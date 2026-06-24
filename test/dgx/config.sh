@@ -1,42 +1,43 @@
-# DGX Spark cluster config. Edit to match your nodes, then use ./dgx.sh.
-HEAD_IP=192.168.0.211
-WORKER_IP=192.168.0.212
-SSH_USER=maci
-SSH_KEY=/home/maci/.config/NVIDIA/Sync/config/nvsync.key
+# Two-node GPU cluster config (example: 2x DGX Spark / GB10). Every value is
+# env-overridable, so you can edit here or export before running ./dgx.sh.
+HEAD_IP="${HEAD_IP:-10.0.0.1}"          # node 1
+WORKER_IP="${WORKER_IP:-10.0.0.2}"      # node 2
+SSH_USER="${SSH_USER:-$USER}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 
 # Stock vLLM image, used unmodified (no rebuild). beam is bind-mounted in.
-IMAGE=vllm/vllm-openai:latest
+IMAGE="${IMAGE:-vllm/vllm-openai:latest}"
 
-# One GB10 GPU per node. (beam is pure Python, so no arch/cross-compile concerns.)
-NUM_GPUS=1                      # GB10 device nodes aren't /dev/nvidia*, so set it explicitly
+# GPUs per node. (beam is pure Python, so no arch/cross-compile concerns.)
+NUM_GPUS="${NUM_GPUS:-1}"               # set explicitly if device nodes aren't /dev/nvidia* (e.g. GB10)
 
-REMOTE_DIR=/home/maci/beam      # host path on each node (no sudo); bind-mounted to /opt/beam
-HEAD_PORT=6379                  # beam head TCP (ray's default port)
+REMOTE_DIR="${REMOTE_DIR:-$HOME/beam}"  # host path on each node (no sudo); bind-mounted to /opt/beam
+HEAD_PORT="${HEAD_PORT:-6379}"          # beam head TCP (ray's default port)
 
 # Control-plane test: one GPU bundle per node.
-DEMO_WORLD=2
+DEMO_WORLD="${DEMO_WORLD:-2}"
 
 # vLLM serve test.
-MODEL=Qwen/Qwen2.5-0.5B-Instruct
-SERVE_PORT=8000
-TP_SIZE=2                       # 2 nodes x 1 GPU
-# GB10 shares 128 GiB between GPU and system, so cap KV cache well under the
-# default 0.9 and skip CUDA-graph capture, or the worker gets OOM-killed (137).
-SERVE_EXTRA="--gpu-memory-utilization 0.5 --max-model-len 8192 --enforce-eager"
-HF_CACHE=/home/maci/.cache/huggingface   # remote path, mounted into the container
+MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+SERVE_PORT="${SERVE_PORT:-8000}"
+TP_SIZE="${TP_SIZE:-2}"                 # 2 nodes x 1 GPU
+# Unified-memory parts (e.g. GB10 shares 128 GiB between GPU and system) OOM-kill
+# the worker at the default 0.9 util, so cap KV cache and skip CUDA-graph capture.
+SERVE_EXTRA="${SERVE_EXTRA:---gpu-memory-utilization 0.5 --max-model-len 8192 --enforce-eager}"
+HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"   # remote path, mounted into the container
 
 # NCCL over RoCE inside containers needs the RDMA verbs devices passed through
 # with --device, which grants the docker device-cgroup permission (a plain -v
 # bind mount exposes the nodes but the cgroup still blocks them, which is why
 # --privileged appeared necessary). --device recurses a directory, so the whole
 # /dev/infiniband goes in at once, same as NVIDIA's multi-node recipes. Plus
-# locked memory for RDMA pinning.
-RDMA_ARGS="--cap-add IPC_LOCK --ulimit memlock=-1:-1 --device /dev/infiniband"
+# locked memory for RDMA pinning. Empty it out for a non-RDMA cluster.
+RDMA_ARGS="${RDMA_ARGS:---cap-add IPC_LOCK --ulimit memlock=-1:-1 --device /dev/infiniband}"
 
-# The two nodes are linked by two ACTIVE RoCE ports: rocep1s0f1 (10.0.1.x) and
-# roceP2p1s0f1 (10.0.2.x). Use both for NCCL data; bootstrap/gloo over the mgmt
-# net (enP7s7). NCCL_DEBUG=INFO shows the transport it selects.
-NCCL_EXTRA="-e NCCL_DEBUG=INFO -e NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 \
-  -e NCCL_SOCKET_IFNAME=enP7s7 -e GLOO_SOCKET_IFNAME=enP7s7"
-# Fallback to plain TCP sockets over a fabric link if RoCE refuses to come up:
-#   NCCL_EXTRA="-e NCCL_DEBUG=INFO -e NCCL_IB_DISABLE=1 -e NCCL_SOCKET_IFNAME=enp1s0f1np1"
+# Point NCCL at your fabric: NCCL_IB_HCA = the RoCE/IB HCA(s) carrying the data,
+# NCCL_SOCKET_IFNAME = the interface for bootstrap/gloo. Check names with
+# `ibv_devices` / `ip -o link`. NCCL_DEBUG=INFO prints the transport it selects.
+NCCL_EXTRA="${NCCL_EXTRA:--e NCCL_DEBUG=INFO}"
+# Examples:
+#   RoCE:  NCCL_EXTRA="-e NCCL_DEBUG=INFO -e NCCL_IB_HCA=<hca0>,<hca1> -e NCCL_SOCKET_IFNAME=<mgmt-if> -e GLOO_SOCKET_IFNAME=<mgmt-if>"
+#   TCP:   NCCL_EXTRA="-e NCCL_DEBUG=INFO -e NCCL_IB_DISABLE=1 -e NCCL_SOCKET_IFNAME=<data-if>"

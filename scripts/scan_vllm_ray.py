@@ -94,6 +94,12 @@ OUT_OF_SCOPE = (
 )
 
 
+def out_of_scope(sym) -> bool:
+    # match on module boundaries: "ray.data" matches "ray.data" and "ray.data.llm"
+    # but not a hypothetical "ray.database".
+    return any(sym == p or sym.startswith(p + ".") for p in OUT_OF_SCOPE)
+
+
 def resolve(dotted) -> bool:
     """True if `dotted` resolves as a module or attribute in the loaded shim."""
     parts = dotted.split(".")
@@ -132,11 +138,6 @@ def main():
         required.add(mod if name is None else f"{mod}.{name}")
     # drop bare "ray" and pure submodule roots we don't need to attribute-check
     required = {r for r in sorted(required) if r != "ray"}
-
-    def out_of_scope(sym):
-        # match on module boundaries: "ray.data" matches "ray.data" and
-        # "ray.data.llm" but not a hypothetical "ray.database".
-        return any(sym == p or sym.startswith(p + ".") for p in OUT_OF_SCOPE)
 
     covered, missing, skipped = [], [], []
     for sym in sorted(required):

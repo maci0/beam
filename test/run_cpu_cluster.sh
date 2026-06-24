@@ -9,22 +9,29 @@
 # different host python / arch; the container makes them uniform.
 #
 # Edit NODES below (first entry = head). Each entry: "name|ssh-opts|host-ip"
-# where ssh-opts is "LOCAL" for the local host, else the ssh flags (no target).
+# where ssh-opts is "LOCAL" for the local host (head runs docker locally), else
+# the ssh flags (no target). SSH_USER is the login on the remote nodes. Override
+# the whole list with the BEAM_NODES env var (newline-separated, same format).
 # Then: bash test/run_cpu_cluster.sh   (set N to use only the first N nodes.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-NVK=/home/maci/.config/NVIDIA/Sync/config/nvsync.key
-SSHO="-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new"
-NODES=(
-  "n0|LOCAL|192.168.0.77"   # this host, head (local docker)
-  "n1|$SSHO|192.168.0.99"
-  "n2|-i $NVK $SSHO|192.168.0.211"
-  "n3|-i $NVK $SSHO|192.168.0.212"
-)
+SSH_USER="${SSH_USER:-$USER}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+SSHO="-i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new"
+if [ -n "${BEAM_NODES:-}" ]; then
+  mapfile -t NODES <<< "$BEAM_NODES"
+else
+  NODES=(
+    "n0|LOCAL|10.0.0.1"   # this host, head (local docker)
+    "n1|$SSHO|10.0.0.2"
+    "n2|$SSHO|10.0.0.3"
+    "n3|$SSHO|10.0.0.4"
+  )
+fi
 N="${N:-${#NODES[@]}}"
 IMAGE="${IMAGE:-python:3.12-slim}"
-REMOTE_DIR="${REMOTE_DIR:-/home/maci/beam}"
+REMOTE_DIR="${REMOTE_DIR:-$HOME/beam}"
 PORT="${PORT:-6379}"
 HEAD_IP="$(echo "${NODES[0]}" | cut -d'|' -f3)"
 
@@ -32,7 +39,7 @@ opts_of() { echo "${NODES[$1]}" | cut -d'|' -f2; }
 ip_of() { echo "${NODES[$1]}" | cut -d'|' -f3; }
 # run a command on node i (local if opts == LOCAL)
 on() { local o; o="$(opts_of "$1")"; local ip; ip="$(ip_of "$1")"; shift
-  if [ "$o" = "LOCAL" ]; then bash -c "$*"; else ssh $o "maci@$ip" "$*"; fi; }
+  if [ "$o" = "LOCAL" ]; then bash -c "$*"; else ssh $o "$SSH_USER@$ip" "$*"; fi; }
 
 cleanup() { for i in $(seq 0 $((N-1))); do on "$i" "docker rm -f beam-cpu 2>/dev/null" >/dev/null 2>&1 || true; done; }
 trap cleanup EXIT
@@ -44,9 +51,9 @@ for i in $(seq 0 $((N-1))); do
   if [ "$o" = "LOCAL" ]; then
     mkdir -p "$REMOTE_DIR"; cp -r "$ROOT/python" "$ROOT/examples" "$REMOTE_DIR/"
   else
-    ssh $o "maci@$ip" "mkdir -p $REMOTE_DIR"
-    rsync -a --delete -e "ssh $o" "$ROOT/python/" "maci@$ip:$REMOTE_DIR/python/"
-    rsync -a --delete -e "ssh $o" "$ROOT/examples/" "maci@$ip:$REMOTE_DIR/examples/"
+    ssh $o "$SSH_USER@$ip" "mkdir -p $REMOTE_DIR"
+    rsync -a --delete -e "ssh $o" "$ROOT/python/" "$SSH_USER@$ip:$REMOTE_DIR/python/"
+    rsync -a --delete -e "ssh $o" "$ROOT/examples/" "$SSH_USER@$ip:$REMOTE_DIR/examples/"
   fi
 done
 

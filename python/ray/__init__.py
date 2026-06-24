@@ -69,6 +69,16 @@ class ObjectRef:
         self._value = value
         self._has_value = has_value
 
+    # equal by id, like real ray, so refs work as dict keys / in membership tests
+    def __eq__(self, other):
+        return isinstance(other, ObjectRef) and other.id == self.id
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __repr__(self):
+        return "ObjectRef(%s)" % self.id
+
 
 def put(obj) -> ObjectRef:
     resp, _ = _need().request({"t": "put"}, _proto.dumps(obj))

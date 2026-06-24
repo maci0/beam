@@ -12,9 +12,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: ruff
-        run: uvx ruff check python examples scripts
+        run: uvx ruff check python examples scripts tests
       - name: black
-        run: uvx black --check python examples scripts
+        run: uvx black --check python examples scripts tests
       - name: mypy
         run: uvx --with cloudpickle mypy --config-file pyproject.toml python/ray examples scripts
 
@@ -26,6 +26,9 @@ jobs:
 
       - name: Syntax check
         run: python3 -m py_compile python/ray/*.py python/ray/**/*.py
+
+      - name: Unit + fuzz tests
+        run: uv run --with pytest --with hypothesis --with cloudpickle pytest tests/ -q
 
       - name: Import surface
         run: PYTHONPATH=python uv run --with cloudpickle python examples/import_check.py
