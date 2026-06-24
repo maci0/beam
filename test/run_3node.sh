@@ -31,7 +31,7 @@ worker_run="--network host -e PYTHONPATH=/opt/beam/python -e BEAM_NUM_GPUS=1 \
   -v $REMOTE_DIR:/opt/beam:ro --entrypoint python3"
 
 cleanup() {
-  [ -n "${HEAD_PID:-}" ] && kill "$HEAD_PID" 2>/dev/null || true
+  kill "${HEAD_PID:-}" 2>/dev/null || true
   $SSH "$SSH_USER@$HEAD_IP"   "docker rm -f beam-n1 2>/dev/null" >/dev/null 2>&1 || true
   $SSH "$SSH_USER@$WORKER_IP" "docker rm -f beam-n2 2>/dev/null" >/dev/null 2>&1 || true
   rm -rf "$RUN"

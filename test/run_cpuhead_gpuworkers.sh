@@ -20,7 +20,7 @@ VENVPY="$RUN/venv/bin/python"
 uv pip install --python "$VENVPY" cloudpickle >/dev/null
 
 cleanup() {
-  [ -n "${HEAD_PID:-}" ] && kill "$HEAD_PID" 2>/dev/null || true
+  kill "${HEAD_PID:-}" 2>/dev/null || true
   $SSH "$SSH_USER@$HEAD_IP"   "docker rm -f beam-w1 2>/dev/null" >/dev/null 2>&1 || true
   $SSH "$SSH_USER@$WORKER_IP" "docker rm -f beam-w2 2>/dev/null" >/dev/null 2>&1 || true
   rm -rf "$RUN"

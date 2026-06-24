@@ -16,8 +16,8 @@ export PYTHONPATH="$ROOT/python"
 export BEAM_WORKER_CMD="$VENVPY -m ray._worker"
 
 cleanup() {
-  [ -n "${HEAD_PID:-}" ] && kill "$HEAD_PID" 2>/dev/null || true
-  [ -n "${WORK_PID:-}" ] && kill "$WORK_PID" 2>/dev/null || true
+  kill "${HEAD_PID:-}" 2>/dev/null || true
+  kill "${WORK_PID:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 

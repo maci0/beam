@@ -16,7 +16,7 @@ export PYTHONPATH="$ROOT/python"
 export BEAM_NUM_GPUS=4
 export BEAM_WORKER_CMD="$VENVPY -m ray._worker"
 
-cleanup() { [ -n "${HEAD_PID:-}" ] && kill "$HEAD_PID" 2>/dev/null || true; }
+cleanup() { kill "${HEAD_PID:-}" 2>/dev/null || true; }
 trap cleanup EXIT
 
 "$VENVPY" -m ray start --head &
