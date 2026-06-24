@@ -75,6 +75,28 @@ Both checks fake the GPU count and need no torch/CUDA (only `uv` + cloudpickle):
     bash test/run_e2e.sh          # single head, 4 fake GPUs
     bash test/run_multinode.sh    # GPU-less head + a 4-GPU worker, routed through the hub
 
+## Validated topologies
+
+Each row ran end to end on real hardware (or fake-GPU control plane where noted).
+The data plane is always NCCL/RCCL; beam carries only the control plane.
+
+| topology | hardware | result | harness |
+|---|---|---|---|
+| Single node, TP=1 | 1× GB10 (NVIDIA DGX Spark) | inference ✓ | `test/dgx/dgx.sh` |
+| 2 nodes, TP=2 | 2× DGX Spark, NCCL over **RoCE + TCP** | inference ✓ | `test/dgx/dgx.sh` |
+| **CPU head + 2 GPU workers**, TP=2 | AMD CPU head (0 GPU, no vLLM) + 2 NVIDIA sparks over RoCE | inference ✓, head is pure control plane on a *different arch*; driver runs on a worker | `test/run_cpuhead_gpuworkers.sh` |
+| 3-node CPU control plane | 3 machines (AMD + 2 NVIDIA), fake GPUs | 1 actor/node, cross-node placement ✓ | `test/run_cpu_cluster.sh` (N=3) |
+| 4-node CPU control plane | 4 machines, fake GPUs | 1 actor/node, cross-node placement ✓ | `test/run_cpu_cluster.sh` |
+| Single node AMD ROCm, TP=1 | RX 7900 XTX, vLLM 0.23 | inference ✓ | `test/run_rocm.sh` |
+| Cross-node AMD control plane | 2 AMD nodes | placement + RCCL **init** on both ranks ✓ | `test/run_rocm_2node.sh` |
+
+CPU-only rows fake the GPU count (`BEAM_NUM_GPUS`) to exercise membership,
+placement, and actor RPC without devices. Cross-node AMD RCCL *completion* is
+the one item not closed: blocked every time by hardware/cloud availability
+(homogeneous 2-node AMD with a real network), never by beam. Harnesses for it
+are ready: `test/run_rocm_cluster.sh` (SSH-into-node) and `test/run_rocm_azure.sh`
+(VM + docker).
+
 ## Keep the shim in sync with vLLM
 
 `scripts/scan_vllm_ray.py` statically scans a vLLM checkout for every `ray.*`
