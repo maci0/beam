@@ -219,13 +219,13 @@ class Daemon:
         self.obj_seq = 0
         self.id_seq = 0
 
+        # head-only state, but typed/empty on every node so attribute access and
+        # mypy are uniform. Only the head seeds itself into `nodes`.
         self.nodes: dict[str, dict[str, Any]] = {}
         self.pgs: dict[str, list[dict[str, Any]]] = {}
         self.actor_loc: dict[str, str] = {}
         if is_head:
-            self.nodes = {node_id: {"info": dict(self.self_info), "peer": None}}
-            self.pgs = {}
-            self.actor_loc = {}
+            self.nodes[node_id] = {"info": dict(self.self_info), "peer": None}
 
     # ---- ids ----
     def _next_obj(self) -> str:
