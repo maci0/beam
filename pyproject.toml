@@ -1,0 +1,36 @@
+# Repo-root dev tooling config (the installable package lives in python/).
+# No [project] table here on purpose: this file only configures lint/format/type.
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = [".e2e-run", ".mn-run", ".edge-run", ".3node-run", ".cpuhead-run", ".rocm-run", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+# E501: line length handled by black. UP031/UP032: %-format is fine and avoids
+# churn. SIM105: contextlib.suppress not always clearer. B008: not relevant.
+ignore = ["E501", "B008", "SIM105", "UP031", "UP032"]
+
+[tool.ruff.lint.per-file-ignores]
+"python/ray/cloudpickle.py" = ["F401", "F403"]
+"python/ray/actor.py" = ["F401"]
+"python/ray/types.py" = ["F401"]
+"python/ray/__init__.py" = ["F401"]
+"python/ray/util/__init__.py" = ["F401"]
+"python/ray/_private/state.py" = ["F401"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+extend-exclude = '/(\.e2e-run|\.mn-run|\.edge-run|\.3node-run|\.cpuhead-run|\.rocm-run|dist)/'
+
+[tool.mypy]
+python_version = "3.10"
+files = ["python/ray", "examples", "scripts"]
+ignore_missing_imports = true
+# pragmatic, not strict: this is glue code over cloudpickle/asyncio sockets
+check_untyped_defs = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff
+        run: uvx ruff check python examples scripts
+      - name: black
+        run: uvx black --check python examples scripts
+      - name: mypy
+        run: uvx --with cloudpickle mypy --config-file pyproject.toml python/ray examples scripts
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Syntax check
+        run: python3 -m py_compile python/ray/*.py python/ray/**/*.py
+
+      - name: Import surface
+        run: PYTHONPATH=python uv run --with cloudpickle python examples/import_check.py
+
+      - name: Single-node control plane (e2e)
+        run: bash test/run_e2e.sh
+
+      - name: Cross-node routing (multinode)
+        run: bash test/run_multinode.sh
+
+      - name: Edge cases
+        run: bash test/run_edge.sh
+
+      - name: Driver on a worker node
+        run: bash test/run_driver_on_worker.sh
+
+  vllm-surface:
+    # Informational: checks the shim still covers vLLM main. Allowed to fail so a
+    # vLLM-side change doesn't block the build; tighten to a gate by pinning a tag.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Clone vLLM
+        run: git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
+      - name: Scan ray API usage vs the shim
+        run: uv run --with cloudpickle python scripts/scan_vllm_ray.py --src /tmp/vllm
