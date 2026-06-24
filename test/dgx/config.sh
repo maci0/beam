@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Two-node GPU cluster config (example: 2x DGX Spark / GB10). Every value is
 # env-overridable, so you can edit here or export before running ./dgx.sh.
 HEAD_IP="${HEAD_IP:-10.0.0.1}"          # node 1

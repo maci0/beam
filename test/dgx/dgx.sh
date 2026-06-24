@@ -14,6 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 SELF="$PWD/$(basename "$0")"
+# shellcheck source=test/dgx/config.sh
 source ./config.sh
 ROOT="$(cd ../.. && pwd)"
 

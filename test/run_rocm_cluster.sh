@@ -9,6 +9,9 @@
 #
 #   NODE0='root@1.2.3.4 -p 22001' NODE1='root@1.2.3.5 -p 22002' \
 #   HEAD_IP=10.65.0.2 NCCL_IF=eth1 bash test/run_rocm_cluster.sh
+# ssh option/target strings (SSHOPTS, NODE="user@host -p port") are intentionally
+# word-split, and remote commands intentionally expand on the client side.
+# shellcheck disable=SC2086,SC2029
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

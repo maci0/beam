@@ -13,6 +13,8 @@
 # the ssh flags (no target). SSH_USER is the login on the remote nodes. Override
 # the whole list with the BEAM_NODES env var (newline-separated, same format).
 # Then: bash test/run_cpu_cluster.sh   (set N to use only the first N nodes.)
+# the $o ssh-option string is intentionally word-split; remote commands expand locally.
+# shellcheck disable=SC2086,SC2029
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 

@@ -5,6 +5,8 @@
 # (e.g. gfx1100 + gfx1030) that is not an officially supported vLLM TP config;
 # beam places the actors fine, RCCL/vLLM may or may not cope. All values are
 # env-overridable.
+# the $common docker-arg string and $SSH are intentionally word-split.
+# shellcheck disable=SC2086
 set -euo pipefail
 
 HEAD_IP="${HEAD_IP:-10.0.0.1}"                  # this host's IP on the shared net

@@ -17,6 +17,8 @@ jobs:
         run: uvx black --check python examples scripts tests
       - name: mypy
         run: uvx --with cloudpickle mypy --config-file pyproject.toml python/ray
+      - name: shellcheck
+        run: shellcheck -x test/*.sh test/dgx/*.sh
 
   test:
     runs-on: ubuntu-latest
