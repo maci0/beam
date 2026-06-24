@@ -10,7 +10,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-from ray._daemon import Daemon, Peer, detect_gpus, new_node_id, owner_of  # noqa: E402
+from ray._daemon import ActorProc, Daemon, Peer, detect_gpus, new_node_id, owner_of  # noqa: E402
 
 
 def head(ngpu=4):
@@ -81,15 +81,14 @@ def test_detect_gpus(monkeypatch):
 
 
 # ---- membership ----
-def test_drop_node_clears_routing_and_peer():
+def test_drop_node_removes_node_and_routing():
     d = head()
     d.nodes["nX"] = {"info": {"node": "nX", "alive": True}, "peer": object()}
     d.actor_loc["a1"] = "nX"
     d.actor_loc["a2"] = "n1"
     d._drop_node("nX")
+    assert "nX" not in d.nodes  # gone, not a phantom DOWN node forever
     assert "a1" not in d.actor_loc and "a2" in d.actor_loc  # only the dead node's
-    assert d.nodes["nX"]["peer"] is None
-    assert d.nodes["nX"]["info"]["alive"] is False
 
 
 def test_drop_node_ignores_stale_peer():
@@ -97,8 +96,17 @@ def test_drop_node_ignores_stale_peer():
     live = object()
     d.nodes["nX"] = {"info": {"node": "nX", "alive": True}, "peer": live}
     d._drop_node("nX", peer=object())  # a different (old) peer closing
-    assert d.nodes["nX"]["peer"] is live  # live connection untouched
-    assert d.nodes["nX"]["info"]["alive"] is True
+    assert "nX" in d.nodes and d.nodes["nX"]["peer"] is live  # live node untouched
+
+
+def test_drop_actor_frees_gpu_and_routing():
+    d = head(2)
+    d.gpu_used[1] = True
+    d.actor_loc["a1"] = "n1"
+    d.actors["a1"] = ActorProc("a1", peer=object(), gpus=[1])  # type: ignore[arg-type]
+    d._drop_actor("a1")
+    assert "a1" not in d.actors and "a1" not in d.actor_loc
+    assert d.gpu_used[1] is False  # crashed actor's GPU reclaimed
 
 
 # ---- the reqid-copy regression (the bug that hung driver-on-worker) ----

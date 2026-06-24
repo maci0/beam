@@ -311,17 +311,29 @@ class Daemon:
 
     def _drop_node(self, node: str, peer: Peer | None = None) -> None:
         rec = self.nodes.get(node)
-        # if the node already reconnected with a fresh peer, this is a stale
-        # close from the old connection: ignore it, don't drop the live node.
+        # stale close from an old connection after the node already reconnected:
+        # ignore it, don't drop the live node.
         if peer is not None and rec is not None and rec["peer"] is not peer:
             return
-        if rec:
-            rec["info"]["alive"] = False
-            rec["peer"] = None  # don't route to a closed peer
-        # actors on a dead node are unreachable; drop their routing so calls fail
+        # remove the node entirely (a reconnect makes a fresh entry). Leaving a
+        # phantom "down" node behind would fail `ray status` health checks forever,
+        # since a restarted worker gets a new node id.
+        self.nodes.pop(node, None)
+        # actors on a gone node are unreachable; drop their routing so calls fail
         # cleanly ("unknown actor") instead of hanging on a dead connection.
         for aid in [a for a, n in self.actor_loc.items() if n == node]:
             del self.actor_loc[aid]
+
+    def _drop_actor(self, actor_id: str) -> None:
+        """Reclaim an actor whose worker subprocess died (crash, not just kill):
+        free its GPUs and drop it from the local + routing tables. Idempotent, so
+        it is safe to also fire after an explicit on_kill."""
+        ap = self.actors.pop(actor_id, None)
+        if ap:
+            for g in ap.gpus:
+                if 0 <= g < len(self.gpu_used):
+                    self.gpu_used[g] = False
+        self.actor_loc.pop(actor_id, None)
 
     def _used_on_node(self, node: str) -> int:
         used = 0
@@ -347,7 +359,10 @@ class Daemon:
     # ---- placement groups (head) ----
     async def on_create_pg(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
-            return await self._forward_head(m, payload)
+            r, pl = await self._forward_head(m, payload)
+            if peer is not None and r.get("pg"):  # track for release on disconnect
+                peer.created_pgs.append(r["pg"])
+            return r, pl
         free = {}
         for node, rec in self.nodes.items():
             if not rec["info"]["alive"]:
@@ -460,7 +475,10 @@ class Daemon:
         # This is what lets the vLLM driver run on a worker node (CPU head, GPU
         # workers, engine on a GPU worker).
         if "actor" not in m:
-            return await self._forward_head(m, payload)
+            r, pl = await self._forward_head(m, payload)
+            if peer is not None and r.get("actor"):  # track for release on disconnect
+                peer.created_actors.append(r["actor"])
+            return r, pl
         return await self._host_actor(m, payload)
 
     def _place_actor(self, m: dict) -> tuple[str | None, list[int] | None, str | None]:
@@ -530,9 +548,12 @@ class Daemon:
         return subprocess.Popen(shlex.split(cmdline), env=env)
 
     async def on_worker_hello(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
-        fut = self.pending_workers.pop(m["actor"], None)
+        actor_id = m["actor"]
+        fut = self.pending_workers.pop(actor_id, None)
         if fut and not fut.done():
             fut.set_result(peer)
+        # when this actor's subprocess dies, reclaim its GPU/slot locally
+        peer.on_close = lambda: self._drop_actor(actor_id)
         return {"t": "worker_hello_ok"}, b""
 
     async def on_call(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
@@ -648,6 +669,19 @@ class Daemon:
         """When a driver disconnects, free the placement groups and actors it
         created so their GPUs return to the pool (no leak across runs)."""
         if not self.is_head:
+            # a local driver on a worker node: the head owns placement and
+            # routing, so forward the releases there (drops the head-side leak
+            # for the CPU-head / GPU-worker, driver-on-worker topology).
+            for actor_id in list(peer.created_actors):
+                try:
+                    await self._forward_head({"t": "kill", "actor": actor_id})
+                except Exception:
+                    pass
+            for pg_id in list(peer.created_pgs):
+                try:
+                    await self._forward_head({"t": "remove_pg", "pg": pg_id})
+                except Exception:
+                    pass
             return
         for actor_id in list(peer.created_actors):
             try:
