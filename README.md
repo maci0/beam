@@ -12,7 +12,7 @@ cluster membership, GPU accounting, placement groups, and an actor-call hub.
 The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactly
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
 
-**~1,230 lines, 112 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
+**~1,430 lines, 124 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
 (see [DESIGN.md](DESIGN.md#size-vs-ray)).
 
 ## Documentation
@@ -32,6 +32,7 @@ and beam runs on the image's own python. Inject it with **one read-only bind
 mount**; `PYTHONPATH` points python at the shim, and beam writes a `ray` launcher
 itself on first start.
 
+    mkdir -p /opt/beam
     cp -r python examples /opt/beam/      # /opt/beam/{python,examples}
 
     # head node (stock image, one mount, image python as entrypoint)
@@ -121,6 +122,16 @@ bump as a CI gate:
 Object store for large data, fault tolerance/actor restart, autoscaling, the
 dashboard, non-actor tasks, and `VLLM_USE_RAY_COMPILED_DAG`. vLLM's distributed
 inference path needs none of these.
+
+## Security / trust model
+
+beam's control plane is **unauthenticated**, exactly like Ray's. The head binds
+its TCP port (default 6379) on `0.0.0.0`, and the protocol carries cloudpickled
+payloads that worker daemons unpickle and execute. Anyone who can reach the port
+can run code as the daemon user. **Run it only on a trusted, private network**
+(a cluster subnet / VPC), never exposed to the internet. This is the same
+posture Ray documents for its own 6379. Set `--node-ip` to advertise a specific
+address; keep the port behind your firewall/security group.
 
 ## License
 

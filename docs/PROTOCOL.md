@@ -30,8 +30,12 @@ TCP connection, and the daemon↔actor-worker unix socket.
 | …        |        | type-specific fields below                           |
 
 A request carries `t` + `reqid` + type-specific fields. Its response echoes
-`reqid` with `resp=true` and either result fields or `err`. A single connection
-is a bidirectional mux: both ends may issue requests; responses are matched by
+`reqid` with `resp=true`, sets `t` to `<request>_ok` (e.g. `create_actor` →
+`create_actor_ok`, `get` → `get_ok`), and carries either the reply fields below
+or `err`. Even messages whose reply column is "—" still get an acknowledgement
+frame (`hello_ok`, `init_ok`, `kill_ok`, …) that the caller awaits; "—" means it
+carries no fields beyond the standard `t`/`reqid`/`resp`. A single connection is
+a bidirectional mux: both ends may issue requests; responses are matched by
 `reqid`.
 
 ## Message types
@@ -52,7 +56,7 @@ Payload column: ✓ means the frame carries a cloudpickled payload.
 | `call`          | client → head → owner  | `actor` `method`      | `obj`                  | ✓ (in)  |
 | `method`        | daemon → actor worker  | `method`              | —                      | ✓ both  |
 | `kill`          | client → head → owner  | `actor`               | —                      |         |
-| `put`           | client → owner         | —                     | `obj`                  | ✓ (in)  |
+| `put`           | client → local daemon  | —                     | `obj`                  | ✓ (in)  |
 | `get`           | client → head → owner  | `obj`                 | —                      | ✓ (out) |
 | `stat`          | client → head → owner  | `obj`                 | `ready` (bool)         |         |
 
