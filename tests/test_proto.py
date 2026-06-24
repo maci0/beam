@@ -4,6 +4,7 @@ socket, so it is the highest-value fuzz target: random input must fail cleanly
 
 import json
 import os
+import socket
 import struct
 import sys
 
@@ -114,7 +115,55 @@ def test_zero_length_header_rejected():
         _proto.read_frame(BytesSock(struct.pack(">I", 0)))
 
 
+def test_bad_plen_rejected():
+    body = json.dumps({"t": "x", "plen": _proto._MAX_FRAME + 1}).encode()
+    frame = struct.pack(">I", len(body)) + body
+    with pytest.raises(ConnectionError):
+        _proto.read_frame(BytesSock(frame))
+
+
 @settings(max_examples=200)
 @given(st.recursive(_scalars, lambda c: st.lists(c) | st.dictionaries(st.text(), c), max_leaves=20))
 def test_pickle_roundtrip(obj):
     assert _proto.loads(_proto.dumps(obj)) == obj
+
+
+# ---- write_frame over a real socketpair (the wire path the client uses) -----
+
+
+def test_write_frame_socketpair_roundtrip():
+    a, b = socket.socketpair()
+    try:
+        _proto.write_frame(a, {"t": "call", "n": 5}, b"body")
+        h, p = _proto.read_frame(b)
+        assert h["t"] == "call" and h["n"] == 5 and p == b"body"
+        assert h["plen"] == 4  # write_frame stamps the payload length
+    finally:
+        a.close()
+        b.close()
+
+
+def test_read_frame_socket_eof_raises():
+    a, b = socket.socketpair()
+    a.close()  # peer gone -> recv returns b'' -> ConnectionError
+    try:
+        with pytest.raises(ConnectionError):
+            _proto.read_frame(b)
+    finally:
+        b.close()
+
+
+@settings(max_examples=150)
+@given(st.dictionaries(st.text(min_size=1), _scalars, max_size=6), st.binary(max_size=2048))
+def test_write_frame_roundtrip_fuzz(header, payload):
+    header = {**header, "t": "x"}
+    a, b = socket.socketpair()
+    try:
+        _proto.write_frame(a, header, payload)
+        h, p = _proto.read_frame(b)
+        assert p == payload
+        for k, v in header.items():
+            assert h[k] == v
+    finally:
+        a.close()
+        b.close()

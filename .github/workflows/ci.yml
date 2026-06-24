@@ -27,8 +27,8 @@ jobs:
       - name: Syntax check
         run: python3 -m py_compile python/ray/*.py python/ray/**/*.py
 
-      - name: Unit + fuzz tests
-        run: uv run --with pytest --with hypothesis --with cloudpickle pytest tests/ -q
+      - name: Unit + fuzz tests (100% coverage gate)
+        run: uv run --with pytest --with hypothesis --with pytest-cov --with cloudpickle pytest tests/ -q --cov=ray --cov-report=term-missing --cov-fail-under=100
 
       - name: Import surface
         run: PYTHONPATH=python uv run --with cloudpickle python examples/import_check.py

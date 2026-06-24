@@ -212,7 +212,7 @@ async def _run_daemon(
     d.shutdown()  # reap actor worker subprocesses instead of orphaning them
     try:
         os.remove(_runtime_path())
-    except OSError:
+    except OSError:  # pragma: no cover (runtime file already gone)
         pass
     return 0
 
@@ -307,7 +307,7 @@ def _stop() -> int:
         else:
             try:
                 os.kill(pid, signal.SIGKILL)
-            except OSError:
+            except OSError:  # pragma: no cover (pid race)
                 pass
     # remove stale runtime files so a later status/connect doesn't hit a dead socket
     for path in (rt.get("sock"), _runtime_path()):
@@ -359,5 +359,5 @@ def bootstrap_env() -> None:
             try:
                 with open(os.path.join(d, "beam.pth"), "w") as f:
                     f.write(py_pkg_parent + "\n")
-            except OSError:
+            except OSError:  # pragma: no cover (unwritable site dir)
                 pass

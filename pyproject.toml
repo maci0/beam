@@ -36,3 +36,15 @@ check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
+
+[tool.coverage.run]
+source = ["ray"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+# entrypoint guards and pragma'd defensive branches are not exercised in-process
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
