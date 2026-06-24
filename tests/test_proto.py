@@ -43,10 +43,19 @@ def test_empty_payload():
     assert p == b""
 
 
-_scalars = st.none() | st.booleans() | st.integers(-(10**9), 10**9) | st.text()
+# cover the values the real wire carries: floats (num_gpus=0.5), big ints
+# (reqids), control/surrogate-free unicode, not just small ints.
+_scalars = (
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False, allow_infinity=False)
+    | st.text()
+)
+_PARSE_ERRORS = (ConnectionError, json.JSONDecodeError, UnicodeDecodeError, struct.error)
 
 
-@settings(max_examples=300)
+@settings(max_examples=400)
 @given(st.dictionaries(st.text(min_size=1), _scalars, max_size=8), st.binary(max_size=8192))
 def test_roundtrip_fuzz(header, payload):
     header = {**header, "t": "x"}  # a type key is always present on the wire
@@ -58,12 +67,40 @@ def test_roundtrip_fuzz(header, payload):
 
 @settings(max_examples=500)
 @given(st.binary(max_size=64))
-def test_garbage_no_crash(data):
-    # random bytes: must raise a known parse/EOF error, not hang or OOM
+def test_garbage_rejected_or_valid(data):
+    # random bytes: either raise a known parse/EOF error, or (rarely) parse to a
+    # structurally valid frame. Never hang, OOM, or return a malformed shape.
     try:
-        _proto.read_frame(BytesSock(data))
-    except (ConnectionError, json.JSONDecodeError, UnicodeDecodeError, struct.error):
-        pass
+        h, p = _proto.read_frame(BytesSock(data))
+    except _PARSE_ERRORS:
+        return
+    assert isinstance(h, dict) and isinstance(p, bytes)
+
+
+@settings(max_examples=500)
+@given(st.binary(max_size=300))
+def test_structured_frame_fuzz(body):
+    # a well-formed 4-byte length over `body`, but body is arbitrary, so this
+    # actually exercises the JSON / unicode / plen-bound branches (not just EOF).
+    frame = struct.pack(">I", len(body)) + body
+    try:
+        h, p = _proto.read_frame(BytesSock(frame))
+    except _PARSE_ERRORS:
+        return
+    assert isinstance(h, dict) and isinstance(p, bytes)
+
+
+def test_class_and_closure_roundtrip():
+    # the actual reason cloudpickle is used: classes and closures, not just data
+    class W:
+        def __init__(self, r):
+            self.r = r
+
+    obj = _proto.loads(_proto.dumps(W(7)))
+    assert obj.r == 7
+    n = 3
+    fn = _proto.loads(_proto.dumps(lambda x: x + n))
+    assert fn(4) == 7
 
 
 def test_oversize_rejected():

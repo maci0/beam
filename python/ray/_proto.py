@@ -52,6 +52,8 @@ def read_frame(sock: socket.socket) -> tuple[dict, bytes]:
     if n == 0 or n > _MAX_FRAME:
         raise ConnectionError("bad frame header length %d" % n)
     header = json.loads(_recv_exact(sock, n))
+    if not isinstance(header, dict):  # valid JSON but not an object (e.g. a bare int)
+        raise ConnectionError("frame header is not a JSON object")
     plen = header.get("plen", 0)
     if plen < 0 or plen > _MAX_FRAME:
         raise ConnectionError("bad frame payload length %d" % plen)

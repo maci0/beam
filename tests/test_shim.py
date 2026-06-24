@@ -17,6 +17,9 @@ from ray.runtime_env import RuntimeEnv  # noqa: E402
 
 
 class FakeClient:
+    """Mirrors DaemonClient.request: an "err" key in the canned response raises
+    RuntimeError, exactly like the real client does for a daemon error frame."""
+
     def __init__(self, responses=None, body=b""):
         self.responses = responses or {}
         self.body = body
@@ -25,10 +28,11 @@ class FakeClient:
     def request(self, header, payload=b""):
         self.sent.append((header, payload))
         t = header["t"]
-        if isinstance(self.responses.get(t), Exception):
-            raise self.responses[t]
-        resp = {"t": t + "_ok", "resp": True, **self.responses.get(t, {})}
-        return resp, self.responses.get(t, {}).get("_body", self.body)
+        canned = self.responses.get(t, {})
+        if canned.get("err"):
+            raise RuntimeError(canned["err"])  # same contract as DaemonClient
+        resp = {"t": t + "_ok", "resp": True, **canned}
+        return resp, canned.get("_body", self.body)
 
 
 def use(monkeypatch, fc):
@@ -69,15 +73,26 @@ def test_get_unpickles_body(monkeypatch):
 
 
 def test_get_timeout_maps_to_GetTimeoutError(monkeypatch):
-    use(monkeypatch, FakeClient({"get": RuntimeError("GetTimeoutError: not ready")}))
+    # drive the real path: daemon returns an "err" with the exact on_get string,
+    # the client raises RuntimeError, the shim re-raises GetTimeoutError
+    use(
+        monkeypatch,
+        FakeClient({"get": {"err": "GetTimeoutError: object n1-o1 not ready in 0.01s"}}),
+    )
     with pytest.raises(GetTimeoutError):
         ray.get(ray.ObjectRef("n1-o1"), timeout=0.01)
 
 
 def test_get_other_error_reraises(monkeypatch):
-    use(monkeypatch, FakeClient({"get": RuntimeError("boom")}))
+    use(monkeypatch, FakeClient({"get": {"err": "unknown object n1-o1"}}))
     with pytest.raises(RuntimeError):
         ray.get(ray.ObjectRef("n1-o1"))
+
+
+def test_err_response_propagates_from_put(monkeypatch):
+    use(monkeypatch, FakeClient({"put": {"err": "daemon exploded"}}))
+    with pytest.raises(RuntimeError, match="daemon exploded"):
+        ray.put(123)
 
 
 def test_get_list_preserves_order(monkeypatch):

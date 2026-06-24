@@ -128,6 +128,14 @@ def _start(args: list[str]) -> int:
     if not head and not address:
         sys.stderr.write("beam start: need --head or --address HOST:PORT\n")
         return 2
+    if address:
+        _, _, ap = address.partition(":")
+        if ap and not ap.isdigit():
+            sys.stderr.write("beam: --address port must be numeric, got %r\n" % ap)
+            return 2
+    if num_gpus is not None and num_gpus < 0:
+        sys.stderr.write("beam: --num-gpus must be >= 0, got %d\n" % num_gpus)
+        return 2
 
     maybe_bootstrap()
     gpus = _daemon.detect_gpus(num_gpus)
@@ -153,16 +161,23 @@ async def _run_daemon(
     sock = os.path.join(_runtime_dir(), "daemon.sock")
     await d.serve_unix(sock)
 
+    def _fail(msg: str) -> int:
+        sys.stderr.write(msg)
+        try:
+            os.remove(sock)  # don't leave a stale socket behind on a failed start
+        except OSError:
+            pass
+        return 1
+
     rt = {"sock": sock, "node": node_id, "head": head, "pid": os.getpid()}
     if head:
         try:
             await d.serve_tcp("0.0.0.0", port)
         except OSError as e:
-            sys.stderr.write(
+            return _fail(
                 "beam head: cannot bind port %d (%s). Another head running? "
                 "Run 'ray stop' first, or pick another --port.\n" % (port, e)
             )
-            return 1
         rt["addr"] = "%s:%d" % (ip, port)
         # the control plane is unauthenticated (see SECURITY in README): keep :port
         # on a trusted/private network only.
@@ -177,11 +192,10 @@ async def _run_daemon(
         try:
             await d.join_head(host, int(p or 6379))
         except OSError as e:
-            sys.stderr.write(
+            return _fail(
                 "beam worker: head not reachable at %s (%s). Check it is up and the "
                 "port is open between nodes.\n" % (address, e)
             )
-            return 1
         rt["addr"] = address
         print("beam worker joined %s (%d GPUs)" % (address, gpus))
 
