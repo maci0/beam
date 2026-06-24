@@ -138,8 +138,8 @@ sequenceDiagram
 7. **Serving.** vLLM calls `handle.run()` on each worker; that method never
    returns (it is the worker's execution loop, fed by vLLM's own shared-memory
    MessageQueue, not by ray). beam keeps the call's `ObjectRef` permanently
-   not-ready. A monitor thread polls `ray.wait(run_refs, timeout=…)` to detect a
-   worker dying; beam's `stat` answers ready/not-ready without blocking.
+   not-ready. vLLM's own monitor thread polls `ray.wait(run_refs, timeout=…)` to
+   detect a worker dying; beam's `stat` answers ready/not-ready without blocking.
 
 At this point the OpenAI server is up. Inference requests flow through vLLM's own
 machinery; beam is idle except for the occasional liveness `stat`.

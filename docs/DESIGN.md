@@ -88,7 +88,7 @@ Star. The head daemon is the router/hub.
 
     driver (vLLM)            worker node                 worker node
       |                        |                            |
-   ray-shim                 beamd  -- python actor       beamd -- python actor
+   ray shim                 beamd  -- python actor       beamd -- python actor
       | unix sock              | TCP                         | TCP
     beamd (head) <-------------+----------------------------+
        \__ python actors (local GPUs)
