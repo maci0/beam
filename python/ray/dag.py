@@ -4,6 +4,8 @@ implement Ray's accelerated/compiled DAG; vLLM gates that on the presence of
 module's classes are never actually instantiated on the supported path.
 """
 
+from typing import Any
+
 _UNSUPPORTED = (
     "beam does not implement Ray compiled DAG (VLLM_USE_RAY_COMPILED_DAG); "
     "use the default per-worker RPC path."
@@ -11,15 +13,15 @@ _UNSUPPORTED = (
 
 
 class CompiledDAG:
-    def __init__(self, *a, **k):
+    def __init__(self, *a: Any, **k: Any) -> None:
         raise NotImplementedError(_UNSUPPORTED)
 
 
 class InputNode:
-    def __init__(self, *a, **k):
+    def __init__(self, *a: Any, **k: Any) -> None:
         raise NotImplementedError(_UNSUPPORTED)
 
 
 class MultiOutputNode:
-    def __init__(self, *a, **k):
+    def __init__(self, *a: Any, **k: Any) -> None:
         raise NotImplementedError(_UNSUPPORTED)

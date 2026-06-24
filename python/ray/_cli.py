@@ -4,6 +4,8 @@
 Everything is Python now; there is no separate binary.
 """
 
+from __future__ import annotations  # keep `X | None` valid on py3.9
+
 import asyncio
 import json
 import os
@@ -11,19 +13,20 @@ import signal
 import socket
 import struct
 import sys
+from collections.abc import Sequence
 
 from . import _daemon
 
 
-def _runtime_dir():
+def _runtime_dir() -> str:
     return os.environ.get("BEAM_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".beam")
 
 
-def _runtime_path():
+def _runtime_path() -> str:
     return os.path.join(_runtime_dir(), "daemon.json")
 
 
-def _local_ip():
+def _local_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -34,7 +37,7 @@ def _local_ip():
         s.close()
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
         return _usage()
@@ -54,7 +57,7 @@ def main(argv=None):
     return _usage()
 
 
-def _usage():
+def _usage() -> int:
     sys.stderr.write(
         "beam: a drop-in subset of ray for vLLM distributed inference\n\n"
         "usage:\n"
@@ -66,7 +69,7 @@ def _usage():
     return 2
 
 
-def _start(args):
+def _start(args: list[str]) -> int:
     head = False
     port = 6379
     address = None
@@ -108,7 +111,14 @@ def _start(args):
     return asyncio.run(_run_daemon(head, node_id, ip, gpus, port, address))
 
 
-async def _run_daemon(head, node_id, ip, gpus, port, address):
+async def _run_daemon(
+    head: bool,
+    node_id: str,
+    ip: str,
+    gpus: int,
+    port: int,
+    address: str | None,
+) -> int:
     d = _daemon.Daemon(head, node_id, ip, gpus)
     sock = os.path.join(_runtime_dir(), "daemon.sock")
     await d.serve_unix(sock)
@@ -120,6 +130,7 @@ async def _run_daemon(head, node_id, ip, gpus, port, address):
         print("beam head started on %s:%d (%d GPUs)" % (ip, port, gpus))
         print("join with:  ray start --address %s:%d" % (ip, port))
     else:
+        assert address is not None  # _start guarantees --address when not --head
         host, _, p = address.partition(":")
         await d.join_head(host, int(p or 6379))
         rt["addr"] = address
@@ -143,12 +154,12 @@ async def _run_daemon(head, node_id, ip, gpus, port, address):
     return 0
 
 
-def _read_runtime():
+def _read_runtime() -> dict:
     with open(_runtime_path()) as f:
         return json.load(f)
 
 
-def _status():
+def _status() -> int:
     try:
         rt = _read_runtime()
     except OSError:
@@ -190,7 +201,7 @@ def _status():
     return 0
 
 
-def _recv(sock, n):
+def _recv(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -200,7 +211,7 @@ def _recv(sock, n):
     return bytes(buf)
 
 
-def _stop():
+def _stop() -> int:
     try:
         rt = _read_runtime()
     except OSError:
@@ -215,14 +226,14 @@ def _stop():
     return 0
 
 
-def maybe_bootstrap():
+def maybe_bootstrap() -> None:
     """Bootstrap only inside a container (or when forced), so running on a host
     never touches /usr/local/bin or the system python site dirs."""
     if os.environ.get("BEAM_BOOTSTRAP") or os.path.exists("/.dockerenv"):
         bootstrap_env()
 
 
-def bootstrap_env():
+def bootstrap_env() -> None:
     """Make `ray`/`beam` commands available and the shim importable, so a single
     bind mount of the beam dir is all a container needs."""
     py = sys.executable

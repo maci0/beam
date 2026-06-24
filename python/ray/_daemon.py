@@ -9,6 +9,8 @@ method-call RPCs, and gathers small results. Tensor traffic goes over NCCL,
 never through here. See DESIGN.md.
 """
 
+from __future__ import annotations  # keep `X | None` valid on py3.9
+
 import asyncio
 import glob
 import json
@@ -17,9 +19,11 @@ import secrets
 import shlex
 import struct
 import subprocess
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 
-def _terminate(proc):
+def _terminate(proc: subprocess.Popen | None) -> None:
     """Best-effort kill of an actor worker subprocess that hasn't already exited."""
     if proc is not None and proc.poll() is None:
         try:
@@ -41,7 +45,7 @@ def encode_frame(header: dict, payload: bytes = b"") -> bytes:
 _MAX_FRAME = 512 * 1024 * 1024  # corrupt-length guard; see _proto._MAX_FRAME
 
 
-async def read_frame(reader: asyncio.StreamReader):
+async def read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes]:
     n = struct.unpack(">I", await reader.readexactly(4))[0]
     if n == 0 or n > _MAX_FRAME:
         raise ConnectionError("bad frame header length %d" % n)
@@ -57,26 +61,32 @@ class Peer:
     """Bidirectional RPC mux over one connection. Either side can issue call();
     the other side's handler answers. Responses match requests by reqid."""
 
-    def __init__(self, reader, writer, handler):
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        handler: Callable[[Peer, dict, bytes], Awaitable[tuple[dict, bytes]]],
+    ) -> None:
         self.reader = reader
         self.writer = writer
         self.handler = handler
-        self.pending = {}
+        self.pending: dict[int, asyncio.Future] = {}
         self.next_id = 0
         self.wlock = asyncio.Lock()
-        self.on_close = None
+        self.on_close: Callable[[], Any] | None = None
         self.closed = False
-        self._tasks = set()  # keep handler task refs so they aren't GC'd mid-flight
+        self._tasks: set[asyncio.Task] = set()  # keep handler task refs so they aren't GC'd mid-flight
         # per-client ownership, for cleanup on disconnect
-        self.created_pgs = []
-        self.created_actors = []
+        self.created_pgs: list[str] = []
+        self.created_actors: list[str] = []
 
-    async def serve(self):
+    async def serve(self) -> None:
         try:
             while True:
                 header, payload = await read_frame(self.reader)
                 if header.get("resp"):
-                    fut = self.pending.pop(header.get("reqid"), None)
+                    rid: Any = header.get("reqid")
+                    fut = self.pending.pop(rid, None)
                     if fut and not fut.done():
                         fut.set_result((header, payload))
                 else:
@@ -93,7 +103,7 @@ class Peer:
         finally:
             await self.close()
 
-    async def _handle(self, header, payload):
+    async def _handle(self, header: dict, payload: bytes) -> None:
         try:
             resp, rpl = await self.handler(self, header, payload)
         except Exception as e:  # never let a handler kill the read loop
@@ -107,12 +117,12 @@ class Peer:
         except (ConnectionError, OSError):
             pass
 
-    async def send(self, header, payload=b""):
+    async def send(self, header: dict, payload: bytes = b"") -> None:
         async with self.wlock:
             self.writer.write(encode_frame(header, payload))
             await self.writer.drain()
 
-    async def call(self, header, payload=b""):
+    async def call(self, header: dict, payload: bytes = b"") -> tuple[dict, bytes]:
         self.next_id += 1
         rid = self.next_id
         # copy: never mutate the caller's dict. A routing handler passes the
@@ -128,7 +138,7 @@ class Peer:
             raise RuntimeError(rheader["err"])
         return rheader, rpayload
 
-    async def close(self):
+    async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
@@ -145,7 +155,7 @@ class Peer:
                 await r
 
 
-def detect_gpus(override=None) -> int:
+def detect_gpus(override: int | None = None) -> int:
     if override is not None and override >= 0:
         return override
     env = os.environ.get("BEAM_NUM_GPUS")
@@ -164,7 +174,13 @@ def owner_of(obj_id: str) -> str:
 
 
 class ActorProc:
-    def __init__(self, actor_id, peer, gpus, proc=None):
+    def __init__(
+        self,
+        actor_id: str,
+        peer: Peer,
+        gpus: list[int],
+        proc: subprocess.Popen | None = None,
+    ) -> None:
         self.id = actor_id
         self.peer = peer
         self.gpus = gpus
@@ -173,15 +189,15 @@ class ActorProc:
 
 
 class ObjSlot:
-    def __init__(self):
+    def __init__(self) -> None:
         self.ev = asyncio.Event()
         self.data = b""
         self.err = ""
 
 
 class Daemon:
-    def __init__(self, is_head, node_id, ip, num_gpus):
-        self.self_info = {
+    def __init__(self, is_head: bool, node_id: str, ip: str, num_gpus: int) -> None:
+        self.self_info: dict[str, Any] = {
             "node": node_id,
             "ip": ip,
             "ngpu": num_gpus,
@@ -191,32 +207,35 @@ class Daemon:
         self.is_head = is_head
         self.node_id = node_id
         self.num_gpus = num_gpus
-        self.head_peer = None
-        self.sock_path = None
+        self.head_peer: Peer | None = None
+        self.sock_path: str | None = None
 
         self.gpu_used = [False] * num_gpus
-        self.actors = {}
-        self.objects = {}
-        self.pending_workers = {}
+        self.actors: dict[str, ActorProc] = {}
+        self.objects: dict[str, ObjSlot] = {}
+        self.pending_workers: dict[str, asyncio.Future] = {}
         self.obj_seq = 0
         self.id_seq = 0
 
+        self.nodes: dict[str, dict[str, Any]] = {}
+        self.pgs: dict[str, list[dict[str, Any]]] = {}
+        self.actor_loc: dict[str, str] = {}
         if is_head:
             self.nodes = {node_id: {"info": dict(self.self_info), "peer": None}}
             self.pgs = {}
             self.actor_loc = {}
 
     # ---- ids ----
-    def _next_obj(self):
+    def _next_obj(self) -> str:
         self.obj_seq += 1
         return f"{self.node_id}-o{self.obj_seq}"
 
-    def _next_id(self, kind):
+    def _next_id(self, kind: str) -> str:
         self.id_seq += 1
         return f"{self.node_id}-{kind}{self.id_seq}"
 
     # ---- servers ----
-    async def serve_unix(self, path):
+    async def serve_unix(self, path: str) -> None:
         self.sock_path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
@@ -225,17 +244,19 @@ class Daemon:
             pass
         await asyncio.start_unix_server(self._on_conn, path=path)
 
-    async def serve_tcp(self, host, port):
+    async def serve_tcp(self, host: str, port: int) -> None:
         await asyncio.start_server(self._on_conn, host=host, port=port)
 
-    async def _on_conn(self, reader, writer):
+    async def _on_conn(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         peer = Peer(reader, writer, self.handle)
         # default: if this turns out to be a driver, free its resources on close.
         # on_hello overwrites this for joining worker daemons (-> _drop_node).
         peer.on_close = lambda: self.release_client(peer)
         await peer.serve()
 
-    async def join_head(self, host, port, retries=60):
+    async def join_head(self, host: str, port: int, retries: int = 60) -> None:
         # the worker daemon may start before the head's TCP listener is up
         # (e.g. both launched together), so retry the dial with backoff.
         for attempt in range(retries):
@@ -253,25 +274,25 @@ class Daemon:
         )
 
     # ---- dispatch ----
-    async def handle(self, peer, m, payload):
+    async def handle(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         t = m.get("t")
         fn = getattr(self, "on_" + t, None) if t else None
         if fn is None:
             return {"err": "unknown message type: %s" % t}, b""
         return await fn(peer, m, payload)
 
-    async def _forward_head(self, m, payload=b""):
+    async def _forward_head(self, m: dict, payload: bytes = b"") -> tuple[dict, bytes]:
         if self.head_peer is None:
             return {"err": "no head connection"}, b""
         r, pl = await self.head_peer.call(m, payload)
         return r, pl
 
-    def _peer_for(self, node):
+    def _peer_for(self, node: str) -> Peer | None:
         rec = self.nodes.get(node)
         return rec["peer"] if rec else None
 
     # ---- membership (head) ----
-    async def on_hello(self, peer, m, payload):
+    async def on_hello(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
             return {"err": "not the head node"}, b""
         node = m["node"]
@@ -288,7 +309,7 @@ class Daemon:
         peer.on_close = lambda: self._drop_node(node, peer)
         return {"t": "hello_ok"}, b""
 
-    def _drop_node(self, node, peer=None):
+    def _drop_node(self, node: str, peer: Peer | None = None) -> None:
         rec = self.nodes.get(node)
         # if the node already reconnected with a fresh peer, this is a stale
         # close from the old connection: ignore it, don't drop the live node.
@@ -302,7 +323,7 @@ class Daemon:
         for aid in [a for a, n in self.actor_loc.items() if n == node]:
             del self.actor_loc[aid]
 
-    def _used_on_node(self, node):
+    def _used_on_node(self, node: str) -> int:
         used = 0
         for pg in self.pgs.values():
             for b in pg:
@@ -310,7 +331,7 @@ class Daemon:
                     used += 1
         return used
 
-    async def on_status(self, peer, m, payload):
+    async def on_status(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
             r, _ = await self._forward_head({"t": "status"})
             return r, b""
@@ -324,7 +345,7 @@ class Daemon:
         return {"t": "status_ok", "nodes": out}, b""
 
     # ---- placement groups (head) ----
-    async def on_create_pg(self, peer, m, payload):
+    async def on_create_pg(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
             return await self._forward_head(m, payload)
         free = {}
@@ -360,17 +381,18 @@ class Daemon:
             peer.created_pgs.append(pg_id)
         return {"t": "create_pg_ok", "pg": pg_id}, b""
 
-    async def on_remove_pg(self, peer, m, payload):
+    async def on_remove_pg(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
             return await self._forward_head(m)
-        self.pgs.pop(m.get("pg"), None)
+        pg_id: Any = m.get("pg")
+        self.pgs.pop(pg_id, None)
         return {"t": "remove_pg_ok"}, b""
 
-    async def on_pg_table(self, peer, m, payload):
+    async def on_pg_table(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
             return await self._forward_head(m)
 
-        def encode(pg):
+        def encode(pg: list[dict[str, Any]]) -> list[dict[str, Any]]:
             out = []
             for b in pg:
                 spec = {"GPU": 1} if b["gpu"] >= 0 else {}
@@ -382,12 +404,12 @@ class Daemon:
             pg = self.pgs.get(pg_id)
             if pg is None:
                 return {"err": "unknown placement group %s" % pg_id}, b""
-            data = {"bundles": encode(pg)}
+            data: dict[str, Any] = {"bundles": encode(pg)}
         else:
             data = {"pgs": {k: encode(v) for k, v in self.pgs.items()}}
         return {"t": "pg_table_ok", "data": data}, b""
 
-    async def on_resources(self, peer, m, payload):
+    async def on_resources(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if not self.is_head:
             return await self._forward_head({"t": "resources"})
         out = {}
@@ -400,11 +422,13 @@ class Daemon:
         return {"t": "resources_ok", "data": out}, b""
 
     # ---- actors ----
-    async def on_create_actor(self, peer, m, payload):
+    async def on_create_actor(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if self.is_head:
             node, gpus, err = self._place_actor(m)
             if err:
                 return {"err": err}, b""
+            # _place_actor returns non-None node/gpus whenever err is falsy
+            assert node is not None and gpus is not None
             actor_id = self._next_id("a")
             self.actor_loc[actor_id] = node
             if peer is not None:
@@ -439,7 +463,9 @@ class Daemon:
             return await self._forward_head(m, payload)
         return await self._host_actor(m, payload)
 
-    def _place_actor(self, m):
+    def _place_actor(
+        self, m: dict
+    ) -> tuple[str | None, list[int] | None, str | None]:
         pg_id = m.get("pg")
         if pg_id:
             pg = self.pgs.get(pg_id)
@@ -466,7 +492,7 @@ class Daemon:
                 return self.node_id, [i], None
         return None, None, "no free GPU for actor"
 
-    async def _host_actor(self, m, payload):
+    async def _host_actor(self, m: dict, payload: bytes) -> tuple[dict, bytes]:
         actor_id = m["actor"]
         gpus = m.get("gpus", []) or []
         fut = asyncio.get_running_loop().create_future()
@@ -487,9 +513,10 @@ class Daemon:
         self.actors[actor_id] = ActorProc(actor_id, peer, gpus, proc)
         return {"t": "create_actor_ok", "actor": actor_id, "gpus": gpus}, b""
 
-    def _spawn_worker(self, actor_id, gpus):
+    def _spawn_worker(self, actor_id: str, gpus: list[int]) -> subprocess.Popen:
         cmdline = os.environ.get("BEAM_WORKER_CMD", "python3 -m ray._worker")
         ids = ",".join(str(g) for g in gpus)
+        assert self.sock_path is not None  # serve_unix runs before any actor spawn
         env = dict(os.environ)
         env.update(
             {
@@ -504,13 +531,13 @@ class Daemon:
         )
         return subprocess.Popen(shlex.split(cmdline), env=env)
 
-    async def on_worker_hello(self, peer, m, payload):
+    async def on_worker_hello(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         fut = self.pending_workers.pop(m["actor"], None)
         if fut and not fut.done():
             fut.set_result(peer)
         return {"t": "worker_hello_ok"}, b""
 
-    async def on_call(self, peer, m, payload):
+    async def on_call(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         if self.is_head:
             node = self.actor_loc.get(m["actor"])
             if node and node != self.node_id:
@@ -534,7 +561,9 @@ class Daemon:
         asyncio.create_task(self._dispatch(ap, m["method"], payload, slot))
         return {"t": "call_ok", "obj": obj_id}, b""
 
-    async def _dispatch(self, ap, method, payload, slot):
+    async def _dispatch(
+        self, ap: ActorProc, method: str, payload: bytes, slot: ObjSlot
+    ) -> None:
         try:
             async with ap.lock:  # serialize per actor
                 _, rpl = await ap.peer.call({"t": "method", "method": method}, payload)
@@ -544,7 +573,7 @@ class Daemon:
         finally:
             slot.ev.set()
 
-    async def on_kill(self, peer, m, payload):
+    async def on_kill(self, peer: Peer | None, m: dict, payload: bytes) -> tuple[dict, bytes]:
         actor_id = m["actor"]
         if self.is_head:
             node = self.actor_loc.pop(actor_id, None)
@@ -568,7 +597,7 @@ class Daemon:
         return {"t": "kill_ok"}, b""
 
     # ---- objects ----
-    async def on_put(self, peer, m, payload):
+    async def on_put(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         obj_id = self._next_obj()
         slot = ObjSlot()
         slot.data = payload
@@ -576,7 +605,7 @@ class Daemon:
         self.objects[obj_id] = slot
         return {"t": "put_ok", "obj": obj_id}, b""
 
-    async def on_get(self, peer, m, payload):
+    async def on_get(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         obj_id = m["obj"]
         owner = owner_of(obj_id)
         if owner != self.node_id:
@@ -602,7 +631,7 @@ class Daemon:
             return {"err": slot.err}, b""
         return {"t": "get_ok", "obj": obj_id}, slot.data
 
-    async def on_stat(self, peer, m, payload):
+    async def on_stat(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         """Report readiness without blocking (backs ray.wait). 'ready' is a plain
         bool, never an error, so the client does not raise on not-ready."""
         obj_id = m["obj"]
@@ -619,7 +648,7 @@ class Daemon:
         return {"t": "stat_ok", "ready": bool(slot and slot.ev.is_set())}, b""
 
     # ---- cleanup ----
-    async def release_client(self, peer):
+    async def release_client(self, peer: Peer) -> None:
         """When a driver disconnects, free the placement groups and actors it
         created so their GPUs return to the pool (no leak across runs)."""
         if not self.is_head:
@@ -632,7 +661,7 @@ class Daemon:
         for pg_id in list(peer.created_pgs):
             self.pgs.pop(pg_id, None)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Reap every actor worker subprocess this daemon spawned. Called on a
         clean daemon stop so workers don't orphan to init."""
         for ap in list(self.actors.values()):

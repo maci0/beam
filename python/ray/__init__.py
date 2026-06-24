@@ -9,6 +9,8 @@ from __future__ import annotations  # keep PEP604 annotations valid on py3.9
 import os
 import socket
 import time
+from collections.abc import Iterable
+from typing import Any
 
 from . import (
     _proto,
@@ -31,11 +33,16 @@ __version__ = "2.43.0"
 # ---- lifecycle ----
 
 
-def init(address=None, *args, ignore_reinit_error=False, **kwargs):
+def init(
+    address: str | None = None,
+    *args: Any,
+    ignore_reinit_error: bool = False,
+    **kwargs: Any,
+) -> _RuntimeContext | None:
     global _client
     if _client is not None:
         if ignore_reinit_error:
-            return
+            return None
         raise RuntimeError("ray already initialized")
     _client = DaemonClient()
     return _RuntimeContext()
@@ -45,7 +52,7 @@ def is_initialized() -> bool:
     return _client is not None
 
 
-def shutdown(*args, **kwargs):
+def shutdown(*args: Any, **kwargs: Any) -> None:
     global _client
     if _client is not None:
         _client.close()
@@ -64,39 +71,39 @@ def _need() -> DaemonClient:
 class ObjectRef:
     __slots__ = ("id", "_value", "_has_value")
 
-    def __init__(self, obj_id, value=None, has_value=False):
+    def __init__(self, obj_id: str, value: Any = None, has_value: bool = False) -> None:
         self.id = obj_id
         self._value = value
         self._has_value = has_value
 
     # equal by id, like real ray, so refs work as dict keys / in membership tests
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, ObjectRef) and other.id == self.id
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.id)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "ObjectRef(%s)" % self.id
 
 
-def put(obj) -> ObjectRef:
+def put(obj: Any) -> ObjectRef:
     resp, _ = _need().request({"t": "put"}, _proto.dumps(obj))
     return ObjectRef(resp["obj"])
 
 
-def get(refs, timeout=None):
+def get(refs: ObjectRef | Iterable[ObjectRef], timeout: float | None = None) -> Any:
     from .exceptions import GetTimeoutError
 
     single = isinstance(refs, ObjectRef)
-    items = [refs] if single else list(refs)
+    items: list[ObjectRef] = [refs] if isinstance(refs, ObjectRef) else list(refs)
     deadline = None if timeout is None else time.time() + timeout
     out = []
     for ref in items:
         if getattr(ref, "_has_value", False):
             out.append(ref._value)
             continue
-        req = {"t": "get", "obj": ref.id}
+        req: dict[str, Any] = {"t": "get", "obj": ref.id}
         if deadline is not None:
             req["timeout"] = max(0.0, deadline - time.time())  # one global deadline
         try:
@@ -109,12 +116,19 @@ def get(refs, timeout=None):
     return out[0] if single else out
 
 
-def wait(refs, *, num_returns=1, timeout=None, **kwargs):
+def wait(
+    refs: Iterable[ObjectRef],
+    *,
+    num_returns: int = 1,
+    timeout: float | None = None,
+    **kwargs: Any,
+) -> tuple[list[ObjectRef], list[ObjectRef]]:
     refs = list(refs)
     num_returns = min(num_returns, len(refs))  # never block waiting for more than exist
     deadline = None if timeout is None else time.time() + timeout
     while True:
-        ready, not_ready = [], []
+        ready: list[ObjectRef] = []
+        not_ready: list[ObjectRef] = []
         for ref in refs:
             if getattr(ref, "_has_value", False):
                 ready.append(ref)
@@ -130,11 +144,11 @@ def wait(refs, *, num_returns=1, timeout=None, **kwargs):
 
 
 class _RemoteMethod:
-    def __init__(self, handle, name):
+    def __init__(self, handle: ActorHandle, name: str) -> None:
         self._handle = handle
         self._name = name
 
-    def remote(self, *args, **kwargs):
+    def remote(self, *args: Any, **kwargs: Any) -> ObjectRef:
         payload = _proto.dumps((args, kwargs))
         resp, _ = _need().request(
             {"t": "call", "actor": self._handle._actor_id, "method": self._name},
@@ -144,26 +158,26 @@ class _RemoteMethod:
 
 
 class ActorHandle:
-    def __init__(self, actor_id):
+    def __init__(self, actor_id: str) -> None:
         self._actor_id = actor_id
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> _RemoteMethod:
         if name.startswith("__"):
             raise AttributeError(name)
         return _RemoteMethod(self, name)
 
 
 class _RemoteClass:
-    def __init__(self, cls, options):
+    def __init__(self, cls: type, options: dict) -> None:
         self._cls = cls
         self._options = options
 
-    def options(self, **opts):
+    def options(self, **opts: Any) -> _RemoteClass:
         merged = dict(self._options)
         merged.update(opts)
         return _RemoteClass(self._cls, merged)
 
-    def remote(self, *args, **kwargs):
+    def remote(self, *args: Any, **kwargs: Any) -> ActorHandle:
         opts = self._options
         num_gpus = float(opts.get("num_gpus", 0) or 0)  # keep fractional (0.5) intact
         pg_id, bundle = "", 0
@@ -182,13 +196,13 @@ class _RemoteClass:
         return ActorHandle(resp["actor"])
 
 
-def kill(actor, *args, **kwargs):
+def kill(actor: Any, *args: Any, **kwargs: Any) -> None:
     """Terminate an actor's worker subprocess (ray.kill)."""
     if isinstance(actor, ActorHandle):
         _need().request({"t": "kill", "actor": actor._actor_id})
 
 
-def remote(*args, **options):
+def remote(*args: Any, **options: Any) -> Any:
     """``ray.remote`` as a bare decorator or with options.
 
     Supports the two forms vLLM uses:
@@ -198,7 +212,7 @@ def remote(*args, **options):
         ray.remote(num_gpus=1, scheduling_strategy=...)(W).remote(...)
     """
 
-    def wrap(cls):
+    def wrap(cls: Any) -> _RemoteClass:
         if isinstance(cls, _RemoteClass):  # tolerate re-decoration
             merged = dict(cls._options)
             merged.update(options)
@@ -217,13 +231,13 @@ class _RuntimeContext:
     def get_node_id(self) -> str:
         return os.environ.get("BEAM_NODE_ID") or _local_node_id()
 
-    def get_accelerator_ids(self):
+    def get_accelerator_ids(self) -> dict[str, list[str]]:
         ids = os.environ.get("BEAM_GPU_IDS", "")
         return {"GPU": [g for g in ids.split(",") if g]}
 
     # some vLLM paths read .gpu_ids directly
     @property
-    def gpu_ids(self):
+    def gpu_ids(self) -> list[int]:
         return get_gpu_ids()
 
 
@@ -231,26 +245,26 @@ def get_runtime_context() -> _RuntimeContext:
     return _RuntimeContext()
 
 
-def get_gpu_ids():
+def get_gpu_ids() -> list[int]:
     ids = os.environ.get("BEAM_GPU_IDS", "")
     return [int(g) for g in ids.split(",") if g]
 
 
-def _status_nodes():
+def _status_nodes() -> list[dict]:
     resp, _ = _need().request({"t": "status"})
     return resp.get("nodes") or []
 
 
-def cluster_resources():
-    res = {}
+def cluster_resources() -> dict[str, float]:
+    res: dict[str, float] = {}
     for n in _status_nodes():
         res["GPU"] = res.get("GPU", 0.0) + n.get("ngpu", 0)
         res["CPU"] = res.get("CPU", 0.0) + 1.0
     return res
 
 
-def available_resources():
-    res = {}
+def available_resources() -> dict[str, float]:
+    res: dict[str, float] = {}
     for n in _status_nodes():
         free = n.get("ngpu", 0) - n.get("used", 0)
         res["GPU"] = res.get("GPU", 0.0) + max(0, free)
@@ -258,7 +272,7 @@ def available_resources():
     return res
 
 
-def nodes():
+def nodes() -> list[dict]:
     out = []
     for n in _status_nodes():
         out.append(

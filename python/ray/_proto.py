@@ -5,8 +5,12 @@ Frame layout (must match encode_frame/read_frame in _daemon.py):
 The header's ``plen`` field gives the length of the raw payload that follows.
 """
 
+from __future__ import annotations  # keep PEP585 generics valid on py3.9
+
 import json
+import socket
 import struct
+from typing import Any
 
 # sanity bound so a corrupt length can't trigger a multi-GB allocation/hang.
 # headers are small JSON; payloads are pickled actor results (a few MB at most).
@@ -18,22 +22,22 @@ except ImportError:  # pragma: no cover
     import pickle as _pickle
 
 
-def dumps(obj) -> bytes:
+def dumps(obj: Any) -> bytes:
     return _pickle.dumps(obj)
 
 
-def loads(buf: bytes):
+def loads(buf: bytes) -> Any:
     return _pickle.loads(buf)
 
 
-def write_frame(sock, header: dict, payload: bytes = b"") -> None:
+def write_frame(sock: socket.socket, header: dict, payload: bytes = b"") -> None:
     header = dict(header)
     header["plen"] = len(payload)
     hdr = json.dumps(header).encode()
     sock.sendall(struct.pack(">I", len(hdr)) + hdr + payload)
 
 
-def _recv_exact(sock, n: int) -> bytes:
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -43,7 +47,7 @@ def _recv_exact(sock, n: int) -> bytes:
     return bytes(buf)
 
 
-def read_frame(sock):
+def read_frame(sock: socket.socket) -> tuple[dict, bytes]:
     (n,) = struct.unpack(">I", _recv_exact(sock, 4))
     if n == 0 or n > _MAX_FRAME:
         raise ConnectionError("bad frame header length %d" % n)

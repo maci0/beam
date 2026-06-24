@@ -1,5 +1,9 @@
 """``ray.util`` subset: placement groups, scheduling strategies, helpers."""
 
+from __future__ import annotations  # keep `X | None` valid on py3.9
+
+from typing import Any
+
 from . import scheduling_strategies  # noqa: F401
 from .placement_group import (  # noqa: F401
     PlacementGroup,
@@ -15,7 +19,7 @@ def get_node_ip_address() -> str:
     return _get_ip()
 
 
-def placement_group_table(pg=None) -> dict:
+def placement_group_table(pg: Any = None) -> dict:
     """ray.util.placement_group_table: bundle index -> node id and spec.
 
     With a placement group, returns one table; without, all tables keyed by id.
@@ -28,7 +32,7 @@ def placement_group_table(pg=None) -> dict:
     resp, _ = _need().request(header)
     data = resp.get("data") or {}
 
-    def table(bundle_list):
+    def table(bundle_list: list[dict]) -> dict:
         return {
             "bundles_to_node_id": {i: b["node"] for i, b in enumerate(bundle_list)},
             "bundles": {i: b["spec"] for i, b in enumerate(bundle_list)},

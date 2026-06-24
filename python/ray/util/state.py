@@ -2,15 +2,19 @@
 scaling path). Backed by the daemon status.
 """
 
+from __future__ import annotations  # keep PEP585 generics valid on py3.9
+
+from typing import Any
+
 
 class _NodeState:
-    def __init__(self, node_id, node_ip, state="ALIVE"):
+    def __init__(self, node_id: str, node_ip: str, state: str = "ALIVE") -> None:
         self.node_id = node_id
         self.node_ip = node_ip
         self.state = state
 
 
-def list_nodes(*args, **kwargs):
+def list_nodes(*args: Any, **kwargs: Any) -> list[_NodeState]:
     from .. import _status_nodes
 
     return [

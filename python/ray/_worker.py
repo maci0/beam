@@ -13,7 +13,7 @@ import traceback
 from . import _proto
 
 
-def _reply(sock, req, payload=b"", err=""):
+def _reply(sock: socket.socket, req: dict, payload: bytes = b"", err: str = "") -> None:
     header = {"t": req["t"] + "_ok", "reqid": req.get("reqid", 0), "resp": True}
     if err:
         header["err"] = err
@@ -21,7 +21,7 @@ def _reply(sock, req, payload=b"", err=""):
     _proto.write_frame(sock, header, payload)
 
 
-def main():
+def main() -> None:
     sock_path = os.environ["BEAM_SOCK"]
     actor_id = os.environ["BEAM_ACTOR_ID"]
 

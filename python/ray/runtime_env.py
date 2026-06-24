@@ -6,7 +6,10 @@ puts here are already inherited by the actor subprocess from the daemon.
 """
 
 
+from typing import Any
+
+
 class RuntimeEnv(dict):
     # accept both RuntimeEnv(env_vars=...) and RuntimeEnv({...}), like real ray
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

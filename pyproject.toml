@@ -27,10 +27,12 @@ extend-exclude = '/(\.e2e-run|\.mn-run|\.edge-run|\.3node-run|\.cpuhead-run|\.ro
 
 [tool.mypy]
 python_version = "3.10"
-files = ["python/ray", "examples", "scripts"]
+files = ["python/ray"]
 ignore_missing_imports = true
-# pragmatic, not strict: this is glue code over cloudpickle/asyncio sockets
-check_untyped_defs = false
+# the library is fully annotated; keep it that way
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true

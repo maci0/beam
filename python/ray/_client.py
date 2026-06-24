@@ -24,13 +24,13 @@ def _runtime_sock() -> str:
 
 
 class DaemonClient:
-    def __init__(self, sock_path: str | None = None):
+    def __init__(self, sock_path: str | None = None) -> None:
         self.sock_path = sock_path or _runtime_sock()
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.connect(self.sock_path)
         self._lock = threading.Lock()
 
-    def request(self, header: dict, payload: bytes = b""):
+    def request(self, header: dict, payload: bytes = b"") -> tuple[dict, bytes]:
         with self._lock:
             _proto.write_frame(self._sock, header, payload)
             resp, body = _proto.read_frame(self._sock)
@@ -38,7 +38,7 @@ class DaemonClient:
             raise RuntimeError(resp["err"])
         return resp, body
 
-    def close(self):
+    def close(self) -> None:
         try:
             self._sock.close()
         except OSError:
