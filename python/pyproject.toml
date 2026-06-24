@@ -6,7 +6,7 @@ name = "ray"
 version = "2.43.0"
 description = "beam: a drop-in subset of the ray API for vLLM distributed inference"
 requires-python = ">=3.9"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 dependencies = ["cloudpickle"]
 
 [project.scripts]

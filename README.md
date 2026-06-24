@@ -1,7 +1,7 @@
 # beam
 
 [![CI](https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg)](https://github.com/maci0/beam/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
 A drop-in alternative to [Ray](https://ray.io), scoped to one job: running vLLM
 distributed inference across multiple nodes
@@ -121,3 +121,12 @@ bump as a CI gate:
 Object store for large data, fault tolerance/actor restart, autoscaling, the
 dashboard, non-actor tasks, and `VLLM_USE_RAY_COMPILED_DAG`. vLLM's distributed
 inference path needs none of these.
+
+## License
+
+[GNU AGPL-3.0-or-later](LICENSE). Copyleft: changes to beam stay open, and
+because it runs as an inference service, the AGPL network clause means anyone
+offering a modified beam over a network must make their source available. beam
+imports cleanly into other-licensed code (vLLM is Apache-2.0); the copyleft
+covers beam and its derivatives, not the model you serve or the rest of your
+stack.
