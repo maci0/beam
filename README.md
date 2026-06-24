@@ -12,7 +12,7 @@ cluster membership, GPU accounting, placement groups, and an actor-call hub.
 The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactly
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
 
-**~1,430 lines, 124 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
+**~1,470 lines, 124 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
 (see [DESIGN.md](DESIGN.md#size-vs-ray)).
 
 ## Documentation
