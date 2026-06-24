@@ -34,6 +34,8 @@ itself on first start.
 
     mkdir -p /opt/beam
     cp -r python examples /opt/beam/      # /opt/beam/{python,examples}
+    # or grab the bundle from a release:
+    #   curl -sL https://github.com/maci0/beam/releases/latest/download/beam-bindmount-<tag>.tar.gz | tar xz -C /opt/beam --strip-components=0
 
     # head node (stock image, one mount, image python as entrypoint)
     docker run -d --name beam-head --network host --gpus all --ipc host \
@@ -50,14 +52,24 @@ itself on first start.
     docker exec beam-head python3 -m ray status
 
     # serve, pointing vLLM at the ray backend (runs in the head container)
-    docker exec beam-head vllm serve <model> \
+    docker exec -e VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 beam-head vllm serve <model> \
         --tensor-parallel-size 2 \
         --distributed-executor-backend ray
+
+    # then hit it
+    docker exec beam-head curl -s localhost:8000/v1/completions \
+        -H 'Content-Type: application/json' \
+        -d '{"model":"<model>","prompt":"The capital of France is","max_tokens":8}'
 
 vLLM's `import ray`, placement-group creation, and per-worker RPCs are served by
 beam. GPUs are detected from `/dev/nvidia*`; override with `--num-gpus N` or
 `BEAM_NUM_GPUS` (DGX Spark / GB10 needs the override, its device nodes are not
 `/dev/nvidia*`).
+
+`VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1` selects vLLM's MessageQueue-based ray
+executor, which is the one beam implements (it does not implement Ray Compiled
+Graph). Recent vLLM falls back to it automatically, but setting it is the
+reliable choice and some images (e.g. ROCm) need it explicitly.
 
 `test/dgx/` is a ready-made harness for two DGX Spark nodes (deploy, up,
 control-plane test, vllm-test) and is verified end-to-end on real GB10 nodes. See
