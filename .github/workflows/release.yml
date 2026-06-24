@@ -18,8 +18,8 @@ jobs:
         run: cd python && uv build --out-dir dist
 
       - name: Bundle the bind-mount payload
-        # the package + examples are all a container needs (no compiled artifacts)
-        run: tar czf beam-bindmount-${GITHUB_REF_NAME}.tar.gz python examples
+        # the shim + examples are all a container needs; exclude build output and caches
+        run: tar czf beam-bindmount-${GITHUB_REF_NAME}.tar.gz --exclude='python/dist' --exclude='__pycache__' python examples
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
