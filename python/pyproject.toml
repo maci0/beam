@@ -1,0 +1,20 @@
+[project]
+# Distribution is named "ray" so it shadows the real package: `import ray`,
+# `importlib.metadata.version("ray")`, and the `ray` console script all resolve
+# to beam. vLLM's distributed-executor backend uses this.
+name = "ray"
+version = "2.43.0"
+description = "beam: a drop-in subset of the ray API for vLLM distributed inference"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = ["cloudpickle"]
+
+[project.scripts]
+ray = "ray._cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ray"]
