@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 210" width="340" role="img" aria-label="beam">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="720" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#06b6d4"/>
+      <stop offset="0.5" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <!-- the control plane: cluster nodes joined by a beam -->
+  <line x1="64" y1="56" x2="656" y2="56" stroke="url(#g)" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="64" cy="56" r="15" fill="url(#g)"/>
+  <circle cx="360" cy="56" r="11" fill="url(#g)"/>
+  <circle cx="656" cy="56" r="15" fill="url(#g)"/>
+  <!-- wordmark -->
+  <text x="360" y="182" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="132" font-weight="800" letter-spacing="4" fill="url(#g)">beam</text>
+</svg>

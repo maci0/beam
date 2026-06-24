@@ -1,7 +1,7 @@
 """beam: a drop-in subset of the ``ray`` API, scoped to what vLLM's
 RayDistributedExecutor uses for distributed inference.
 
-Only the surface vLLM imports is implemented. See DESIGN.md for the contract.
+Only the surface vLLM imports is implemented. See docs/DESIGN.md for the contract.
 """
 
 from __future__ import annotations  # keep PEP604 annotations valid on py3.9

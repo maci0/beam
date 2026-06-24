@@ -1,23 +1,32 @@
-# beam
+<p align="center">
+  <img src="docs/logo.svg" alt="beam" width="320">
+</p>
 
-[![CI](https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg)](https://github.com/maci0/beam/actions/workflows/ci.yml)
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+<p align="center">
+  <b>A drop-in alternative to <a href="https://ray.io">Ray</a>, scoped to one job:<br>making vLLM distributed inference work across nodes.</b>
+</p>
 
-A drop-in alternative to [Ray](https://ray.io), scoped to one job: running vLLM
-distributed inference across multiple nodes
-([vLLM parallelism & scaling](https://docs.vllm.ai/en/v0.23.0/serving/parallelism_scaling/)).
+<p align="center">
+  <a href="https://github.com/maci0/beam/actions/workflows/ci.yml"><img src="https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="coverage">
+  <img src="https://img.shields.io/badge/tests-273-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/mypy-strict-blue" alt="mypy strict">
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="python 3.9+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license AGPL-3.0"></a>
+</p>
 
 It implements only the slice of Ray that vLLM's `RayDistributedExecutor` uses:
 cluster membership, GPU accounting, placement groups, and an actor-call hub.
 The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactly
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
+([vLLM parallelism & scaling](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/).)
 
 **~1,470 lines, 124 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
-(see [DESIGN.md](DESIGN.md#size-vs-ray)).
+(see [docs/DESIGN.md](docs/DESIGN.md#size-vs-ray)).
 
 ## Documentation
 
-- [DESIGN.md](DESIGN.md) — rationale and scope (why it's this small, the contract)
+- [docs/DESIGN.md](docs/DESIGN.md) — rationale and scope (why it's this small, the contract)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, topology, end-to-end startup walkthrough
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — wire format and every message type
 - [docs/API.md](docs/API.md) — the full ray surface implemented, mapped to daemon ops

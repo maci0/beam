@@ -6,7 +6,7 @@ to the head and execute create/call/get/kill requests pushed down it.
 
 This is pure control plane: it launches actor subprocesses, assigns GPUs, routes
 method-call RPCs, and gathers small results. Tensor traffic goes over NCCL,
-never through here. See DESIGN.md.
+never through here. See docs/DESIGN.md.
 """
 
 from __future__ import annotations  # keep `X | None` valid on py3.9

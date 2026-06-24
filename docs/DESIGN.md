@@ -124,7 +124,7 @@ owner without a lookup.
 
 ## Wire protocol
 
-Full message reference in [docs/PROTOCOL.md](docs/PROTOCOL.md). In brief, one
+Full message reference in [docs/PROTOCOL.md](PROTOCOL.md). In brief, one
 framing for every link (unix and TCP):
 
     [4-byte big-endian length][JSON header][optional raw payload]
