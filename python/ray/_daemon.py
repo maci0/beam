@@ -75,7 +75,9 @@ class Peer:
         self.wlock = asyncio.Lock()
         self.on_close: Callable[[], Any] | None = None
         self.closed = False
-        self._tasks: set[asyncio.Task] = set()  # keep handler task refs so they aren't GC'd mid-flight
+        self._tasks: set[asyncio.Task] = (
+            set()
+        )  # keep handler task refs so they aren't GC'd mid-flight
         # per-client ownership, for cleanup on disconnect
         self.created_pgs: list[str] = []
         self.created_actors: list[str] = []
@@ -247,9 +249,7 @@ class Daemon:
     async def serve_tcp(self, host: str, port: int) -> None:
         await asyncio.start_server(self._on_conn, host=host, port=port)
 
-    async def _on_conn(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _on_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = Peer(reader, writer, self.handle)
         # default: if this turns out to be a driver, free its resources on close.
         # on_hello overwrites this for joining worker daemons (-> _drop_node).
@@ -463,9 +463,7 @@ class Daemon:
             return await self._forward_head(m, payload)
         return await self._host_actor(m, payload)
 
-    def _place_actor(
-        self, m: dict
-    ) -> tuple[str | None, list[int] | None, str | None]:
+    def _place_actor(self, m: dict) -> tuple[str | None, list[int] | None, str | None]:
         pg_id = m.get("pg")
         if pg_id:
             pg = self.pgs.get(pg_id)
@@ -561,9 +559,7 @@ class Daemon:
         asyncio.create_task(self._dispatch(ap, m["method"], payload, slot))
         return {"t": "call_ok", "obj": obj_id}, b""
 
-    async def _dispatch(
-        self, ap: ActorProc, method: str, payload: bytes, slot: ObjSlot
-    ) -> None:
+    async def _dispatch(self, ap: ActorProc, method: str, payload: bytes, slot: ObjSlot) -> None:
         try:
             async with ap.lock:  # serialize per actor
                 _, rpl = await ap.peer.call({"t": "method", "method": method}, payload)

@@ -61,10 +61,15 @@ def _usage() -> int:
     sys.stderr.write(
         "beam: a drop-in subset of ray for vLLM distributed inference\n\n"
         "usage:\n"
-        "  ray start --head [--port 6379] [--num-gpus N]   start the head (blocks)\n"
-        "  ray start --address HOST:PORT [--num-gpus N]     join a cluster (blocks)\n"
-        "  ray status                                       show cluster nodes/GPUs\n"
-        "  ray stop                                         stop the local daemon\n"
+        "  ray start --head [--port 6379] [--num-gpus N] [--node-ip IP]   start head (blocks)\n"
+        "  ray start --address HOST:PORT [--num-gpus N]                   join cluster (blocks)\n"
+        "  ray status                                  show cluster nodes/GPUs (exit 1 if any down)\n"
+        "  ray stop                                    stop the local daemon, clean its runtime files\n\n"
+        "environment:\n"
+        "  BEAM_NUM_GPUS     override detected GPU count (set on boxes without /dev/nvidia*)\n"
+        "  BEAM_RUNTIME_DIR  daemon state dir (default ~/.beam)\n"
+        "  BEAM_SOCK         daemon unix socket (else read from the runtime dir)\n"
+        "  BEAM_WORKER_CMD   how to launch an actor (default 'python3 -m ray._worker')\n"
     )
     return 2
 
@@ -74,7 +79,24 @@ def _start(args: list[str]) -> int:
     port = 6379
     address = None
     num_gpus = None
+    node_ip = None
     i = 0
+
+    def grab(name: str) -> str:
+        nonlocal i
+        if i + 1 >= len(args):
+            sys.stderr.write("beam: %s expects a value\n" % name)
+            sys.exit(2)
+        i += 1
+        return args[i]
+
+    def as_int(val: str, name: str) -> int:
+        try:
+            return int(val)
+        except ValueError:
+            sys.stderr.write("beam: %s expects an integer, got %r\n" % (name, val))
+            sys.exit(2)
+
     while i < len(args):
         a = args[i]
         if a == "--head":
@@ -82,20 +104,23 @@ def _start(args: list[str]) -> int:
         elif a == "--block":
             pass  # always blocks; accepted for compatibility
         elif a == "--port":
-            i += 1
-            port = int(args[i])
+            port = as_int(grab("--port"), "--port")
         elif a.startswith("--port="):
-            port = int(a.split("=", 1)[1])
+            port = as_int(a.split("=", 1)[1], "--port")
         elif a == "--address":
-            i += 1
-            address = args[i]
+            address = grab("--address")
         elif a.startswith("--address="):
             address = a.split("=", 1)[1]
         elif a == "--num-gpus":
-            i += 1
-            num_gpus = int(args[i])
+            num_gpus = as_int(grab("--num-gpus"), "--num-gpus")
         elif a.startswith("--num-gpus="):
-            num_gpus = int(a.split("=", 1)[1])
+            num_gpus = as_int(a.split("=", 1)[1], "--num-gpus")
+        elif a == "--node-ip":
+            node_ip = grab("--node-ip")
+        elif a.startswith("--node-ip="):
+            node_ip = a.split("=", 1)[1]
+        elif a in ("-h", "--help"):
+            return _usage()
         else:
             sys.stderr.write("beam: unknown flag %r\n" % a)
             return 2
@@ -106,8 +131,13 @@ def _start(args: list[str]) -> int:
 
     maybe_bootstrap()
     gpus = _daemon.detect_gpus(num_gpus)
+    if gpus == 0 and num_gpus is None and not os.environ.get("BEAM_NUM_GPUS"):
+        sys.stderr.write(
+            "beam: detected 0 GPUs (no /dev/nvidia*). If this node has GPUs, set "
+            "--num-gpus N or BEAM_NUM_GPUS (e.g. GB10/ROCm device nodes differ).\n"
+        )
     node_id = _daemon.new_node_id()
-    ip = _local_ip()
+    ip = node_ip or _local_ip()
     return asyncio.run(_run_daemon(head, node_id, ip, gpus, port, address))
 
 
@@ -125,14 +155,33 @@ async def _run_daemon(
 
     rt = {"sock": sock, "node": node_id, "head": head, "pid": os.getpid()}
     if head:
-        await d.serve_tcp("0.0.0.0", port)
+        try:
+            await d.serve_tcp("0.0.0.0", port)
+        except OSError as e:
+            sys.stderr.write(
+                "beam head: cannot bind port %d (%s). Another head running? "
+                "Run 'ray stop' first, or pick another --port.\n" % (port, e)
+            )
+            return 1
         rt["addr"] = "%s:%d" % (ip, port)
-        print("beam head started on %s:%d (%d GPUs)" % (ip, port, gpus))
+        # the control plane is unauthenticated (see SECURITY in README): keep :port
+        # on a trusted/private network only.
+        print(
+            "beam head started on %s:%d (%d GPUs), control port open on 0.0.0.0" % (ip, port, gpus)
+        )
         print("join with:  ray start --address %s:%d" % (ip, port))
     else:
         assert address is not None  # _start guarantees --address when not --head
         host, _, p = address.partition(":")
-        await d.join_head(host, int(p or 6379))
+        print("beam worker: joining head at %s (retrying until it answers)..." % address)
+        try:
+            await d.join_head(host, int(p or 6379))
+        except OSError as e:
+            sys.stderr.write(
+                "beam worker: head not reachable at %s (%s). Check it is up and the "
+                "port is open between nodes.\n" % (address, e)
+            )
+            return 1
         rt["addr"] = address
         print("beam worker joined %s (%d GPUs)" % (address, gpus))
 
@@ -180,10 +229,12 @@ def _status() -> int:
         sys.stderr.write("beam status: %s\n" % resp["err"])
         return 1
     nodes = resp.get("nodes") or []
-    tot = used = 0
-    print("node                 ip                 GPUs   alive  role")
+    tot = used = down = 0
+    print("node                 ip                 GPUs   state  role")
     for nd in nodes:
         role = "head" if nd.get("head") else "worker"
+        alive = nd.get("alive", True)
+        down += 0 if alive else 1
         print(
             "%-20s %-18s %d/%-4d %-6s %s"
             % (
@@ -191,13 +242,16 @@ def _status() -> int:
                 nd.get("ip", ""),
                 nd.get("used", 0),
                 nd.get("ngpu", 0),
-                nd.get("alive", True),
+                "up" if alive else "DOWN",
                 role,
             )
         )
         tot += nd.get("ngpu", 0)
         used += nd.get("used", 0)
     print("\ncluster: %d nodes, %d/%d GPUs used" % (len(nodes), used, tot))
+    if down:
+        sys.stderr.write("beam status: %d node(s) DOWN\n" % down)
+        return 1  # so `ray status && ...` health checks fail on a dropped node
     return 0
 
 
@@ -212,17 +266,47 @@ def _recv(sock: socket.socket, n: int) -> bytes:
 
 
 def _stop() -> int:
+    import time
+
     try:
         rt = _read_runtime()
     except OSError:
         sys.stderr.write("beam stop: no running daemon found\n")
         return 1
-    pid = rt.get("pid")
+    pid = int(rt.get("pid") or 0)
+    alive = False
     if pid:
         try:
             os.kill(pid, signal.SIGTERM)
+            alive = True
+        except ProcessLookupError:
+            pass  # already gone; fall through to clean up its stale files
+        except OSError as e:
+            sys.stderr.write("beam stop: cannot signal pid %s: %s\n" % (pid, e))
+    if alive:
+        for _ in range(50):  # up to ~5s for a clean exit, then SIGKILL
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    # remove stale runtime files so a later status/connect doesn't hit a dead socket
+    for path in (rt.get("sock"), _runtime_path()):
+        try:
+            if path:
+                os.remove(path)
         except OSError:
             pass
+    print(
+        "beam stop: stopped pid %s" % pid
+        if alive
+        else "beam stop: no live daemon (cleaned stale files)"
+    )
     return 0
 
 
