@@ -298,6 +298,12 @@ def _local_node_id() -> str:
 
 
 def _get_ip() -> str:
+    # Prefer an explicitly configured cluster IP. The 8.8.8.8 heuristic below
+    # returns the default-route interface, which on a multi-homed host (router,
+    # VM bridges) is often not the cluster LAN the other nodes reach us on.
+    env_ip = os.environ.get("BEAM_NODE_IP") or os.environ.get("VLLM_HOST_IP")
+    if env_ip:
+        return env_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
