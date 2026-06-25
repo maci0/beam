@@ -99,7 +99,8 @@ Both checks fake the GPU count and need no torch/CUDA (only `uv` + cloudpickle):
 ## Validated topologies
 
 Each row ran end to end on real hardware (or fake-GPU control plane where noted).
-The data plane is always NCCL/RCCL; beam carries only the control plane.
+The data plane is NCCL/RCCL on GPU backends, or gloo (torch.distributed) on the
+CPU/Vulkan backend; beam carries only the control plane either way.
 
 | topology | hardware | result | harness |
 |---|---|---|---|
@@ -110,13 +111,31 @@ The data plane is always NCCL/RCCL; beam carries only the control plane.
 | 4-node CPU control plane | 4 machines, fake GPUs | 1 actor/node, cross-node placement ✓ | `test/run_cpu_cluster.sh` |
 | Single node AMD ROCm, TP=1 | RX 7900 XTX, vLLM 0.23 | inference ✓ | `test/run_rocm.sh` |
 | Cross-node AMD control plane | 2 AMD nodes | placement + RCCL **init** on both ranks ✓ | `test/run_rocm_2node.sh` |
+| **2 nodes, TP=2, Vulkan over gloo** | RX 7900 XTX (gfx1100) + RX 6900 XT (gfx1030), heterogeneous, vllm-vulkan, all-reduce over **gloo/TCP** | inference ✓ (correct output, full data plane closed) | manual 2-node vllm-vulkan |
 
 CPU-only rows fake the GPU count (`BEAM_NUM_GPUS`) to exercise membership,
-placement, and actor RPC without devices. Cross-node AMD RCCL *completion* is
-the one item not closed: blocked every time by hardware/cloud availability
-(homogeneous 2-node AMD with a real network), never by beam. Harnesses for it
-are ready: `test/run_rocm_cluster.sh` (SSH-into-node) and `test/run_rocm_azure.sh`
-(VM + docker).
+placement, and actor RPC without devices.
+
+The **Vulkan-over-gloo** row closes the full cross-node data plane end to end
+(MessageQueue broadcast/response over zmq **and** the tensor-parallel all-reduce
+over gloo), on two different-arch AMD GPUs. Cross-node **RCCL** *completion*
+specifically is the remaining open item: blocked every time by hardware/cloud
+availability (homogeneous 2-node NVIDIA/AMD with a real RDMA network), never by
+beam. Harnesses for it are ready: `test/run_rocm_cluster.sh` (SSH-into-node) and
+`test/run_rocm_azure.sh` (VM + docker).
+
+Two gotchas surfaced closing the gloo row, both worth knowing for any multi-node
+deploy (see [docs/OPERATIONS.md](docs/OPERATIONS.md)):
+
+- **Node IP on multi-homed hosts.** vLLM advertises its zmq queues at
+  `ray.util.get_node_ip_address()`. The default heuristic picks the default-route
+  interface, which on a router/multi-NIC box is often not the cluster LAN. Set
+  `BEAM_NODE_IP` (or `VLLM_HOST_IP`) per node to the reachable address.
+- **Bidirectional reachability.** The all-reduce and the per-worker response
+  queues need the driver to reach the workers (driver→worker), not just
+  worker→driver. A default-deny host firewall (e.g. ufw) that allows the
+  worker→head direction can still silently stall the head→worker queues. Open the
+  cluster subnet between nodes.
 
 ## Keep the shim in sync with vLLM
 

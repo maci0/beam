@@ -128,6 +128,28 @@ disable IB so NCCL falls back to sockets on a chosen interface:
 
 Slower than RoCE, but it proves the whole path end to end without RDMA.
 
+## gloo data plane (CPU / Vulkan backends)
+
+On the CPU platform (which the [vllm-vulkan](https://github.com/ericcurtin/vllm-vulkan)
+plugin rides) the tensor-parallel all-reduce runs over **gloo** instead of
+NCCL/RCCL. beam carries the control plane identically; two extra things matter
+for the gloo data plane across nodes:
+
+- **Advertise the right node IP.** vLLM publishes its zmq message queues at
+  `ray.util.get_node_ip_address()`. The default heuristic returns the
+  default-route interface, which on a multi-homed host (a router, or a box with
+  several NICs / a secondary address on one NIC) is frequently not the address
+  the other nodes reach you on. Set `BEAM_NODE_IP` (preferred) or `VLLM_HOST_IP`
+  per node to the cluster-LAN address, and point gloo at the same interface with
+  `GLOO_SOCKET_IFNAME`.
+- **Reachability must be bidirectional.** Workers connect to the driver's
+  broadcast queue (worker→driver), but the driver also connects to each worker's
+  *response* queue and the all-reduce is peer-to-peer (driver→worker). A
+  default-deny host firewall that only permits the worker→driver direction lets
+  the cluster form and the broadcast queue subscribe, then **silently stalls** at
+  the response-queue/all-reduce barrier. Open the cluster subnet between nodes
+  (e.g. `ufw allow from <subnet>`); ICMP/ssh passing is not enough.
+
 ## AMD GPUs (ROCm)
 
 beam works on AMD the same way it does on NVIDIA: it sets the per-actor device
@@ -252,6 +274,8 @@ vllm serve … --gpu-memory-utilization 0.5 --max-model-len 8192 --enforce-eager
 | worker container exits 137, `OOMKilled=false` | host memory pressure (unified memory) | lower `--gpu-memory-utilization`, add `--enforce-eager` |
 | `placement group needs more GPUs than the cluster has free` | GPUs reserved by a previous run's pg | restart the daemons, or let the driver disconnect (beam frees pgs on disconnect) |
 | `RayWorkerMonitor … connection closed` | a worker actor died; beam correctly detected it | look at that worker's container logs for the real crash (often NCCL or OOM) |
+| engine init hangs at `MessageQueue.wait_until_ready` / first all-reduce, cluster otherwise formed | driver can't reach a worker (one-way firewall, or wrong advertised IP) | open the cluster subnet head→workers; set `BEAM_NODE_IP`/`VLLM_HOST_IP` per node to the LAN address |
+| workers connect but queues never become ready on a multi-homed host | node advertised its default-route IP, not the cluster LAN | set `BEAM_NODE_IP` per node |
 | `Tensor parallel size (N) exceeds available GPUs (1)` warning | benign: vLLM compares TP to per-node GPUs; beam spreads ranks across nodes | ignore (or add GPUs per node) |
 | `import ray` finds the real ray | a real ray is installed in the image | use the stock vllm-openai image (no ray), or uninstall ray |
 
