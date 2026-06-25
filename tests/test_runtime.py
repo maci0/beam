@@ -228,6 +228,9 @@ def test_get_ip_returns_str():
 
 
 def test_get_ip_fallback(monkeypatch):
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
+    monkeypatch.delenv("VLLM_HOST_IP", raising=False)
+
     class DeadSock:
         def connect(self, addr):
             raise OSError("no route")
@@ -240,6 +243,41 @@ def test_get_ip_fallback(monkeypatch):
 
     monkeypatch.setattr(ray.socket, "socket", lambda *a, **k: DeadSock())
     assert ray._get_ip() == "127.0.0.1"
+
+
+def test_get_ip_prefers_beam_node_ip(monkeypatch):
+    # an explicitly configured cluster IP wins over the socket heuristic
+    monkeypatch.setenv("BEAM_NODE_IP", "10.1.2.3")
+
+    def _no_socket(*a, **k):
+        raise AssertionError("socket must not be used when the IP is configured")
+
+    monkeypatch.setattr(ray.socket, "socket", _no_socket)
+    assert ray._get_ip() == "10.1.2.3"
+
+
+def test_get_ip_falls_back_to_vllm_host_ip(monkeypatch):
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
+    monkeypatch.setenv("VLLM_HOST_IP", "10.4.5.6")
+    assert ray._get_ip() == "10.4.5.6"
+
+
+@given(st.text(min_size=1).filter(lambda s: s.strip() and "\x00" not in s))
+def test_get_ip_returns_configured_value(ip):
+    import os
+
+    prev_b = os.environ.get("BEAM_NODE_IP")
+    prev_v = os.environ.get("VLLM_HOST_IP")
+    os.environ.pop("VLLM_HOST_IP", None)
+    os.environ["BEAM_NODE_IP"] = ip
+    try:
+        assert ray._get_ip() == ip
+    finally:
+        os.environ.pop("BEAM_NODE_IP", None)
+        if prev_b is not None:
+            os.environ["BEAM_NODE_IP"] = prev_b
+        if prev_v is not None:
+            os.environ["VLLM_HOST_IP"] = prev_v
 
 
 # ---- remote with placement-group scheduling strategy ------------------------
