@@ -150,6 +150,38 @@ for the gloo data plane across nodes:
   the response-queue/all-reduce barrier. Open the cluster subnet between nodes
   (e.g. `ufw allow from <subnet>`); ICMP/ssh passing is not enough.
 
+## Heterogeneous nodes (different arch / vendor / image)
+
+gloo and beam's control plane are arch- and vendor-agnostic, so a single TP group
+can span an x86 AMD node and an aarch64 NVIDIA node at once (validated: RX 6900 XT
++ GB10, half the model on each, computing on Vulkan). Two things to get right when
+the nodes are not identical:
+
+- **Python minor version must match** across the cluster. beam ships actor classes
+  with cloudpickle (version-specific bytecode); the *arch* does not matter, the
+  *minor* version does. Keep every node on, say, 3.12.
+- **Point each node's actor launcher at the right interpreter.** beam spawns
+  actors with `BEAM_WORKER_CMD` (default `python3 -m ray._worker`). If a node's
+  image keeps vLLM in a venv, its `python3` can't import vLLM and the actor dies
+  with `ModuleNotFoundError: No module named 'vllm'`. Set it per node:
+  `-e BEAM_WORKER_CMD='/opt/venv/bin/python -m ray._worker'`.
+
+### NVIDIA Vulkan inside a container
+
+For the Vulkan backend on an NVIDIA node, the container needs more than
+`--gpus all`. The NVIDIA container runtime injects the **driver** libraries
+(`libGLX_nvidia`, `libnvidia-glcore`, …) but not the userland they link against,
+and the driver's Vulkan ICD will only initialize against a matching libc:
+
+- **Match the base image to the host's distro** (its glibc). A driver built for
+  Ubuntu 24.04 (glibc 2.39) returns `VK_ERROR_INITIALIZATION_FAILED` under a
+  22.04 (glibc 2.35) image — even though `nvidia-smi`/CUDA work. The failure is
+  silent at the ICD-negotiation step.
+- **Install the X/GL userland** `libGLX_nvidia` pulls in: `libx11-6 libxext6
+  libglvnd0 libgl1 libegl1 libvulkan1 libxcb1 libxau6 libxdmcp6`.
+- Run with `-e NVIDIA_DRIVER_CAPABILITIES=all` and `--device /dev/dri/renderD<N>`.
+  `vulkaninfo --summary` should then list the GPU (not just `llvmpipe`).
+
 ## AMD GPUs (ROCm)
 
 beam works on AMD the same way it does on NVIDIA: it sets the per-actor device
