@@ -112,13 +112,19 @@ CPU/Vulkan backend; beam carries only the control plane either way.
 | Single node AMD ROCm, TP=1 | RX 7900 XTX, vLLM 0.23 | inference ✓ | `test/run_rocm.sh` |
 | Cross-node AMD control plane | 2 AMD nodes | placement + RCCL **init** on both ranks ✓ | `test/run_rocm_2node.sh` |
 | **2 nodes, TP=2, Vulkan over gloo** | RX 7900 XTX (gfx1100) + RX 6900 XT (gfx1030), heterogeneous, vllm-vulkan, all-reduce over **gloo/TCP** | inference ✓ (correct output, full data plane closed) | manual 2-node vllm-vulkan |
+| **2 nodes, TP=2, cross-arch + cross-vendor** | **x86_64 AMD RX 6900 XT (RDNA2)** + **aarch64 NVIDIA GB10 (Blackwell)**, vllm-vulkan, all-reduce over **gloo/TCP** | inference ✓ (correct output) | manual 2-node vllm-vulkan |
 
 CPU-only rows fake the GPU count (`BEAM_NUM_GPUS`) to exercise membership,
 placement, and actor RPC without devices.
 
-The **Vulkan-over-gloo** row closes the full cross-node data plane end to end
+The **Vulkan-over-gloo** rows close the full cross-node data plane end to end
 (MessageQueue broadcast/response over zmq **and** the tensor-parallel all-reduce
-over gloo), on two different-arch AMD GPUs. Cross-node **RCCL** *completion*
+over gloo). The last row does it across **two CPU architectures and two GPU
+vendors at once** — half the model sharded onto an x86 AMD RDNA2 card, half onto
+an aarch64 NVIDIA Blackwell GPU, each computing on Vulkan, reducing over gloo;
+beam ships the same actor bytecode to both (same Python minor version) and the
+node-agnostic control plane does not care about arch or vendor. Cross-node
+**RCCL** *completion*
 specifically is the remaining open item: blocked every time by hardware/cloud
 availability (homogeneous 2-node NVIDIA/AMD with a real RDMA network), never by
 beam. Harnesses for it are ready: `test/run_rocm_cluster.sh` (SSH-into-node) and
@@ -136,6 +142,13 @@ deploy (see [docs/OPERATIONS.md](docs/OPERATIONS.md)):
   worker→driver. A default-deny host firewall (e.g. ufw) that allows the
   worker→head direction can still silently stall the head→worker queues. Open the
   cluster subnet between nodes.
+- **Per-node interpreter for heterogeneous images.** beam launches each actor
+  with `BEAM_WORKER_CMD` (default `python3 -m ray._worker`). When a node's image
+  keeps vLLM in a venv rather than the system Python (so `python3` can't import
+  it), set `BEAM_WORKER_CMD` on that node's daemon container to the venv's
+  interpreter, e.g. `-e BEAM_WORKER_CMD='/opt/venv/bin/python -m ray._worker'`.
+  Nodes may run different images/arches; only the Python *minor* version must
+  match across the cluster (cloudpickle bytecode).
 
 ## Keep the shim in sync with vLLM
 
