@@ -133,12 +133,15 @@ def test_start_block_flag_accepted(monkeypatch):
         return _c()
 
     monkeypatch.setattr(_cli, "maybe_bootstrap", lambda: None)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
     monkeypatch.setattr(_cli.asyncio, "run", fake_run)
     monkeypatch.setattr(_cli, "_run_daemon", fake_run_daemon)
     monkeypatch.setattr(_cli._daemon, "detect_gpus", lambda n: 0)
     # space-separated --port and --node-ip forms, plus --block
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
     rc = _cli._start(["--head", "--block", "--port", "6400", "--node-ip", "3.3.3.3"])
     assert rc == 0 and captured["node_ip"] == "3.3.3.3"
+    assert os.environ.get("BEAM_NODE_IP") == "3.3.3.3"  # workers inherit advertised IP
 
 
 def test_start_node_ip_equals_form(monkeypatch):
@@ -157,6 +160,7 @@ def test_start_node_ip_equals_form(monkeypatch):
         return _c()
 
     monkeypatch.setattr(_cli, "maybe_bootstrap", lambda: None)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
     monkeypatch.setattr(_cli.asyncio, "run", fake_run)
     monkeypatch.setattr(_cli, "_run_daemon", fake_run_daemon)
     monkeypatch.setattr(_cli._daemon, "detect_gpus", lambda n: 0)
@@ -228,6 +232,7 @@ def test_start_dispatches_to_run_daemon(monkeypatch):
         return _c()
 
     monkeypatch.setattr(_cli, "maybe_bootstrap", lambda: None)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
     monkeypatch.setattr(_cli.asyncio, "run", fake_run)
     monkeypatch.setattr(_cli, "_run_daemon", fake_run_daemon)
     monkeypatch.setattr(_cli._daemon, "detect_gpus", lambda n: 8)
@@ -254,12 +259,66 @@ def test_start_address_form_parses(monkeypatch):
         return _c()
 
     monkeypatch.setattr(_cli, "maybe_bootstrap", lambda: None)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
     monkeypatch.setattr(_cli.asyncio, "run", fake_run)
     monkeypatch.setattr(_cli, "_run_daemon", fake_run_daemon)
     monkeypatch.setattr(_cli._daemon, "detect_gpus", lambda n: 0)
     monkeypatch.setattr(_cli, "_local_ip", lambda: "1.1.1.1")
     _cli._start(["--address=h:6379"])
     assert captured["head"] is False and captured["address"] == "h:6379"
+
+
+def test_start_refuses_if_daemon_already_running(monkeypatch, capsys):
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: 12345)
+    assert _cli._start(["--head"]) == 1
+    assert "already running" in capsys.readouterr().err
+
+
+def test_live_daemon_pid_corrupt_json_is_stale(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "daemon.json").write_text("{not json")
+    assert _cli._live_daemon_pid() is None
+
+
+def test_live_daemon_pid_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    assert _cli._live_daemon_pid() is None
+
+
+def test_live_daemon_pid_dead_process(tmp_path, monkeypatch):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock", "pid": 1})
+
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    assert _cli._live_daemon_pid() is None
+
+
+def test_live_daemon_pid_eperm_treated_live(tmp_path, monkeypatch):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock", "pid": 9})
+
+    def fake_kill(pid, sig):
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    assert _cli._live_daemon_pid() == 9
+
+
+def test_live_daemon_pid_alive(tmp_path, monkeypatch):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock", "pid": 42})
+    monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)
+    assert _cli._live_daemon_pid() == 42
+
+
+def test_live_daemon_pid_bad_pid_type(tmp_path, monkeypatch):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock", "pid": "nope"})
+    assert _cli._live_daemon_pid() is None
+
+
+def test_live_daemon_pid_zero_pid(tmp_path, monkeypatch):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock", "pid": 0})
+    assert _cli._live_daemon_pid() is None
 
 
 # ---- _run_daemon (head + worker, no real listeners) -------------------------
@@ -312,6 +371,47 @@ def test_run_daemon_head(tmp_path, monkeypatch, capsys):
     assert not os.path.exists(_cli._runtime_path())
     out = capsys.readouterr().out
     assert "beam head started" in out and "shutting down" in out
+
+
+def test_run_daemon_exit_other_pid_leaves_claim(tmp_path, monkeypatch, capsys):
+    """If claim was rewritten to another pid, exit must not delete the sock."""
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _patch_daemon(monkeypatch)
+    import asyncio as aio
+
+    orig_shutdown = _cli._daemon.Daemon.shutdown
+
+    def rewrite_then_shutdown(self):
+        path = _cli._runtime_path()
+        with open(path) as f:
+            rt = json.load(f)
+        rt["pid"] = os.getpid() + 999
+        with open(path, "w") as f:
+            json.dump(rt, f)
+        return orig_shutdown(self)
+
+    monkeypatch.setattr(_cli._daemon.Daemon, "shutdown", rewrite_then_shutdown)
+    rc = aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 0, 6379, None))
+    assert rc == 0
+    assert os.path.exists(_cli._runtime_path())
+
+
+def test_run_daemon_exit_missing_claim(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _patch_daemon(monkeypatch)
+    import asyncio as aio
+
+    orig_shutdown = _cli._daemon.Daemon.shutdown
+
+    def drop_claim_then_shutdown(self):
+        try:
+            os.remove(_cli._runtime_path())
+        except OSError:
+            pass
+        return orig_shutdown(self)
+
+    monkeypatch.setattr(_cli._daemon.Daemon, "shutdown", drop_claim_then_shutdown)
+    assert aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 0, 6379, None)) == 0
 
 
 def test_run_daemon_head_bind_failure(tmp_path, monkeypatch, capsys):
@@ -452,6 +552,333 @@ def test_stop_no_runtime(tmp_path, monkeypatch, capsys):
     assert "no running daemon" in capsys.readouterr().err
 
 
+def test_stop_concurrent_live_stop_waits(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump(
+            {"pid": 55, "stopping": True, "sock": str(sock), "stopped": 1}, f
+        )
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def fake_kill(pid, sig):
+        probes["n"] += 1
+        if probes["n"] < 3:
+            return  # still "alive"
+        raise ProcessLookupError()  # peer stop exited
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    # peer stop died but left an abandoned hold: seize-clean leftovers
+    out = capsys.readouterr().out
+    assert "cleaned leftover stop state" in out
+    assert not sock.exists()
+
+
+def test_stop_concurrent_stop_fully_cleaned(tmp_path, monkeypatch, capsys):
+    """When the peer stop finishes and removes the claim, return cleanly."""
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def fake_kill(pid, sig):
+        probes["n"] += 1
+        if probes["n"] >= 2:
+            # peer stop cleaned the claim
+            try:
+                os.remove(tmp_path / "daemon.json")
+            except OSError:
+                pass
+            raise OSError("gone")
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_concurrent_live_stop_timeout(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 1
+    assert "another stop in progress" in capsys.readouterr().err
+
+
+def test_stop_abandoned_stop_hold_cleans(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+
+    def dead(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(_cli.os, "kill", dead)
+    assert _cli._stop() == 0
+    assert "cleaned leftover stop state" in capsys.readouterr().out
+    assert not sock.exists()
+    assert not (tmp_path / "daemon.json").exists()
+
+
+def test_stop_abandoned_does_not_unlink_live_claim(tmp_path, monkeypatch, capsys):
+    """After seize, if doc is no longer a stop hold, restore and report carefully."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    claim = tmp_path / "daemon.json"
+    with open(claim, "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    # Stay dead for pre-seize probes; after restore, pid 99 is "live".
+    state = {"n": 0}
+
+    def kill_fn(pid, sig):
+        state["n"] += 1
+        if pid == 99:
+            return None  # live daemon after restore
+        raise ProcessLookupError()
+
+    real_rename = os.rename
+
+    def rename_swap(src, dst):
+        real_rename(src, dst)
+        # concurrent rewrite of seized doc to a non-stopping daemon claim
+        with open(dst, "w") as f:
+            json.dump({"pid": 99, "sock": str(sock)}, f)
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    monkeypatch.setattr(_cli.os, "rename", rename_swap)
+    # Restored non-stopping claim with live pid → must not claim success
+    assert _cli._stop() == 1
+    err = capsys.readouterr().err
+    assert "live daemon" in err or "re-run ray stop" in err
+    assert claim.exists()
+
+
+def test_stop_abandoned_does_not_clobber_new_claim(tmp_path, monkeypatch, capsys):
+    """Restore must not rename-over a concurrent start's claim."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    claim = tmp_path / "daemon.json"
+    with open(claim, "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_rename = os.rename
+    real_link = os.link
+
+    def rename_and_reclaim(src, dst):
+        real_rename(src, dst)
+        # concurrent start claims path while we hold seized
+        with open(claim, "w") as f:
+            json.dump({"pid": 99, "sock": str(sock)}, f)
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "rename", rename_and_reclaim)
+    # hold re-check sees live pid 55? seized still has stopping:55 but path is 99
+    # After seize, doc is stopping with pid 55; kill(55) ProcessLookupError → clean
+    # But path exists (new claim) → must not unlink sock
+    assert _cli._stop() == 0
+    assert claim.exists()
+    with open(claim) as f:
+        assert json.load(f)["pid"] == 99
+    assert sock.exists()  # new daemon's sock preserved
+
+
+def test_stop_concurrent_probe_eperm(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda pid, sig: (_ for _ in ()).throw(PermissionError("x"))
+    )
+    assert _cli._stop() == 1
+    assert "cannot probe stop pid" in capsys.readouterr().err
+
+
+def test_stop_abandoned_cleanup_remove_fails(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x")))
+    assert _cli._stop() == 0
+    assert "cleaned leftover stop state" in capsys.readouterr().out
+
+
+def test_stop_refuses_seize_when_claim_pid_changed(tmp_path, monkeypatch, capsys):
+    """After old daemon dies, do not rename-seize a new daemon's claim."""
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    _write_runtime(tmp_path, monkeypatch, {"sock": sock, "pid": 4242})
+    probes = {"n": 0}
+
+    def fake_kill(pid, sig):
+        probes["n"] += 1
+        if sig == 0:
+            # first alive checks for 4242: dead; claim already rewritten to 99
+            if pid == 4242:
+                with open(tmp_path / "daemon.json", "w") as f:
+                    json.dump({"pid": 99, "sock": sock}, f)
+                raise OSError("gone")
+            return None  # 99 live
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "owned by another daemon" in capsys.readouterr().out
+    with open(tmp_path / "daemon.json") as f:
+        assert json.load(f)["pid"] == 99  # not seized
+
+
+def test_stop_precheck_same_pid_stopping_live(tmp_path, monkeypatch, capsys):
+    """Pre-seize re-read: same pid with stopping and live process → do not seize."""
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    _write_runtime(tmp_path, monkeypatch, {"sock": sock, "pid": 4242})
+    reads = {"n": 0}
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"pid": 4242, "sock": sock}
+        # still pid 4242 but marked stopping (another stop/reclaim race)
+        return {"pid": 4242, "stopping": True, "sock": sock}
+
+    def fake_kill(pid, sig):
+        if sig == 0 and reads["n"] == 1:
+            raise OSError("gone")  # daemon gone during wait
+        return None  # pre-seize: pid 4242 appears live as stop hold
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "owned by another daemon" in capsys.readouterr().out
+
+
+def test_stop_precheck_same_pid_stopping_dead_seizes(tmp_path, monkeypatch, capsys):
+    """Same pid stopping but process dead: fall through and seize."""
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    path = tmp_path / "daemon.json"
+    with open(path, "w") as f:
+        json.dump({"pid": 4242, "sock": sock}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    reads = {"n": 0}
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"pid": 4242, "sock": sock}
+        return {"pid": 4242, "stopping": True, "sock": sock}
+
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()  # always dead
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    # After seize, hold install needs real files — mock rename of path
+    real_rename = os.rename
+
+    def rename_ok(src, dst):
+        # materialize seized content
+        if str(src) == str(path):
+            with open(dst, "w") as f:
+                json.dump({"pid": 4242, "stopping": True, "sock": sock}, f)
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            return
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(_cli.os, "rename", rename_ok)
+    rc = _cli._stop()
+    assert rc == 0
+
+
+def test_stop_precheck_same_pid_stopping_eperm(tmp_path, monkeypatch, capsys):
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    _write_runtime(tmp_path, monkeypatch, {"sock": sock, "pid": 4242})
+    reads = {"n": 0}
+    phase = {"precheck": False}
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"pid": 4242, "sock": sock}
+        phase["precheck"] = True
+        return {"pid": 4242, "stopping": True, "sock": sock}
+
+    def fake_kill(pid, sig):
+        if phase["precheck"]:
+            raise PermissionError("eperm")
+        if sig == 0:
+            raise OSError("gone")
+        return None  # SIGTERM ok
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "owned by another daemon" in capsys.readouterr().out
+
+
+def test_stop_precheck_read_fails_after_death(tmp_path, monkeypatch, capsys):
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    _write_runtime(tmp_path, monkeypatch, {"sock": sock, "pid": 4242})
+    reads = {"n": 0}
+    real_read = _cli._read_runtime
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return real_read()
+        raise OSError("gone")
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+        return None
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "stopped pid" in capsys.readouterr().out
+
+
 def test_stop_signals_and_cleans(tmp_path, monkeypatch, capsys):
     sock = os.path.join(str(tmp_path), "daemon.sock")
     open(sock, "w").close()
@@ -481,6 +908,591 @@ def test_stop_already_dead_pid(tmp_path, monkeypatch, capsys):
     assert "no live daemon" in capsys.readouterr().out
 
 
+def test_stop_does_not_unlink_new_daemon_files(tmp_path, monkeypatch, capsys):
+    """After the old pid dies, a new daemon may rewrite daemon.json; stop must
+    not delete the new runtime (atomic rename seize + restore)."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 111})
+    real_rename = os.rename
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    def fake_rename(src, dst):
+        # first rename seizes the old file; inject a new daemon's runtime as
+        # if it claimed the path before we could read the seized content...
+        # instead: after seize, rewrite doomed content to new pid and restore path
+        real_rename(src, dst)
+        # simulate: new daemon already owns the path under a different name
+        # by writing pid 222 into the seized file so stop restores it
+        with open(dst) as f:
+            data = json.load(f)
+        data["pid"] = 222
+        with open(dst, "w") as f:
+            json.dump(data, f)
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "rename", fake_rename)
+    assert _cli._stop() == 0
+    assert (tmp_path / "daemon.json").exists()
+    assert "another daemon" in capsys.readouterr().out
+
+
+def test_stop_reread_runtime_error_falls_back(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 7})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    def fake_rename(src, dst):
+        # seize then leave corrupt content for the open/json path
+        os.rename.__wrapped__(src, dst) if hasattr(os.rename, "__wrapped__") else None
+        real = os.rename
+        # use builtins: already renamed by us
+        import shutil
+
+        # simpler: rename works, then corrupt doomed
+        path = src
+        # Actually monkeypatch replaces rename entirely — implement with open/rename
+        raise AssertionError("use real rename below")
+
+    real_rename = os.rename
+
+    def seize_then_corrupt(src, dst):
+        real_rename(src, dst)
+        with open(dst, "w") as f:
+            f.write("{bad")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "rename", seize_then_corrupt)
+    assert _cli._stop() == 0
+    assert "stopped pid 7" in capsys.readouterr().out
+
+
+def test_stop_rename_missing_runtime(tmp_path, monkeypatch, capsys):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/nope.sock", "pid": 3})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "rename", lambda s, d: (_ for _ in ()).throw(OSError("gone")))
+    assert _cli._stop() == 0
+    assert "stopped pid 3" in capsys.readouterr().out
+
+
+def test_stop_restore_rename_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 111})
+    real_rename = os.rename
+    state = {"n": 0}
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    def fake_rename(src, dst):
+        state["n"] += 1
+        if state["n"] == 1:
+            real_rename(src, dst)
+            with open(dst) as f:
+                data = json.load(f)
+            data["pid"] = 222
+            with open(dst, "w") as f:
+                json.dump(data, f)
+            return
+        raise OSError("cannot restore")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "rename", fake_rename)
+    assert _cli._stop() == 0
+    assert "another daemon" in capsys.readouterr().out
+
+
+def test_stop_leaves_sock_if_new_claim_appeared(tmp_path, monkeypatch, capsys):
+    """Hold-path link fails when concurrent start already claimed; leave sock."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("live")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 111})
+    real_rename = os.rename
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    def seize_then_new_claim(src, dst):
+        real_rename(src, dst)
+        # concurrent start claims the free path again
+        with open(src, "w") as f:
+            json.dump({"sock": str(sock), "pid": 222}, f)
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "rename", seize_then_new_claim)
+    assert _cli._stop() == 0
+    assert sock.exists() and sock.read_text() == "live"
+    assert "another daemon" in capsys.readouterr().out
+
+
+def test_stop_hold_link_exists_unlink_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("live")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 111})
+    real_rename = os.rename
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    def seize_then_new_claim(src, dst):
+        real_rename(src, dst)
+        with open(src, "w") as f:
+            json.dump({"sock": str(sock), "pid": 222}, f)
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "rename", seize_then_new_claim)
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x")))
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("y")))
+    assert _cli._stop() == 0
+    assert "another daemon" in capsys.readouterr().out
+
+
+def test_stop_hold_oserror_does_not_remove_sock(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("keep")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nospace")))
+    assert _cli._stop() == 0
+    assert sock.exists() and sock.read_text() == "keep"
+    assert "stopped pid 9" in capsys.readouterr().out
+
+
+def test_stop_hold_oserror_cleanup_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("keep")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nospace")))
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x")))
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("y")))
+    assert _cli._stop() == 0
+
+
+def test_stop_hold_ownership_lost_before_sock_unlink(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("live")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    real_link = os.link
+
+    def link_then_steal(src, dst):
+        real_link(src, dst)
+        # concurrent start rewrites claim
+        with open(dst, "w") as f:
+            json.dump({"pid": 999, "stopping": False}, f)
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "link", link_then_steal)
+    assert _cli._stop() == 0
+    assert sock.exists()
+    assert "another daemon" in capsys.readouterr().out
+
+
+def test_stop_hold_ownership_lost_doomed_remove_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("live")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    real_link = os.link
+
+    def link_then_steal(src, dst):
+        real_link(src, dst)
+        with open(dst, "w") as f:
+            json.dump({"pid": 999, "stopping": False}, f)
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "link", link_then_steal)
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x")))
+    assert _cli._stop() == 0
+
+
+def test_stop_hold_claim_unreadable_after_hold(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    real_link = os.link
+
+    def link_then_corrupt(src, dst):
+        real_link(src, dst)
+        with open(dst, "w") as f:
+            f.write("{bad")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "link", link_then_corrupt)
+    assert _cli._stop() == 0
+    assert "stopped pid 9" in capsys.readouterr().out
+
+
+def test_stop_hold_unreadable_doomed_remove_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    real_link = os.link
+
+    def link_then_corrupt(src, dst):
+        real_link(src, dst)
+        with open(dst, "w") as f:
+            f.write("{bad")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(_cli.os, "link", link_then_corrupt)
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x")))
+    assert _cli._stop() == 0
+
+
+def test_stop_hold_success_unlink_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 9})
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("gone")
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    real_unlink = os.unlink
+
+    def flaky_unlink(p):
+        if "stophold" in str(p):
+            raise OSError("busy")
+        return real_unlink(p)
+
+    monkeypatch.setattr(_cli.os, "unlink", flaky_unlink)
+    assert _cli._stop() == 0
+    assert "stopped pid 9" in capsys.readouterr().out
+
+
+def test_claim_runtime_exclusive(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    rt = {"sock": "/s", "node": "n", "head": True, "pid": 1}
+    assert _cli._claim_runtime(rt) is None
+    assert (tmp_path / "daemon.json").exists()
+    # second claim with live pid refused
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: 1)
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 2})
+    assert err is not None and "already running" in err
+
+
+def test_claim_runtime_replaces_stale(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 9})
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3}) is None
+
+
+def test_claim_runtime_stale_rename_fails(tmp_path, monkeypatch):
+    """Stale reclaim uses rename-seize; if rename fails, retry then give up."""
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 9})
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    monkeypatch.setattr(
+        _cli.os,
+        "link",
+        lambda src, dst: (_ for _ in ()).throw(FileExistsError()),
+    )
+    monkeypatch.setattr(
+        _cli.os,
+        "rename",
+        lambda s, d: (_ for _ in ()).throw(OSError("busy")),
+    )
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
+    assert err is not None and "cannot claim" in err
+
+
+def test_claim_runtime_seized_still_live(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 42})
+    # first live check says dead so we try seize; kill(0) then says live
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    real_link = os.link
+    links = {"n": 0}
+
+    def link_fn(src, dst):
+        links["n"] += 1
+        # first link is claim attempt (tmp → path): conflict
+        if links["n"] == 1:
+            raise FileExistsError()
+        # restore link(seized → path): allow
+        return real_link(src, dst)
+
+    monkeypatch.setattr(_cli.os, "link", link_fn)
+    monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)  # process "alive"
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
+    assert err is not None and "already running" in err
+    assert (tmp_path / "daemon.json").exists()  # restored
+
+
+def test_claim_runtime_seized_active_stop_hold(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 42, "stopping": True}, f)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError())
+    )
+    monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)  # stop still alive
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
+    assert err is not None and "already running" in err
+
+
+def test_claim_runtime_seized_abandoned_stop_hold(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 42, "stopping": True}, f)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    links = {"n": 0}
+    real_link = os.link
+
+    def flaky_link(src, dst):
+        links["n"] += 1
+        if links["n"] == 1:
+            raise FileExistsError()
+        return real_link(src, dst)
+
+    monkeypatch.setattr(_cli.os, "link", flaky_link)
+
+    def dead(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(_cli.os, "kill", dead)
+    assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3}) is None
+
+
+def test_claim_runtime_seized_eperm_treated_live(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 42})
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    monkeypatch.setattr(
+        _cli.os,
+        "link",
+        lambda src, dst: (_ for _ in ()).throw(FileExistsError()),
+    )
+
+    def eperm(pid, sig):
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(_cli.os, "kill", eperm)
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
+    assert err is not None and "already running" in err
+
+
+def test_claim_runtime_seized_stop_hold_eperm(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 42, "stopping": True}, f)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda pid, sig: (_ for _ in ()).throw(PermissionError("x"))
+    )
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
+    assert err is not None and "already running" in err
+
+
+def test_claim_runtime_seized_dead_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 42})
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    links = {"n": 0}
+    real_link = os.link
+
+    def flaky_link(src, dst):
+        links["n"] += 1
+        if links["n"] == 1:
+            raise FileExistsError()
+        return real_link(src, dst)
+
+    monkeypatch.setattr(_cli.os, "link", flaky_link)
+
+    def dead(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(_cli.os, "kill", dead)
+    assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3}) is None
+
+
+def test_claim_runtime_seized_corrupt_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "daemon.json").write_text("{bad")
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    links = {"n": 0}
+    real_link = os.link
+
+    def flaky_link(src, dst):
+        links["n"] += 1
+        if links["n"] == 1:
+            raise FileExistsError()
+        return real_link(src, dst)
+
+    monkeypatch.setattr(_cli.os, "link", flaky_link)
+    assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3}) is None
+
+
+def test_claim_runtime_seized_live_restore_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 42})
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    real_rename = os.rename
+    n = {"c": 0}
+
+    def rename_once(src, dst):
+        n["c"] += 1
+        if n["c"] == 1:
+            return real_rename(src, dst)
+        raise OSError("cannot restore")
+
+    monkeypatch.setattr(_cli.os, "rename", rename_once)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError())
+    )
+    monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
+    assert err is not None and "already running" in err
+
+
+def test_claim_runtime_seized_remove_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 42})
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    links = {"n": 0}
+    real_link = os.link
+
+    def flaky_link(src, dst):
+        links["n"] += 1
+        if links["n"] == 1:
+            raise FileExistsError()
+        return real_link(src, dst)
+
+    monkeypatch.setattr(_cli.os, "link", flaky_link)
+
+    def dead(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(_cli.os, "kill", dead)
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("busy")))
+    # still succeeds overall (remove of seized is best-effort)
+    assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3}) is None
+
+
+def test_claim_runtime_write_failure_cleans(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(_cli.json, "dump", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    try:
+        _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 1})
+        raise AssertionError("expected OSError")
+    except OSError:
+        pass
+    assert not (tmp_path / "daemon.json").exists()
+
+
+def test_claim_runtime_exhausted_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    # path always "exists" for link; remove is a no-op so retries exhaust
+    monkeypatch.setattr(
+        _cli.os,
+        "link",
+        lambda src, dst: (_ for _ in ()).throw(FileExistsError()),
+    )
+    monkeypatch.setattr(_cli.os, "remove", lambda p: None)
+    err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 1})
+    assert err is not None and "cannot claim" in err
+
+
+def test_claim_runtime_tmp_unlink_failure_ignored(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def flaky_unlink(p):
+        calls["n"] += 1
+        if str(p).endswith(".tmp." + str(os.getpid())) or ".tmp." in str(p):
+            raise OSError("busy tmp")
+        return real_unlink(p)
+
+    monkeypatch.setattr(_cli.os, "unlink", flaky_unlink)
+    assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 1}) is None
+    assert (tmp_path / "daemon.json").exists()
+
+
+def test_run_daemon_claim_conflict(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(_cli, "_claim_runtime", lambda rt: "beam: daemon already running (pid 1)\n")
+    import asyncio as aio
+
+    rc = aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 0, 6379, None))
+    assert rc == 1
+    assert "already running" in capsys.readouterr().err
+
+
+def test_status_framing_error(tmp_path, monkeypatch, capsys):
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock"})
+
+    class BadSock:
+        def connect(self, addr):
+            pass
+
+        def sendall(self, b):
+            pass
+
+        def recv(self, n):
+            return b""  # short read -> ConnectionError
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_cli.socket, "socket", lambda *a, **k: BadSock())
+    assert _cli._status() == 1
+    assert "cannot reach daemon" in capsys.readouterr().err
+
+
 def test_stop_no_pid(tmp_path, monkeypatch, capsys):
     _write_runtime(tmp_path, monkeypatch, {"sock": "/nope.sock"})
     assert _cli._stop() == 0
@@ -492,9 +1504,15 @@ def test_stop_escalates_to_sigkill(tmp_path, monkeypatch, capsys):
     gets SIGKILL (covers the escalation branch)."""
     _write_runtime(tmp_path, monkeypatch, {"sock": "/nope.sock", "pid": 5})
     sigs = []
+    probes = {"n": 0}
 
     def fake_kill(pid, sig):
-        sigs.append(sig)  # alive for SIGTERM and every os.kill(pid, 0) probe
+        sigs.append(sig)
+        if sig == 0:
+            probes["n"] += 1
+            # stay "alive" for the SIGTERM poll (50) + a few post-SIGKILL probes
+            if probes["n"] > 55:
+                raise OSError("gone")
 
     monkeypatch.setattr(_cli.os, "kill", fake_kill)
     import time as time_mod
@@ -504,15 +1522,37 @@ def test_stop_escalates_to_sigkill(tmp_path, monkeypatch, capsys):
     assert signal.SIGKILL in sigs
 
 
+def test_stop_sigkill_still_alive_leaves_files(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 5})
+
+    def always_alive(pid, sig):
+        pass  # kill(0) never fails
+
+    monkeypatch.setattr(_cli.os, "kill", always_alive)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 1
+    assert sock.exists()
+    assert "still alive" in capsys.readouterr().err
+
+
 def test_stop_signal_oserror(tmp_path, monkeypatch, capsys):
-    _write_runtime(tmp_path, monkeypatch, {"sock": "/nope.sock", "pid": 6})
+    """EPERM on signal: leave runtime files so the live daemon stays findable."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("")
+    _write_runtime(tmp_path, monkeypatch, {"sock": str(sock), "pid": 6})
 
     def fake_kill(pid, sig):
         raise PermissionError("not allowed")  # an OSError subclass
 
     monkeypatch.setattr(_cli.os, "kill", fake_kill)
-    assert _cli._stop() == 0
+    assert _cli._stop() == 1
     assert "cannot signal pid" in capsys.readouterr().err
+    assert sock.exists()  # runtime files not unlinked under a live, unsignalable pid
+    assert (tmp_path / "daemon.json").exists()
 
 
 # ---- maybe_bootstrap / bootstrap_env ----------------------------------------
@@ -600,6 +1640,7 @@ def test_fuzz_start_valid_port_parses(port):
 
     with (
         mock.patch.object(_cli, "maybe_bootstrap", lambda: None),
+        mock.patch.object(_cli, "_live_daemon_pid", lambda: None),
         mock.patch.object(_cli.asyncio, "run", fake_run),
         mock.patch.object(_cli, "_run_daemon", fake_run_daemon),
         mock.patch.object(_cli._daemon, "detect_gpus", lambda n: 0),
@@ -614,12 +1655,916 @@ def test_fuzz_start_nonint_port_exits(garbage):
     """A non-integer --port value always exits 2, never parses to a bogus int."""
     import unittest.mock as mock
 
-    if garbage.lstrip("-").isdigit():
-        return  # this branch is for non-numeric strings only
-    with mock.patch.object(_cli, "maybe_bootstrap", lambda: None):
+    # Accept only pure non-integers (no trailing space that int() also rejects
+    # after strip in some paths; exclude anything isdigit after strip).
+    token = garbage.strip().lstrip("-")
+    if not garbage.strip() or token.isdigit():
+        return
+    with (
+        mock.patch.object(_cli, "maybe_bootstrap", lambda: None),
+        mock.patch.object(_cli, "_live_daemon_pid", lambda: None),
+    ):
         try:
             rc = _cli._start(["--head", "--port=%s" % garbage])
         except SystemExit as e:
             assert e.code == 2
             return
     assert rc == 2  # unknown-flag fallthrough also returns 2
+
+
+def test_stop_concurrent_peer_cleaned_claim(tmp_path, monkeypatch, capsys):
+    """Peer stop finishes and leaves a non-stopping claim -> done."""
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def fake_kill(pid, sig):
+        probes["n"] += 1
+        if probes["n"] >= 2:
+            with open(tmp_path / "daemon.json", "w") as f:
+                json.dump({"pid": 99, "sock": "/x"}, f)  # new daemon, no stopping
+            raise ProcessLookupError()
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_concurrent_peer_different_hold_pid(tmp_path, monkeypatch, capsys):
+    """After peer dies, a different stop hold is present -> leave it."""
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def fake_kill(pid, sig):
+        probes["n"] += 1
+        if probes["n"] >= 2:
+            with open(tmp_path / "daemon.json", "w") as f:
+                json.dump({"pid": 77, "stopping": True, "sock": "/x"}, f)
+            raise ProcessLookupError()
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_rename_fails(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "rename", lambda s, d: (_ for _ in ()).throw(OSError("busy"))
+    )
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_restore_rename_fails(tmp_path, monkeypatch, capsys):
+    """Seized doc is not a stop hold; restore rename fails still returns 0."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    claim = tmp_path / "daemon.json"
+    with open(claim, "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_rename = os.rename
+    renames = {"n": 0}
+
+    def rename_then_fail_restore(src, dst):
+        renames["n"] += 1
+        if renames["n"] == 1:
+            real_rename(src, dst)
+            with open(dst, "w") as f:
+                json.dump({"pid": 99, "sock": str(sock)}, f)
+            return
+        raise OSError("restore busy")
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "rename", rename_then_fail_restore)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_hold_eperm(tmp_path, monkeypatch, capsys):
+    """EPERM probing seized hold pid: restore claim, report in progress."""
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_seq(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            raise ProcessLookupError()  # initial abandoned check
+        raise PermissionError("eperm")  # re-check after seize
+
+    monkeypatch.setattr(_cli.os, "kill", kill_seq)
+    assert _cli._stop() == 1
+    assert "another stop in progress" in capsys.readouterr().err
+    assert (tmp_path / "daemon.json").exists()
+
+
+def test_stop_abandoned_hold_still_live(tmp_path, monkeypatch, capsys):
+    """Seized hold pid becomes live again: restore and leave it."""
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_seq(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            raise ProcessLookupError()
+        return None  # live on re-check
+
+    monkeypatch.setattr(_cli.os, "kill", kill_seq)
+    assert _cli._stop() == 1
+    assert "another stop in progress" in capsys.readouterr().err
+    assert (tmp_path / "daemon.json").exists()
+
+
+def test_stop_abandoned_eperm_restore_fails(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_seq(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            raise ProcessLookupError()
+        raise PermissionError("eperm")
+
+    monkeypatch.setattr(_cli.os, "kill", kill_seq)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nope"))
+    )
+    assert _cli._stop() == 1
+
+
+def test_stop_abandoned_live_restore_fails(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_seq(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            raise ProcessLookupError()
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", kill_seq)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nope"))
+    )
+    assert _cli._stop() == 1
+
+
+def test_stop_abandoned_restore_file_exists(tmp_path, monkeypatch, capsys):
+    """link restore hits FileExistsError: drop seized, leave new claim."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_rename = os.rename
+
+    def kill_fn(pid, sig):
+        # stay dead for pre-seize probes; after rename path has pid 99 live
+        if pid == 99:
+            return None
+        raise ProcessLookupError()
+
+    def rename_then_reclaim(src, dst):
+        real_rename(src, dst)
+        with open(tmp_path / "daemon.json", "w") as f:
+            json.dump({"pid": 99, "sock": str(sock)}, f)
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    monkeypatch.setattr(_cli.os, "rename", rename_then_reclaim)
+    assert _cli._stop() == 1
+    err = capsys.readouterr().err
+    assert "in progress" in err or "live" in err or "owned" in err
+    with open(tmp_path / "daemon.json") as f:
+        assert json.load(f)["pid"] == 99
+
+
+def test_stop_abandoned_restore_exists_unlink_fails(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_seq(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            raise ProcessLookupError()
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", kill_seq)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(FileExistsError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
+    )
+    assert _cli._stop() == 1
+
+
+def test_stop_abandoned_restore_oserror_unlink_fails(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_seq(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            raise ProcessLookupError()
+        return None
+
+    monkeypatch.setattr(_cli.os, "kill", kill_seq)
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("link"))
+    )
+    monkeypatch.setattr(
+        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("un"))
+    )
+    assert _cli._stop() == 1
+
+
+def test_stop_abandoned_path_reclaimed_remove_seized_fails(
+    tmp_path, monkeypatch, capsys
+):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_rename = os.rename
+
+    def rename_and_reclaim(src, dst):
+        real_rename(src, dst)
+        with open(tmp_path / "daemon.json", "w") as f:
+            json.dump({"pid": 99, "sock": str(sock)}, f)
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "rename", rename_and_reclaim)
+    monkeypatch.setattr(
+        _cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x"))
+    )
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_bad_seized_json(tmp_path, monkeypatch, capsys):
+    """Corrupt seized file: still best-effort clean sock/seized."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    claim = tmp_path / "daemon.json"
+    with open(claim, "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_rename = os.rename
+
+    def rename_corrupt(src, dst):
+        real_rename(src, dst)
+        with open(dst, "w") as f:
+            f.write("{not json")
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "rename", rename_corrupt)
+    assert _cli._stop() == 0
+    assert "cleaned leftover stop state" in capsys.readouterr().out
+
+
+def test_stop_abandoned_reclaim_link_exists(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    links = {"n": 0}
+
+    def link_exists(src, dst):
+        links["n"] += 1
+        raise FileExistsError()
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "link", link_exists)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+    assert links["n"] >= 1
+
+
+def test_stop_abandoned_reclaim_link_exists_unlink_fails(
+    tmp_path, monkeypatch, capsys
+):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(FileExistsError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
+    )
+    assert _cli._stop() == 0
+
+
+def test_stop_abandoned_reclaim_link_oserror(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("e"))
+    )
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_reclaim_link_oserror_unlink_fails(
+    tmp_path, monkeypatch, capsys
+):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("e"))
+    )
+    monkeypatch.setattr(
+        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
+    )
+    assert _cli._stop() == 0
+
+
+def test_stop_abandoned_reclaim_then_not_stopping(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_link = os.link
+
+    def link_then_mutate(src, dst):
+        real_link(src, dst)
+        with open(dst, "w") as f:
+            json.dump({"pid": 99, "sock": str(sock)}, f)  # no stopping
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "link", link_then_mutate)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_reclaim_ownership_lost_remove_fails(
+    tmp_path, monkeypatch, capsys
+):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_link = os.link
+
+    def link_then_mutate(src, dst):
+        real_link(src, dst)
+        with open(dst, "w") as f:
+            json.dump({"pid": 99, "stopping": True, "sock": str(sock)}, f)
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "link", link_then_mutate)
+    monkeypatch.setattr(
+        _cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x"))
+    )
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_reclaim_then_bad_json(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_link = os.link
+
+    def link_corrupt(src, dst):
+        real_link(src, dst)
+        with open(dst, "w") as f:
+            f.write("{bad")
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "link", link_corrupt)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_hold_finally_unlink_fails(tmp_path, monkeypatch, capsys):
+    """finally unlink of hold tmp fails: still clean sock/claim."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_unlink = os.unlink
+    unlinks = {"n": 0}
+
+    def unlink_flaky(p):
+        unlinks["n"] += 1
+        if "stopclean" in str(p):
+            raise OSError("busy")
+        return real_unlink(p)
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "unlink", unlink_flaky)
+    assert _cli._stop() == 0
+    assert "cleaned leftover stop state" in capsys.readouterr().out
+
+
+def test_link_restore_success_and_unlink_fail(tmp_path, monkeypatch):
+    path = str(tmp_path / "daemon.json")
+    seized = path + ".seized"
+    with open(seized, "w") as f:
+        f.write("{}")
+    real_unlink = os.unlink
+    unlinks = {"n": 0}
+
+    def unlink_once(p):
+        unlinks["n"] += 1
+        if unlinks["n"] == 1:
+            raise OSError("x")
+        return real_unlink(p)
+
+    monkeypatch.setattr(_cli.os, "unlink", unlink_once)
+    assert _cli._link_restore(seized, path) is True
+    assert os.path.exists(path)
+
+
+def test_link_restore_exists_unlink_fail(tmp_path, monkeypatch):
+    path = str(tmp_path / "daemon.json")
+    seized = path + ".seized"
+    with open(path, "w") as f:
+        f.write('{"pid":1}')
+    with open(seized, "w") as f:
+        f.write("{}")
+    monkeypatch.setattr(
+        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
+    )
+    assert _cli._link_restore(seized, path) is False
+
+
+def test_link_restore_oserror_keeps_seized(tmp_path, monkeypatch):
+    """Non-FileExistsError on link must not destroy the last claim copy."""
+    path = str(tmp_path / "daemon.json")
+    seized = path + ".seized"
+    with open(seized, "w") as f:
+        f.write("{}")
+    monkeypatch.setattr(
+        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("link"))
+    )
+    assert _cli._link_restore(seized, path) is False
+    assert os.path.exists(seized)
+
+
+def test_stop_concurrent_peer_left_live_daemon(tmp_path, monkeypatch, capsys):
+    """Peer stop finished; non-stopping claim with live pid → exit 1."""
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_fn(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return None  # concurrent stop live
+        if probes["n"] == 2:
+            # peer stop exits; rewrite claim as live daemon
+            with open(tmp_path / "daemon.json", "w") as f:
+                json.dump({"pid": 99, "sock": "/x"}, f)
+            raise ProcessLookupError()
+        return None  # pid 99 live for _live_daemon_pid
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 1
+    assert "still running" in capsys.readouterr().err
+
+
+def test_stop_concurrent_different_hold_live(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_fn(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return None
+        if probes["n"] == 2:
+            with open(tmp_path / "daemon.json", "w") as f:
+                json.dump({"pid": 77, "stopping": True, "sock": "/x"}, f)
+            raise ProcessLookupError()
+        return None  # 77 live
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 1
+    assert "another stop in progress" in capsys.readouterr().err
+
+
+def test_stop_concurrent_different_hold_eperm(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    probes = {"n": 0}
+
+    def kill_fn(pid, sig):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return None
+        if probes["n"] == 2:
+            with open(tmp_path / "daemon.json", "w") as f:
+                json.dump({"pid": 77, "stopping": True, "sock": "/x"}, f)
+            raise ProcessLookupError()
+        raise PermissionError("eperm")
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 1
+
+
+def test_stop_abandoned_precheck_not_stopping_live(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    reads = {"n": 0}
+    real_read = _cli._read_runtime
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return real_read()
+        return {"pid": 99, "sock": "/x"}  # no stopping on pre-seize re-read
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: None if p == 99 else (_ for _ in ()).throw(ProcessLookupError())
+    )
+    assert _cli._stop() == 1
+    assert "still running" in capsys.readouterr().err
+
+
+def test_stop_abandoned_precheck_not_stopping_no_live(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    reads = {"n": 0}
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"pid": 55, "stopping": True, "sock": "/x"}
+        return {"pid": 0, "sock": "/x"}  # not stopping, no live pid
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_precheck_read_fails(tmp_path, monkeypatch, capsys):
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    reads = {"n": 0}
+
+    def read_fn():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"pid": 55, "stopping": True, "sock": "/x"}
+        raise OSError("gone")
+
+    monkeypatch.setattr(_cli, "_read_runtime", read_fn)
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_doc_live_restore(tmp_path, monkeypatch, capsys):
+    """After seize, hold pid is live → restore and exit 1."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    # Pre-check: dead. Post-seize hold check: live.
+    state = {"phase": "pre"}
+
+    def kill_fn(pid, sig):
+        if state["phase"] == "pre":
+            raise ProcessLookupError()
+        return None
+
+    real_rename = os.rename
+
+    def rename_flip(src, dst):
+        real_rename(src, dst)
+        state["phase"] = "post"
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    monkeypatch.setattr(_cli.os, "rename", rename_flip)
+    assert _cli._stop() == 1
+    assert "in progress" in capsys.readouterr().err
+
+
+def test_stop_abandoned_doc_eperm_restore(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    state = {"phase": "pre"}
+
+    def kill_fn(pid, sig):
+        if state["phase"] == "pre":
+            raise ProcessLookupError()
+        raise PermissionError("eperm")
+
+    real_rename = os.rename
+
+    def rename_flip(src, dst):
+        real_rename(src, dst)
+        state["phase"] = "post"
+
+    monkeypatch.setattr(_cli.os, "kill", kill_fn)
+    monkeypatch.setattr(_cli.os, "rename", rename_flip)
+    assert _cli._stop() == 1
+    assert "in progress" in capsys.readouterr().err
+
+
+def test_stop_abandoned_toctou_ownership_lost(tmp_path, monkeypatch, capsys):
+    """Between hold install and final unlink, claim is stolen."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    real_open = open
+    real_link = os.link
+    links = {"n": 0}
+
+    def link_then_steal(src, dst):
+        real_link(src, dst)
+        links["n"] += 1
+        if links["n"] >= 1 and "stopclean" in str(src):
+            with real_open(dst, "w") as f:
+                json.dump({"pid": 99, "sock": str(sock)}, f)
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(_cli.os, "link", link_then_steal)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_second_toctou_foreign(tmp_path, monkeypatch, capsys):
+    """Second TOCTOU check on abandoned path sees foreign claim."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    path = tmp_path / "daemon.json"
+    with open(path, "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    import builtins
+
+    real_open = builtins.open
+    path_s = str(path)
+    own_reads = {"n": 0}
+
+    def open_spy(file, *a, **k):
+        mode = a[0] if a else k.get("mode", "r")
+        f = real_open(file, *a, **k)
+        if str(file) == path_s and "r" in str(mode):
+            own_reads["n"] += 1
+            # After stopclean hold is in place, second ownership re-check (4th+
+            # path read depending on flow) returns foreign
+            data = f.read()
+            f.seek(0)
+            if own_reads["n"] >= 3:
+                f.close()
+
+                class Fake:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *a):
+                        pass
+
+                    def read(self, *a):
+                        return json.dumps({"pid": 1, "sock": str(sock)})
+
+                return Fake()
+        return f
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(builtins, "open", open_spy)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_abandoned_second_toctou_bad_json(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    path = tmp_path / "daemon.json"
+    with open(path, "w") as f:
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    import builtins
+
+    real_open = builtins.open
+    path_s = str(path)
+    own_reads = {"n": 0}
+
+    def open_spy(file, *a, **k):
+        mode = a[0] if a else k.get("mode", "r")
+        if str(file) == path_s and "r" in str(mode):
+            own_reads["n"] += 1
+            if own_reads["n"] >= 3:
+                class Fake:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *a):
+                        pass
+
+                    def read(self, *a):
+                        return "{bad"
+
+                return Fake()
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(
+        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    monkeypatch.setattr(builtins, "open", open_spy)
+    assert _cli._stop() == 0
+    assert "another stop finished" in capsys.readouterr().out
+
+
+def test_stop_normal_second_ownership_check_fails(tmp_path, monkeypatch, capsys):
+    """Normal stop: second TOCTOU ownership check sees foreign claim."""
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    _write_runtime(tmp_path, monkeypatch, {"sock": sock, "pid": 4242})
+    path = str(tmp_path / "daemon.json")
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("process gone")
+
+    import builtins
+
+    open_count = {"n": 0}
+    real_builtins_open = builtins.open
+
+    def open_spy(file, *a, **k):
+        mode = a[0] if a else k.get("mode", "r")
+        f = real_builtins_open(file, *a, **k)
+        if str(file) == path and "r" in str(mode):
+            open_count["n"] += 1
+            if open_count["n"] >= 3:
+                f.close()
+
+                class Fake:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *a):
+                        pass
+
+                    def read(self, *a):
+                        return json.dumps({"pid": 1, "sock": sock})
+
+                return Fake()
+        return f
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(builtins, "open", open_spy)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    rc = _cli._stop()
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "owned by another" in out or "stopped pid" in out
+
+
+def test_stop_normal_second_ownership_bad_json(tmp_path, monkeypatch, capsys):
+    sock = os.path.join(str(tmp_path), "daemon.sock")
+    open(sock, "w").close()
+    _write_runtime(tmp_path, monkeypatch, {"sock": sock, "pid": 4242})
+    path = str(tmp_path / "daemon.json")
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise OSError("process gone")
+
+    import builtins
+
+    open_count = {"n": 0}
+    real_builtins_open = builtins.open
+
+    def open_spy(file, *a, **k):
+        mode = a[0] if a else k.get("mode", "r")
+        if str(file) == path and "r" in str(mode):
+            open_count["n"] += 1
+            if open_count["n"] >= 3:
+                class Fake:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *a):
+                        pass
+
+                    def read(self, *a):
+                        return "{not-json"
+
+                return Fake()
+        return real_builtins_open(file, *a, **k)
+
+    monkeypatch.setattr(_cli.os, "kill", fake_kill)
+    monkeypatch.setattr(builtins, "open", open_spy)
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    assert _cli._stop() == 0
+    assert "stopped pid" in capsys.readouterr().out
+
+
+def test_stop_abandoned_zero_hold_pid(tmp_path, monkeypatch, capsys):
+    """stopping hold with pid 0: skip live probe, clean seized."""
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("x")
+    with open(tmp_path / "daemon.json", "w") as f:
+        json.dump({"pid": 0, "stopping": True, "sock": str(sock)}, f)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    # stop_pid is 0/falsy so we skip the live concurrent wait branch
+    assert _cli._stop() == 0
+    assert "cleaned leftover stop state" in capsys.readouterr().out
+    assert not sock.exists()

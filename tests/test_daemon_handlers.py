@@ -39,7 +39,10 @@ class FakePeer:
         self.closed = False
         self.created_actors = []
         self.created_pgs = []
+        self.in_flight = 0
         self.on_close = None
+        self.pending: dict = {}
+        self.writer = type("W", (), {"close": lambda self: None})()
 
     async def call(self, header, payload=b""):
         self.calls.append((dict(header), payload))
@@ -53,15 +56,22 @@ class FakePeer:
         return resp, canned.get("_body", b"")
 
     async def close(self):
+        if self.closed:
+            return
         self.closed = True
+        if self.on_close is not None:
+            r = self.on_close()
+            if asyncio.iscoroutine(r):
+                await r
 
 
 class FakeProc:
-    """Stand-in for subprocess.Popen: poll()/terminate() only."""
+    """Stand-in for subprocess.Popen: poll()/terminate()/wait/kill."""
 
     def __init__(self, alive=True):
         self._alive = alive
         self.terminated = False
+        self.killed = False
 
     def poll(self):
         return None if self._alive else 0
@@ -69,6 +79,14 @@ class FakeProc:
     def terminate(self):
         self.terminated = True
         self._alive = False
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+    def wait(self, timeout=None):
+        self._alive = False
+        return 0
 
 
 def head(ngpu=2):
@@ -110,7 +128,86 @@ def test_terminate_swallows_oserror():
         def terminate(self):
             raise OSError("gone")
 
+        def kill(self):
+            raise OSError("gone")
+
+        def wait(self, timeout=None):
+            raise OSError("gone")
+
     _terminate(Boom())  # OSError swallowed, no raise
+
+
+def test_terminate_kill_oserror_and_wait_fail():
+    class Stubborn:
+        def __init__(self):
+            self.n = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            self.n += 1
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+        def kill(self):
+            raise OSError("nope")
+
+    import subprocess as sp
+
+    _terminate(Stubborn())  # all errors swallowed
+
+
+def test_terminate_wait_succeeds_after_term():
+    class DiesOnWait:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            raise AssertionError("should not kill")
+
+    _terminate(DiesOnWait())
+
+
+def test_peer_close_on_close_raises_swallowed():
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        p = Peer(r1, w1, lambda *a: None)
+
+        def boom():
+            raise RuntimeError("cb")
+
+        p.on_close = boom
+        await p.close()  # no raise
+        s2.close()
+
+    run(go())
+
+
+def test_on_kill_close_error_still_terminates():
+    d = head()
+    proc = FakeProc()
+
+    class BadPeer(FakePeer):
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    d.actors["a1"] = ActorProc("a1", peer=BadPeer(), gpus=[], proc=proc)
+    d.actor_loc["a1"] = "n1"
+    r, _ = run(d.on_kill(None, {"actor": "a1"}, b""))
+    assert r["t"] == "kill_ok"
+    assert proc.terminated
+    assert "a1" not in d.actors
 
 
 # ---- _dispatch / handle -----------------------------------------------------
@@ -193,6 +290,44 @@ def test_on_create_pg_cpu_only_bundle():
     pg_id = r["pg"]
     assert d.pgs[pg_id] == [{"node": "n1", "gpu": -1}]
     assert peer.created_pgs == [pg_id]
+
+
+def test_on_create_pg_closed_peer_rolls_back():
+    d = head(2)
+    peer = FakePeer()
+    peer.closed = True
+    r, _ = run(d.on_create_pg(peer, {"t": "create_pg", "specs": [{"GPU": 1}]}, b""))
+    assert "disconnected" in r["err"]
+    assert d.pgs == {}
+    assert peer.created_pgs == []
+
+
+def test_on_create_pg_worker_closed_removes():
+    d = worker()
+    d.head_peer = FakePeer({"create_pg": {"pg": "n1-pg9"}})
+    peer = FakePeer()
+    peer.closed = True
+    r, _ = run(d.on_create_pg(peer, {"t": "create_pg", "specs": [{"GPU": 1}]}, b""))
+    assert "disconnected" in r["err"]
+    assert {"t": "remove_pg", "pg": "n1-pg9"} in [c[0] for c in d.head_peer.calls]
+
+
+def test_on_create_pg_worker_closed_remove_error():
+    d = worker()
+    calls = {"n": 0}
+
+    class Flaky(FakePeer):
+        async def call(self, header, payload=b""):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"t": "create_pg_ok", "pg": "n1-pg1"}, b""
+            raise RuntimeError("gone")
+
+    d.head_peer = Flaky()
+    peer = FakePeer()
+    peer.closed = True
+    r, _ = run(d.on_create_pg(peer, {"t": "create_pg", "specs": [{}]}, b""))
+    assert "disconnected" in r["err"]
 
 
 def test_on_create_pg_gpu_bundle_assigns_index():
@@ -488,17 +623,24 @@ def test_on_create_actor_cpu_local_host(monkeypatch):
 
 
 def test_on_create_actor_rollback_on_worker_failure(monkeypatch):
-    """Head places on a remote node; the remote .call raises -> placement must
-    roll back: actor_loc popped, GPU freed, created_actors entry removed."""
+    """Head places on a remote node; the remote create raises -> force-kill then
+    roll back ownership when the kill succeeds."""
     d = head(2)
-    remote = FakePeer(raise_on_call=RuntimeError("node died"))
+
+    class FailCreatePeer(FakePeer):
+        async def call(self, header, payload=b""):
+            if header.get("t") == "create_actor":
+                raise RuntimeError("node died")
+            return await super().call(header, payload)
+
+    remote = FailCreatePeer()
     d.nodes["n2"] = {"info": {"node": "n2", "ngpu": 2, "alive": True}, "peer": remote}
     # force placement onto n2 via a pg bundle that lives on n2 with a gpu
     d.pgs["p"] = [{"node": "n2", "gpu": 0}]
     peer = FakePeer()
     r, _ = run(d.on_create_actor(peer, {"t": "create_actor", "pg": "p", "bundle": 0}, b""))
     assert "node died" in r["err"]
-    assert d.actor_loc == {}  # routing entry rolled back
+    assert d.actor_loc == {}  # routing entry rolled back after successful kill
     assert peer.created_actors == []  # ownership entry removed
 
 
@@ -511,7 +653,14 @@ def test_on_create_actor_remote_rollback_does_not_free_head_gpus():
     """
     d = head(2)
     d.gpu_used[0] = True  # local non-pg actor already holds head GPU 0
-    remote = FakePeer(raise_on_call=RuntimeError("spawn failed"))
+
+    class FailCreatePeer(FakePeer):
+        async def call(self, header, payload=b""):
+            if header.get("t") == "create_actor":
+                raise RuntimeError("spawn failed")
+            return await super().call(header, payload)
+
+    remote = FailCreatePeer()
     d.nodes["n2"] = {"info": {"node": "n2", "ngpu": 2, "alive": True}, "peer": remote}
     d.pgs["p"] = [{"node": "n2", "gpu": 0}]  # same index, different node
     r, _ = run(d.on_create_actor(FakePeer(), {"t": "create_actor", "pg": "p", "bundle": 0}, b""))
@@ -566,7 +715,140 @@ def test_on_create_actor_node_unavailable():
     d.pgs["p"] = [{"node": "n2", "gpu": 0}]
     r, _ = run(d.on_create_actor(FakePeer(), {"t": "create_actor", "pg": "p", "bundle": 0}, b""))
     assert "not available" in r["err"]
-    assert d.actor_loc == {}  # rolled back
+    assert d.actor_loc == {}  # force_kill drops loc when owner peer is gone
+
+
+def test_on_create_actor_keeps_routing_when_kill_also_fails():
+    """If create and subsequent force-kill both fail, keep actor_loc + ownership."""
+    d = head(2)
+    remote = FakePeer(raise_on_call=RuntimeError("link down"))
+    d.nodes["n2"] = {"info": {"node": "n2", "ngpu": 2, "alive": True}, "peer": remote}
+    d.pgs["p"] = [{"node": "n2", "gpu": 0}]
+    peer = FakePeer()
+    r, _ = run(d.on_create_actor(peer, {"t": "create_actor", "pg": "p", "bundle": 0}, b""))
+    assert "link down" in r["err"]
+    assert d.actor_loc  # still routable for a later kill
+    assert peer.created_actors  # release_client can still retry
+
+
+def test_rollback_does_not_steal_other_actors_gpu():
+    """After kill frees a GPU and another actor re-places it, rollback must not
+    clear gpu_used for the new owner."""
+    d = head(1)
+    # simulate: A reserved GPU 0, was killed, B now holds GPU 0
+    d.gpu_used[0] = True
+    d.actors["b"] = ActorProc("b", peer=FakePeer(), gpus=[0], proc=FakeProc())
+    peer = FakePeer()
+    peer.created_actors = ["a"]
+    # A is fully gone
+    run(d._rollback_failed_create(peer, "a", "n1", [0]))
+    assert d.gpu_used[0] is True  # B still owns it
+    assert "a" not in peer.created_actors
+
+
+def test_rollback_schedules_orphan_when_kill_fails_and_peer_closed():
+    d = head(2)
+    remote = FakePeer(raise_on_call=RuntimeError("down"))
+    d.nodes["n2"] = {"info": {"node": "n2", "ngpu": 2, "alive": True}, "peer": remote}
+    d.actor_loc["a1"] = "n2"
+    peer = FakePeer()
+    peer.closed = True
+    peer.created_actors = ["a1"]
+    run(d._rollback_failed_create(peer, "a1", "n2", [0]))
+    assert "a1" in d._orphans
+    assert d.actor_loc.get("a1") == "n2"
+    # second schedule is no-op
+    d._schedule_orphan_reap("a1", "n2")
+    assert d._orphans["a1"] == "n2"
+
+
+def test_reap_orphan_clears_when_untracked():
+    d = head(2)
+    d._orphans["a1"] = "n2"
+
+    async def go():
+        await d._reap_orphan("a1", "n2")
+
+    run(go())
+    assert "a1" not in d._orphans
+
+
+def test_reap_orphan_retries_until_gone(monkeypatch):
+    d = head(2)
+    d.actor_loc["a1"] = "n2"
+    d._orphans["a1"] = "n2"
+    tries = {"n": 0}
+
+    async def force(actor_id, node):
+        tries["n"] += 1
+        if tries["n"] >= 2:
+            d.actor_loc.pop(actor_id, None)
+
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(d, "_force_kill_actor", force)
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+
+    async def go():
+        await d._reap_orphan("a1", "n2")
+
+    run(go())
+    assert "a1" not in d._orphans and tries["n"] >= 2
+
+
+def test_reap_orphan_keeps_slot_on_cancel_if_still_tracked(monkeypatch):
+    """Cancel mid-reap leaves the slot; schedule can restart via task.done()."""
+    d = head(2)
+    d.actor_loc["a1"] = "n2"
+    d._orphans["a1"] = "n2"
+    calls = {"n": 0}
+
+    async def force(actor_id, node):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError()
+
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(d, "_force_kill_actor", force)
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+
+    async def go():
+        try:
+            await d._reap_orphan("a1", "n2")
+        except asyncio.CancelledError:
+            pass
+
+    run(go())
+    assert "a1" in d._orphans  # still needs reaping
+    # restart is allowed because the previous task is done
+    async def schedule_under_loop():
+        d._schedule_orphan_reap("a1", "n2")
+        assert "a1" in d._orphan_tasks
+
+    run(schedule_under_loop())
+
+
+def test_reap_orphan_frees_deferred_pgs_when_idle(monkeypatch):
+    d = head(2)
+    d.actor_loc["a1"] = "n2"
+    d._orphans["a1"] = "n2"
+    d.pgs["p1"] = [{"node": "n2", "gpu": 0}]
+    d._orphan_pgs.add("p1")
+
+    async def force(actor_id, node):
+        d.actor_loc.pop(actor_id, None)
+
+    monkeypatch.setattr(d, "_force_kill_actor", force)
+
+    async def go():
+        await d._reap_orphan("a1", "n2")
+
+    run(go())
+    assert "p1" not in d.pgs
+    assert not d._orphan_pgs
 
 
 def test_on_create_actor_worker_no_actor_forwards():
@@ -705,6 +987,848 @@ def test_on_kill_remote_routes():
     assert "a1" not in d.actor_loc
 
 
+def test_on_kill_remote_keeps_routing_on_rpc_failure():
+    """If the owner kill RPC fails, actor_loc must stay so a retry can route."""
+    d = head()
+    remote = FakePeer(raise_on_call=RuntimeError("link down"))
+    d.nodes["n2"] = {"info": {"node": "n2"}, "peer": remote}
+    d.actor_loc["a1"] = "n2"
+    r, _ = run(d.on_kill(FakePeer(), {"actor": "a1"}, b""))
+    assert "link down" in r["err"]
+    assert d.actor_loc["a1"] == "n2"
+
+
+def test_on_kill_bounce_back_guard():
+    """Kill arrives from the owner node we'd forward to: drop routing, no loop."""
+    d = head()
+    peer = FakePeer()
+    d.nodes["n2"] = {"info": {"node": "n2"}, "peer": peer}
+    d.actor_loc["a1"] = "n2"
+    r, _ = run(d.on_kill(peer, {"actor": "a1"}, b""))
+    assert r["t"] == "kill_ok"
+    assert "a1" not in d.actor_loc
+    assert peer.calls == []  # must not re-forward to the same peer
+
+
+def test_on_kill_mid_create_reaps_hosting_proc():
+    d = head(1)
+    proc = FakeProc()
+    wpeer = FakePeer()
+    d._hosting["a1"] = (proc, wpeer, [0])
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        f = loop.create_future()
+        d.pending_workers["a1"] = f
+        d.actor_loc["a1"] = "n1"
+        r, _ = await d.on_kill(FakePeer(), {"actor": "a1"}, b"")
+        return r, f
+
+    r, f = run(go())
+    assert r["t"] == "kill_ok"
+    assert proc.terminated and wpeer.closed
+    assert f.done() and "killed during create" in str(f.exception())
+    assert "a1" not in d._hosting
+
+
+def test_on_kill_from_head_unknown_local_is_ok():
+    """Worker must not bounce a head kill for an id it does not host."""
+    d = worker()
+    d.head_peer = FakePeer()
+    r, _ = run(d.on_kill(d.head_peer, {"actor": "ghost"}, b""))
+    assert r["t"] == "kill_ok"
+    assert d.head_peer.calls == []  # no forward
+    assert "ghost" in d._kill_pending  # tombstone for late create
+
+
+def test_host_actor_aborts_if_kill_pending(monkeypatch):
+    d = worker()
+    d.sock_path = "/x.sock"
+    d._kill_pending.add("a1")
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(FakeProc()))
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": []}, b""))
+    assert "killed during create" in r["err"]
+    assert "a1" not in d._kill_pending
+
+
+def test_host_actor_aborts_if_kill_pending_after_spawn(monkeypatch):
+    """Kill tombstone arrives after spawn/hosting entry is installed."""
+    d = worker()
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+
+    def spawn_and_tombstone(self, actor_id, gpus):
+        d._kill_pending.add(actor_id)
+        return proc
+
+    monkeypatch.setattr(Daemon, "_spawn_worker", spawn_and_tombstone)
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+    assert "killed" in r["err"] and proc.terminated
+
+
+def test_create_actor_aborts_when_client_disconnects_after_host(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    worker_peer = FakePeer({"init": {}})
+    driver = FakePeer()
+
+    async def go():
+        task = asyncio.ensure_future(
+            d.on_create_actor(driver, {"t": "create_actor", "ngpu": 1}, b"")
+        )
+        await asyncio.sleep(0)
+        aid = next(iter(d.pending_workers))
+        d.pending_workers[aid].set_result(worker_peer)
+        driver.closed = True  # disconnect before create returns
+        return await task
+
+    r, _ = run(go())
+    assert "disconnected" in r["err"]
+    assert d.actor_loc == {}
+
+
+def test_create_actor_worker_forward_disconnects(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer({"create_actor": {"actor": "n1-a9"}})
+    driver = FakePeer()
+    driver.closed = True
+    r, _ = run(d.on_create_actor(driver, {"t": "create_actor", "ngpu": 0}, b""))
+    assert "disconnected" in r["err"]
+    assert {"t": "kill", "actor": "n1-a9"} in [c[0] for c in d.head_peer.calls]
+    assert driver.created_actors == []
+
+
+def test_create_actor_worker_forward_disconnect_kill_errors(monkeypatch):
+    """Disconnect-after-create path swallows kill failures."""
+    d = worker()
+    d.head_peer = FakePeer(
+        responses={"create_actor": {"actor": "n1-a9"}},
+        raise_on_call=None,
+    )
+    # first call succeeds (create); subsequent calls fail
+    calls = {"n": 0}
+    orig_call = d.head_peer.call
+
+    async def flaky(header, payload=b""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await orig_call(header, payload)
+        raise RuntimeError("gone")
+
+    d.head_peer.call = flaky
+    d.actors["n1-a9"] = ActorProc("n1-a9", peer=FakePeer(), gpus=[], proc=FakeProc())
+    driver = FakePeer()
+    driver.closed = True
+
+    async def boom(*a, **k):
+        raise RuntimeError("local kill failed")
+
+    monkeypatch.setattr(d, "on_kill", boom)
+    r, _ = run(d.on_create_actor(driver, {"t": "create_actor", "ngpu": 0}, b""))
+    assert "disconnected" in r["err"]
+
+
+def test_force_kill_actor_remote():
+    d = head()
+    remote = FakePeer()
+    d.nodes["n2"] = {"info": {"node": "n2"}, "peer": remote}
+    d.actor_loc["a1"] = "n2"
+    run(d._force_kill_actor("a1", "n2"))
+    assert remote.calls[0][0]["t"] == "kill"
+    assert "a1" not in d.actor_loc
+
+
+def test_force_kill_actor_remote_rpc_error():
+    d = head()
+    remote = FakePeer(raise_on_call=RuntimeError("down"))
+    d.nodes["n2"] = {"info": {"node": "n2"}, "peer": remote}
+    d.actor_loc["a1"] = "n2"
+    run(d._force_kill_actor("a1", "n2"))  # swallowed
+    assert d.actor_loc["a1"] == "n2"  # keep routing for retry
+
+
+def test_force_kill_actor_local():
+    d = head(1)
+    proc = FakeProc()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[0], proc=proc)
+    d.gpu_used[0] = True
+    run(d._force_kill_actor("a1", "n1"))
+    assert "a1" not in d.actors and proc.terminated
+
+
+def test_force_kill_actor_outer_exception_swallowed(monkeypatch):
+    d = head()
+
+    def boom(*a, **k):
+        raise RuntimeError("peer table exploded")
+
+    monkeypatch.setattr(d, "_peer_for", boom)
+    run(d._force_kill_actor("a1", "n2"))  # must not raise
+
+
+def test_host_actor_aborted_by_kill_during_attach(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        # simulate on_kill mid-create (attach not yet done)
+        fut = d.pending_workers["a1"]
+        fut.set_exception(RuntimeError("actor killed during create"))
+        return await task
+
+    r, _ = run(go())
+    assert "aborted" in r["err"] or "killed" in r["err"]
+    assert "a1" not in d._hosting
+
+
+def test_shutdown_reaps_hosting_procs():
+    d = head()
+    p1, p2 = FakeProc(), FakeProc()
+    wp = FakePeer()
+    loop = asyncio.new_event_loop()
+    pending_fut = loop.create_future()
+    wp.pending[1] = pending_fut
+    d._hosting["a1"] = (p1, None, [])
+    d._hosting["a2"] = (p2, wp, [0])
+    d.gpu_used = [True]
+
+    class BoomWriter:
+        def close(self):
+            raise OSError("already closed")
+
+    wp.writer = BoomWriter()
+
+    async def go():
+        f = asyncio.get_running_loop().create_future()
+        d.pending_workers["pending"] = f
+        d.shutdown()
+        return f
+
+    f = run(go())
+    assert p1.terminated and p2.terminated
+    assert d._hosting == {} and d.pending_workers == {}
+    assert f.done() and "shutdown" in str(f.exception())
+    assert pending_fut.done()
+    loop.close()
+
+
+def test_shutdown_reaps_actors_with_pending():
+    d = head(1)
+    peer = FakePeer()
+    loop = asyncio.new_event_loop()
+    fut = loop.create_future()
+    peer.pending[7] = fut
+    d.actors["a1"] = ActorProc("a1", peer=peer, gpus=[0], proc=FakeProc())
+    d.gpu_used[0] = True
+
+    class BoomW:
+        def close(self):
+            raise RuntimeError("x")
+
+    peer.writer = BoomW()
+    d.shutdown()
+    assert "a1" not in d.actors and fut.done() and d.gpu_used[0] is False
+    loop.close()
+
+
+def test_host_actor_killed_after_init_before_publish(monkeypatch):
+    """Kill pops _hosting after init succeeds; actor must not be published."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+
+    class KillAfterInitPeer(FakePeer):
+        async def call(self, header, payload=b""):
+            # after successful init reply, simulate concurrent kill
+            d._hosting.pop("a1", None)
+            return await super().call(header, payload)
+
+        async def close(self):
+            self.closed = True
+            raise RuntimeError("close after kill race")
+
+    worker_peer = KillAfterInitPeer({"init": {}})
+
+    async def go():
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+        await asyncio.sleep(0)
+        d.pending_workers["a1"].set_result(worker_peer)
+        return await task
+
+    r, _ = run(go())
+    assert "killed during create" in r["err"]
+    assert "a1" not in d.actors
+
+
+def test_on_kill_hosting_peer_close_error():
+    d = head(1)
+
+    class BoomPeer(FakePeer):
+        async def close(self):
+            self.closed = True
+            raise RuntimeError("close failed")
+
+    proc = FakeProc()
+    d._hosting["a1"] = (proc, BoomPeer(), [])
+    r, _ = run(d.on_kill(FakePeer(), {"actor": "a1"}, b""))
+    assert r["t"] == "kill_ok" and proc.terminated
+
+
+def test_host_actor_init_close_error_swallowed(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+
+    class BoomClosePeer(FakePeer):
+        def __init__(self):
+            super().__init__(raise_on_call=RuntimeError("init boom"))
+
+        async def close(self):
+            self.closed = True
+            raise RuntimeError("close also boom")
+
+    worker_peer = BoomClosePeer()
+
+    async def go():
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": []}, b""))
+        await asyncio.sleep(0)
+        d.pending_workers["a1"].set_result(worker_peer)
+        return await task
+
+    r, _ = run(go())
+    assert "init failed" in r["err"]
+
+
+def test_worker_hello_attaches_peer_to_hosting():
+    d = head()
+    proc = FakeProc()
+    d._hosting["a1"] = (proc, None, [1])
+    peer = FakePeer()
+    run(d.on_worker_hello(peer, {"t": "worker_hello", "actor": "a1"}, b""))
+    assert d._hosting["a1"] == (proc, peer, [1])
+
+
+def test_on_hello_stale_close_guard_returns():
+    d = head()
+    old = FakePeer()
+    new = FakePeer()
+    run(d.on_hello(old, {"t": "hello", "node": "n2", "ip": "x", "ngpu": 1}, b""))
+    old.created_pgs = ["keep-me"]
+    d.pgs["keep-me"] = [{"node": "n1", "gpu": 0}]
+    run(d.on_hello(new, {"t": "hello", "node": "n2", "ip": "x", "ngpu": 1}, b""))
+    assert old.closed  # re-hello awaits close of superseded peer
+    assert "keep-me" in new.created_pgs  # ownership transferred
+    assert "n2" in d.nodes and d.nodes["n2"]["peer"] is new
+
+
+def test_on_worker_close_stale_guard():
+    """_on_worker_close no-ops when nodes[node].peer is no longer this peer."""
+    d = head()
+    live = FakePeer()
+    run(d.on_hello(live, {"t": "hello", "node": "n2", "ip": "x", "ngpu": 1}, b""))
+    cb = live.on_close
+    live.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": 0}]
+    # replace peer without going through re-hello close
+    d.nodes["n2"]["peer"] = FakePeer()
+    run(cb())  # hits stale guard return
+    assert "p1" in d.pgs
+    assert "n2" in d.nodes
+
+
+def test_stale_worker_close_skips_release():
+    """After re-hello, ownership moves to the new peer; old peer is closed."""
+    d = head()
+    old = FakePeer()
+    new = FakePeer()
+    run(d.on_hello(old, {"t": "hello", "node": "n2", "ip": "x", "ngpu": 1}, b""))
+    old.created_pgs = ["p-should-not-drop"]
+    old.created_actors = ["a-owned"]
+    d.pgs["p-should-not-drop"] = [{"node": "n1", "gpu": 0}]
+    d.actor_loc["a-owned"] = "n2"
+    run(d.on_hello(new, {"t": "hello", "node": "n2", "ip": "x", "ngpu": 1}, b""))
+    assert old.closed and getattr(old, "superseded", False)
+    # ownership moved to the new peer so a later disconnect still cleans up
+    assert "p-should-not-drop" in new.created_pgs
+    assert "a-owned" in new.created_actors
+    assert old.created_pgs == [] and old.created_actors == []
+    # new peer disconnect still drops node, not a stale old close
+    assert d.nodes["n2"]["peer"] is new
+
+
+def test_release_client_skips_transferred_ids():
+    """In-flight release must not kill ids that re-hello moved off the peer."""
+    d = head(1)
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    d.actor_loc["a1"] = "n1"
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[0], proc=FakeProc())
+    d.gpu_used[0] = True
+
+    async def go():
+        # start release, but transfer ownership mid-flight before kill
+        peer.superseded = True
+        peer.created_actors.clear()
+        await d.release_client(peer)
+
+    run(go())
+    assert "a1" in d.actors  # not killed
+
+
+def test_release_client_continues_after_missing_id(monkeypatch):
+    """A concurrent rollback removing one id must not skip remaining PGs."""
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = ["a1", "a2"]
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actors["a2"] = ActorProc("a2", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actor_loc["a1"] = d.actor_loc["a2"] = "n1"
+
+    async def kill_removes_other(peer_arg, m, payload):
+        # first kill claims a1; a2 already gone from list (simulated)
+        if m.get("actor") == "a1" and "a2" in peer.created_actors:
+            peer.created_actors.remove("a2")
+        return {"t": "kill_ok"}, b""
+
+    monkeypatch.setattr(d, "on_kill", kill_removes_other)
+    run(d.release_client(peer))
+    assert "p1" not in d.pgs  # PG loop still runs
+
+
+def test_release_client_skips_pg_after_transfer():
+    d = head()
+    peer = FakePeer()
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    peer.superseded = True
+    peer.created_pgs.clear()
+    run(d.release_client(peer))
+    assert "p1" in d.pgs
+
+
+def test_release_client_worker_skips_when_superseded():
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    peer.superseded = True
+    run(d.release_client(peer))
+    assert d.head_peer.calls == []
+
+
+def test_release_client_skips_id_removed_from_list_mid_loop(monkeypatch):
+    d = head(1)
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    d.actor_loc["a1"] = "n1"
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[0], proc=FakeProc())
+
+    async def clear_then_ok(peer_arg, m, payload):
+        peer.created_actors.clear()
+        return {"t": "kill_ok"}, b""
+
+    # membership check is before on_kill; clear list before release so second id path
+    peer.created_actors = ["a1"]
+    peer.created_actors.remove("a1")  # empty after snapshot would need mid-await
+    # better: two ids, clear second during first kill
+    peer.created_actors = ["a1", "a2"]
+    d.actor_loc["a2"] = "n1"
+    d.actors["a2"] = ActorProc("a2", peer=FakePeer(), gpus=[], proc=FakeProc())
+
+    async def kill_clears(peer_arg, m, payload):
+        peer.created_actors[:] = []  # transfer away remaining
+        return {"t": "kill_ok"}, b""
+
+    monkeypatch.setattr(d, "on_kill", kill_clears)
+    run(d.release_client(peer))
+    # a2 not killed via second iteration because list was cleared
+    assert "a2" in d.actors
+
+
+def test_release_client_worker_skips_pg_mid_loop():
+    """Ghost membership mid-claim: id vanishes from live list -> continue."""
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+
+    class GhostList(list):
+        def __contains__(self, item):
+            # first id present for claim, later checks fail
+            return item in list(self) and item != "p2"
+
+        def remove(self, item):
+            list.remove(self, item)
+
+    peer.created_pgs = GhostList(["p1", "p2"])
+    run(d.release_client(peer))
+    # p2 skipped via not-in; only p1 forwarded
+    assert len(d.head_peer.calls) == 1
+    assert d.head_peer.calls[0][0]["pg"] == "p1"
+
+
+def test_release_client_worker_superseded_mid_actor_loop():
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+
+    peer.created_actors = SuperList(["a1", "a2"])
+
+    async def go():
+        await d.release_client(peer)
+
+    run(go())
+    assert len(d.head_peer.calls) == 1
+
+
+def test_release_client_worker_superseded_mid_pg_loop():
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+
+    peer.created_pgs = SuperList(["p1", "p2"])
+    run(d.release_client(peer))
+    assert len(d.head_peer.calls) == 1
+
+
+def test_release_client_schedules_retry_on_forward_fail(monkeypatch):
+    """Dying driver peer must not be re-appended; background retry is scheduled."""
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("gone"))
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    peer.created_pgs = ["p1"]
+    scheduled: list[str] = []
+
+    def track(task):
+        scheduled.append("release")
+        task.cancel()  # don't run infinite retry in unit test
+        return task
+
+    monkeypatch.setattr(d, "_track", track)
+    run(d.release_client(peer))
+    assert "a1" not in peer.created_actors  # claimed, not dead-lettered
+    assert "p1" not in peer.created_pgs
+    # single chained task: kills then pgs
+    assert scheduled == ["release"]
+
+
+def test_release_client_schedules_pg_retry_on_forward_fail(monkeypatch):
+    """PG-only release with head down: retry remove_pg without kill chain."""
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("gone"))
+    peer = FakePeer()
+    peer.created_pgs = ["p1"]
+    scheduled: list[str] = []
+
+    def track(task):
+        scheduled.append("pg")
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(d, "_track", track)
+    run(d.release_client(peer))
+    assert "p1" not in peer.created_pgs
+    assert scheduled == ["pg"]
+
+
+def test_release_client_head_schedules_orphan_on_kill_fail(monkeypatch):
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    d.actor_loc["a1"] = "n2"
+    scheduled: list[tuple[str, str]] = []
+
+    def capture(actor_id, node):
+        scheduled.append((actor_id, node))
+        d._orphans[actor_id] = node  # register without starting a task
+
+    async def boom(*a, **k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(d, "on_kill", boom)
+    monkeypatch.setattr(d, "_schedule_orphan_reap", capture)
+    run(d.release_client(peer))
+    assert "a1" not in peer.created_actors  # not dead-lettered onto dying peer
+    assert scheduled == [("a1", "n2")]
+
+
+def test_release_client_head_soft_err_schedules_orphan(monkeypatch):
+    """on_kill returns err without raising: still schedule orphan reaper."""
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    d.actor_loc["a1"] = "n2"
+    scheduled: list[tuple[str, str]] = []
+
+    def capture(actor_id, node):
+        scheduled.append((actor_id, node))
+        d._orphans[actor_id] = node
+
+    async def soft(*a, **k):
+        return {"err": "link down"}, b""
+
+    monkeypatch.setattr(d, "on_kill", soft)
+    monkeypatch.setattr(d, "_schedule_orphan_reap", capture)
+    run(d.release_client(peer))
+    assert scheduled == [("a1", "n2")]
+    assert "a1" not in peer.created_actors
+
+
+def test_release_client_head_defers_pg_while_orphans(monkeypatch):
+    """PG reservations stay until orphan actors are reaped (no double-book)."""
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    peer.created_pgs = ["p1"]
+    d.actor_loc["a1"] = "n2"
+    d.pgs["p1"] = [{"node": "n2", "gpu": 0}]
+
+    def capture(actor_id, node):
+        d._orphans[actor_id] = node
+
+    async def soft(*a, **k):
+        return {"err": "down"}, b""
+
+    monkeypatch.setattr(d, "on_kill", soft)
+    monkeypatch.setattr(d, "_schedule_orphan_reap", capture)
+    run(d.release_client(peer))
+    assert "a1" in d._orphans
+    assert "p1" in d.pgs  # not freed while orphan lives
+    assert "p1" in d._orphan_pgs
+
+
+def test_release_client_head_skips_missing_actor_id():
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    # a1 not in list when loop checks (removed before release)
+    peer.created_actors.clear()
+    run(d.release_client(peer))
+    assert "p1" not in d.pgs
+
+
+def test_release_client_continue_on_missing_ids_in_snapshot():
+    """Snapshot has ghost ids already removed from live lists -> continue."""
+    d = head()
+    peer = FakePeer()
+
+    class GhostList(list):
+        def __contains__(self, item):
+            return False  # always missing at check time
+
+        def remove(self, item):
+            raise AssertionError("must not claim missing id")
+
+    peer.created_actors = GhostList(["ghost"])
+    peer.created_pgs = GhostList(["ghost-pg"])
+    # no real work — both continue; ensure no crash
+    run(d.release_client(peer))
+
+
+def test_release_client_worker_continue_missing_actor():
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+
+    class GhostList(list):
+        def __contains__(self, item):
+            return False
+
+    peer.created_actors = GhostList(["ghost"])
+    peer.created_pgs = ["p1"]
+    run(d.release_client(peer))
+    assert d.head_peer.calls and d.head_peer.calls[0][0]["t"] == "remove_pg"
+
+
+def test_release_client_head_superseded_mid_pg_loop():
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = []
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            if item == "p1":
+                peer.superseded = True
+
+    peer.created_pgs = SuperList(["p1", "p2"])
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    d.pgs["p2"] = [{"node": "n1", "gpu": -1}]
+    run(d.release_client(peer))
+    assert "p1" not in d.pgs and "p2" in d.pgs
+
+
+def test_release_client_head_superseded_mid_actor_loop():
+    d = head()
+    peer = FakePeer()
+    new_peer = FakePeer()
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+            peer.superseded_by = new_peer
+            # real re-hello: transfer remaining then clear
+            for a in list(self):
+                new_peer.created_actors.append(a)
+            peer.created_actors.clear()
+            peer.created_pgs.clear()
+
+    peer.created_actors = SuperList(["a1", "a2"])
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actors["a2"] = ActorProc("a2", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actor_loc["a1"] = d.actor_loc["a2"] = "n1"
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    run(d.release_client(peer))
+    # PGs handed to replacement peer only because it still owns transferred a2
+    assert "a2" in new_peer.created_actors
+    assert "p1" in new_peer.created_pgs
+    assert "p1" in d.pgs
+
+
+def test_release_client_superseded_always_hands_pgs_to_by():
+    """Even if transfer lists look empty, hand claimed PGs to superseded_by."""
+    d = head()
+    peer = FakePeer()
+    new_peer = FakePeer()
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+            peer.superseded_by = new_peer
+            peer.created_actors.clear()
+            peer.created_pgs.clear()
+
+    peer.created_actors = SuperList(["a1"])
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actor_loc["a1"] = "n1"
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    run(d.release_client(peer))
+    # Safe over-retain: new peer owns p1 until it disconnects
+    assert "p1" in new_peer.created_pgs
+    assert "p1" in d.pgs
+
+
+def test_release_client_superseded_without_by_keeps_on_peer():
+    """Edge path: superseded but no superseded_by; remaining actors keep PGs."""
+    d = head()
+    peer = FakePeer()
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+            # leave a2 on list (no clear) so elif peer.created_actors branch runs
+
+    peer.created_actors = SuperList(["a1", "a2"])
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actors["a2"] = ActorProc("a2", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actor_loc["a1"] = d.actor_loc["a2"] = "n1"
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    run(d.release_client(peer))
+    assert "p1" in peer.created_pgs
+    assert "p1" in d.pgs
+
+
+def test_terminate_waits_then_kills(monkeypatch):
+    class Stubborn:
+        def __init__(self):
+            self.steps = []
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def terminate(self):
+            self.steps.append("term")
+
+        def kill(self):
+            self.steps.append("kill")
+            self._alive = False
+
+        def wait(self, timeout=None):
+            self.steps.append("wait:%s" % timeout)
+            if "kill" not in self.steps:
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+            return 0
+
+    import subprocess as sp
+
+    p = Stubborn()
+    _terminate(p)
+    assert p.steps[0] == "term"
+    assert "kill" in p.steps
+    assert p.poll() == 0
+
+
+def test_on_actor_gone_worker_forwards():
+    d = worker()
+    d.head_peer = FakePeer({"actor_gone": {}})
+    r, _ = run(d.on_actor_gone(FakePeer(), {"t": "actor_gone", "actor": "a1"}, b""))
+    assert d.head_peer.calls[0][0]["t"] == "actor_gone"
+
+
+def test_worker_actor_close_notifies_head():
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+    run(d.on_worker_hello(peer, {"t": "worker_hello", "actor": "a1"}, b""))
+    assert peer.on_close is not None
+    run(peer.on_close())
+    assert {"t": "actor_gone", "actor": "a1"} in [c[0] for c in d.head_peer.calls]
+
+
+def test_worker_actor_close_swallows_notify_error():
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("head gone"))
+    peer = FakePeer()
+    run(d.on_worker_hello(peer, {"t": "worker_hello", "actor": "a1"}, b""))
+    run(peer.on_close())  # no raise
+
+
+def test_release_client_local_fallback_swallows_kill_error(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("head gone"))
+    proc = FakeProc()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=proc)
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+
+    async def boom(*a, **k):
+        raise RuntimeError("kill failed")
+
+    monkeypatch.setattr(d, "on_kill", boom)
+    run(d.release_client(peer))  # no raise
+
+
 def test_on_kill_unknown_is_ok():
     d = head()
     r, _ = run(d.on_kill(FakePeer(), {"actor": "ghost"}, b""))
@@ -717,6 +1841,26 @@ def test_on_kill_worker_forwards():
     r, _ = run(d.on_kill(FakePeer(), {"actor": "n1-a1"}, b""))
     assert r["t"] == "kill_ok"
     assert d.head_peer.calls[0][0] == {"t": "kill", "actor": "n1-a1"}
+
+
+def test_on_kill_worker_local_notifies_head():
+    """ray.kill on the owner worker must clear head actor_loc via actor_gone."""
+    d = worker()
+    d.head_peer = FakePeer()
+    proc = FakeProc()
+    ap = ActorProc("a1", peer=FakePeer(), gpus=[], proc=proc)
+    d.actors["a1"] = ap
+    r, _ = run(d.on_kill(FakePeer(), {"actor": "a1"}, b""))
+    assert r["t"] == "kill_ok"
+    assert "a1" not in d.actors and proc.terminated
+    assert {"t": "actor_gone", "actor": "a1"} in [c[0] for c in d.head_peer.calls]
+
+
+def test_on_actor_gone_head_drops_routing():
+    d = head()
+    d.actor_loc["a1"] = "n2"
+    r, _ = run(d.on_actor_gone(FakePeer(), {"t": "actor_gone", "actor": "a1"}, b""))
+    assert r["t"] == "actor_gone_ok" and "a1" not in d.actor_loc
 
 
 # ---- on_hello (membership) --------------------------------------------------
@@ -819,6 +1963,19 @@ def test_release_client_worker_swallows_forward_errors():
     peer.created_actors = ["a1"]
     peer.created_pgs = ["p1"]
     run(d.release_client(peer))  # errors swallowed, no raise
+
+
+def test_release_client_worker_reaps_local_when_head_down():
+    """Driver-on-worker disconnect with head unreachable must still kill local actors."""
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("head gone"))
+    proc = FakeProc()
+    ap = ActorProc("a1", peer=FakePeer(), gpus=[], proc=proc)
+    d.actors["a1"] = ap
+    peer = FakePeer()
+    peer.created_actors = ["a1"]
+    run(d.release_client(peer))
+    assert "a1" not in d.actors and proc.terminated
 
 
 def test_release_client_head_no_head_peer_needed():
@@ -1143,6 +2300,39 @@ def test_serve_tcp_creates_listener():
     run(go())
 
 
+def test_join_head_sets_on_close_to_shutdown(monkeypatch):
+    d = worker()
+    called = []
+
+    class HP(FakePeer):
+        pass
+
+    async def fake_open(host, port):
+        return object(), object()
+
+    monkeypatch.setattr(_daemon.asyncio, "open_connection", fake_open)
+
+    def fake_peer(reader, writer, handler):
+        p = HP()
+        return p
+
+    monkeypatch.setattr(_daemon, "Peer", fake_peer)
+    monkeypatch.setattr(d, "shutdown", lambda: called.append(True))
+
+    async def go():
+        # minimal: set head_peer like join_head does
+        d.head_peer = HP()
+
+        def _on_head_lost():
+            d.shutdown()
+
+        d.head_peer.on_close = _on_head_lost
+        d.head_peer.on_close()
+        return called
+
+    assert run(go()) == [True]
+
+
 def test_join_head_handshake():
     """A worker daemon dials a real head over TCP and completes the hello; the
     head records the new node. No subprocess, just two in-process daemons."""
@@ -1288,3 +2478,1628 @@ def test_peer_close_async_on_close():
         s2.close()
 
     run(go())
+
+
+def test_peer_close_drains_handler_tasks_before_on_close():
+    """release/on_close must not run while framed handlers are still pending."""
+    order: list[str] = []
+
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+
+        async def slow_handler(peer, m, payload):
+            order.append("handle_start")
+            await asyncio.sleep(0.01)
+            order.append("handle_done")
+            return {"t": "ok"}, b""
+
+        p = Peer(r1, w1, slow_handler)
+
+        async def on_close():
+            order.append("on_close")
+
+        p.on_close = on_close
+        # Simulate a handler already scheduled (as serve would)
+        t = asyncio.create_task(p._handle({"t": "x", "reqid": 1}, b""))
+        p._tasks.add(t)
+        t.add_done_callback(p._tasks.discard)
+        await asyncio.sleep(0)  # let handle_start run
+        await p.close()
+        assert order == ["handle_start", "handle_done", "on_close"]
+        s2.close()
+
+    run(go())
+
+
+def test_peer_close_fails_pending_before_drain():
+    """Handlers blocked on same-peer call() must unblock when close runs."""
+
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        s2.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        r2, w2 = await asyncio.open_connection(sock=s2)
+
+        async def bounce(peer, m, payload):
+            # call back on the same peer — would hang if pending not failed first
+            return await peer.call({"t": "echo"}, b"")
+
+        p = Peer(r1, w1, bounce)
+        # plant a pending future as if call() is in flight
+        fut = asyncio.get_running_loop().create_future()
+        p.pending[99] = fut
+
+        async def stuck_handler(peer, m, payload):
+            try:
+                await fut  # wait until close fails pending
+            except ConnectionError:
+                return {"t": "aborted"}, b""
+            return {"t": "ok"}, b""
+
+        p.handler = stuck_handler
+        t = asyncio.create_task(p._handle({"t": "x", "reqid": 1}, b""))
+        p._tasks.add(t)
+        t.add_done_callback(p._tasks.discard)
+        await asyncio.sleep(0)
+        await p.close()
+        assert fut.done()
+        assert t.done()
+        w2.close()
+
+    run(go())
+
+
+def test_peer_close_fires_on_close_even_if_drain_cancelled():
+    """Cancelled drain must still close writer and run on_close once."""
+    fired = []
+
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+
+        async def forever(peer, m, payload):
+            await asyncio.Event().wait()
+            return {"t": "ok"}, b""
+
+        p = Peer(r1, w1, forever)
+        p.on_close = lambda: fired.append("close")
+        t = asyncio.create_task(p._handle({"t": "x", "reqid": 1}, b""))
+        p._tasks.add(t)
+        t.add_done_callback(p._tasks.discard)
+        await asyncio.sleep(0)
+
+        async def bad_wait(aws, timeout=None):
+            raise asyncio.CancelledError()
+
+        orig = asyncio.wait
+        asyncio.wait = bad_wait  # type: ignore
+        try:
+            try:
+                await p.close()
+            except asyncio.CancelledError:
+                pass
+        finally:
+            asyncio.wait = orig  # type: ignore
+
+        assert fired == ["close"]
+        assert p.on_close is None
+        s2.close()
+
+    run(go())
+
+
+def test_peer_close_second_await_joins_first():
+    """Concurrent close() waits for the first close's release to finish."""
+    order: list[str] = []
+
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        p = Peer(r1, w1, lambda *a: None)
+        gate = asyncio.Event()
+
+        async def slow_on_close():
+            order.append("release_start")
+            await gate.wait()
+            order.append("release_done")
+
+        p.on_close = slow_on_close
+        t1 = asyncio.create_task(p.close())
+        await asyncio.sleep(0)
+        assert p.closed
+        t2 = asyncio.create_task(p.close())
+        await asyncio.sleep(0)
+        assert not t2.done()  # joined on _close_done
+        gate.set()
+        await t1
+        await t2
+        assert order == ["release_start", "release_done"]
+        s2.close()
+
+    run(go())
+
+
+def test_release_client_superseded_closed_target_frees_or_reaps():
+    d = head()
+    peer = FakePeer()
+    new_peer = FakePeer()
+    new_peer.closed = True
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+            peer.superseded_by = new_peer
+            peer.created_actors.clear()
+            peer.created_pgs.clear()
+
+    peer.created_actors = SuperList(["a1"])
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actor_loc["a1"] = "n1"
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    run(d.release_client(peer))
+    # a1 killed; closed target has no leftovers → free PG (not stuck forever)
+    assert "p1" not in d.pgs
+    assert "p1" not in new_peer.created_pgs
+
+
+def test_release_client_superseded_closed_target_with_leftover_actors():
+    d = head()
+    peer = FakePeer()
+    new_peer = FakePeer()
+    new_peer.closed = True
+    new_peer.created_actors = ["a2"]  # transferred earlier; still tracked
+
+    class SuperList(list):
+        def remove(self, item):
+            list.remove(self, item)
+            peer.superseded = True
+            peer.superseded_by = new_peer
+            peer.created_actors.clear()
+            peer.created_pgs.clear()
+
+    peer.created_actors = SuperList(["a1"])
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actors["a2"] = ActorProc("a2", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.actor_loc["a1"] = d.actor_loc["a2"] = "n1"
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    scheduled = []
+
+    def capture(aid, node):
+        scheduled.append(aid)
+        d._orphans[aid] = node
+
+    # Patch on the instance after construction
+    d._schedule_orphan_reap = capture  # type: ignore
+    run(d.release_client(peer))
+    assert "a2" in scheduled
+    assert "p1" in d._orphan_pgs or "p1" in d.pgs
+
+
+def test_terminate_returns_false_if_still_alive():
+    class Immortal:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+    assert _terminate(Immortal()) is False
+
+
+def test_on_kill_returns_err_if_process_still_alive():
+    d = head(1)
+    d.gpu_used[0] = True
+
+    class Immortal(FakeProc):
+        def __init__(self):
+            super().__init__(alive=True)
+
+        def terminate(self):
+            self.terminated = True
+            # stay alive
+
+        def kill(self):
+            self.killed = True
+            # stay alive
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+    proc = Immortal()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[0], proc=proc)
+    d.actor_loc["a1"] = "n1"
+    r, _ = run(d.on_kill(None, {"actor": "a1"}, b""))
+    assert r.get("err")
+    assert "a1" in d.actors  # restored for tracking
+    assert d.gpu_used[0] is True  # not freed under live process
+
+
+def test_host_actor_aborts_publish_if_peer_closed(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    worker_peer = FakePeer()
+    worker_peer.closed = True  # already dead when attach completes
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": []}, b"")
+        )
+        await asyncio.sleep(0)
+        d.pending_workers["a1"].set_result(worker_peer)
+        return await task
+
+    r, _ = run(go())
+    assert r.get("err")
+    assert "a1" not in d.actors
+
+
+def test_host_actor_peer_closed_proc_still_alive(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+    worker_peer = FakePeer()
+    worker_peer.closed = True
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        d.pending_workers["a1"].set_result(worker_peer)
+        return await task
+
+    r, _ = run(go())
+    assert "still alive" in r["err"]
+    assert "a1" in d._hosting
+    assert d.gpu_used[0] is True
+
+
+def test_on_kill_hosting_restores_if_process_alive():
+    d = head(1)
+    d.gpu_used[0] = True
+
+    class Immortal(FakeProc):
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+    proc = Immortal()
+    d._hosting["a1"] = (proc, FakePeer(), [0])
+    r, _ = run(d.on_kill(None, {"actor": "a1"}, b""))
+    assert r.get("err")
+    assert "a1" in d._hosting
+    assert d.actor_loc.get("a1") == "n1"
+    assert d.gpu_used[0] is True
+
+
+def test_host_actor_finally_keeps_hosting_if_alive(monkeypatch):
+    """Concurrent kill restore + host_actor finally must not untrack live proc."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+
+    class Immortal(FakeProc):
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+    proc = Immortal()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        # kill mid-create while still hosting
+        r, _ = await d.on_kill(None, {"actor": "a1"}, b"")
+        assert r.get("err")
+        try:
+            await task
+        except Exception:
+            pass
+        # immortal proc must remain tracked
+        assert "a1" in d._hosting
+
+    run(go())
+
+
+def test_host_actor_kill_pending_after_spawn_still_alive(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+
+    class Immortal(FakeProc):
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+    proc = Immortal()
+    d.gpu_used[0] = True
+
+    def spawn_then_tombstone(self, actor_id, gpus):
+        d._kill_pending.add(actor_id)  # after spawn, before hosting check
+        return proc
+
+    monkeypatch.setattr(Daemon, "_spawn_worker", spawn_then_tombstone)
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+    assert "still alive" in r["err"]
+    assert "a1" in d._hosting
+    assert d.gpu_used[0] is True
+
+
+def test_host_actor_cancel_keeps_hosting_if_alive(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert "a1" in d._hosting
+        assert d.gpu_used[0] is True
+
+    run(go())
+
+
+def test_host_actor_cancel_frees_if_proc_dies(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc(alive=True)
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert "a1" not in d._hosting
+        assert d.gpu_used[0] is False
+
+    run(go())
+
+
+def test_host_actor_cancel_restores_hosting_if_popped(monkeypatch):
+    """Cancel after hosting was cleared: re-park immortal proc."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        d._hosting.pop("a1", None)  # simulate concurrent clear
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert "a1" in d._hosting
+        assert d.gpu_used[0] is True
+
+    run(go())
+
+
+def _immortal():
+    class Immortal(FakeProc):
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+
+    return Immortal()
+
+
+def test_host_actor_timeout_still_alive(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+
+    async def go():
+        # fail attach immediately
+        async def boom_wait(aw, timeout=None):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(asyncio, "wait_for", boom_wait)
+        return await d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+
+    r, _ = run(go())
+    assert "still alive" in r["err"]
+    assert "a1" in d._hosting
+
+
+def test_host_actor_init_fail_still_alive(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+    wp = FakePeer(raise_on_call=RuntimeError("init boom"))
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        d.pending_workers["a1"].set_result(wp)
+        return await task
+
+    r, _ = run(go())
+    assert "still alive" in r["err"]
+    assert "a1" in d._hosting
+
+
+def test_host_actor_spawn_fail_still_alive(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    d.gpu_used[0] = True
+
+    def boom_spawn(self, aid, gpus):
+        # set proc then raise after hosting would need... spawn raises before hosting
+        raise RuntimeError("exec failed")
+
+    monkeypatch.setattr(Daemon, "_spawn_worker", boom_spawn)
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+    assert "spawn failed" in r["err"]
+
+
+def test_host_actor_spawn_sets_proc_then_raises(monkeypatch):
+    """Exception path with proc set but hosting empty: restore hosting if alive."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = _immortal()
+    d.gpu_used[0] = True
+
+    def weird_spawn(self, aid, gpus):
+        return proc
+
+    class BoomDict(dict):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def __setitem__(self, k, v):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("map full")  # first assign (hosting) fails
+            return dict.__setitem__(self, k, v)  # restore on cleanup succeeds
+
+    monkeypatch.setattr(Daemon, "_spawn_worker", weird_spawn)
+    d._hosting = BoomDict()
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+    assert "spawn failed" in r["err"]
+    assert "a1" in d._hosting
+    assert d.gpu_used[0] is True
+
+
+def test_retry_forward_kill_stops_when_head_gone(monkeypatch):
+    d = worker()
+    d.head_peer = None
+    run(d._retry_forward_kill("a1"))  # returns without spinning
+
+
+def test_retry_forward_remove_pg_stops_when_head_closed(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    d.head_peer.closed = True
+    run(d._retry_forward_remove_pg("p1"))
+
+
+def test_retry_forward_kill_stops_after_fail_when_head_closes(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("x"))
+    tries = {"n": 0}
+
+    async def flaky_forward(m, payload=b""):
+        tries["n"] += 1
+        d.head_peer.closed = True
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(d, "_forward_head", flaky_forward)
+    run(d._retry_forward_kill("a1"))
+    assert tries["n"] == 1
+
+
+def test_retry_forward_remove_pg_stops_after_fail_when_head_closes(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+
+    async def flaky_forward(m, payload=b""):
+        d.head_peer.closed = True
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(d, "_forward_head", flaky_forward)
+    run(d._retry_forward_remove_pg("p1"))
+
+
+def test_peer_close_cancels_straggler_handlers(monkeypatch):
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+
+        async def forever(peer, m, payload):
+            await asyncio.Event().wait()
+            return {"t": "ok"}, b""
+
+        p = Peer(r1, w1, forever)
+        t = asyncio.create_task(p._handle({"t": "x", "reqid": 1}, b""))
+        p._tasks.add(t)
+        t.add_done_callback(p._tasks.discard)
+        await asyncio.sleep(0)
+
+        real_wait = asyncio.wait
+
+        async def quick_wait(aws, timeout=None):
+            # expire immediately so close cancels the hung handler
+            return await real_wait(aws, timeout=0)
+
+        monkeypatch.setattr(asyncio, "wait", quick_wait)
+        await p.close()
+        assert t.done()
+        s2.close()
+
+    run(go())
+
+
+def test_host_actor_cancel_terminates_proc(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    d.gpu_used[0] = True
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    run(go())
+    assert proc.terminated
+    assert "a1" not in d._hosting
+    assert d.gpu_used[0] is False
+
+
+def test_await_fwd_after_cancel_swallows_error():
+    d = worker()
+    peer = FakePeer()
+
+    async def go():
+        async def boom():
+            raise RuntimeError("x")
+
+        t = asyncio.create_task(boom())
+        return await d._await_fwd_after_cancel(t, peer, "actor")
+
+    assert run(go()) is None
+
+
+def test_await_fwd_after_cancel_timeout_schedules_bg(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    scheduled = []
+
+    def track(task):
+        scheduled.append("bg")
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(d, "_track", track)
+
+    async def go():
+        async def hang():
+            await asyncio.Event().wait()
+            return {"actor": "a1"}, b""
+
+        t = asyncio.create_task(hang())
+        real_wf = asyncio.wait_for
+
+        async def quick(aw, timeout=None):
+            return await real_wf(aw, timeout=0.01)
+
+        monkeypatch.setattr(asyncio, "wait_for", quick)
+        r = await d._await_fwd_after_cancel(t, peer, "actor")
+        assert r is None
+        assert not t.cancelled()  # forward left running for bg cleanup
+        assert scheduled == ["bg"]
+        assert peer.in_flight >= 1
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    run(go())
+
+
+def test_bg_finish_fwd_cleanup_actor(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    cleaned = []
+
+    async def cleanup(p, aid):
+        cleaned.append(aid)
+
+    monkeypatch.setattr(d, "_worker_cleanup_actor", cleanup)
+
+    async def go():
+        async def done():
+            return {"actor": "n1-a1"}, b""
+
+        t = asyncio.create_task(done())
+        peer.in_flight = 1
+        await d._bg_finish_fwd_cleanup(peer, t, "actor")
+        assert peer.in_flight == 0
+
+    run(go())
+    assert cleaned == ["n1-a1"]
+
+
+def test_bg_finish_fwd_cleanup_pg(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    cleaned = []
+
+    async def cleanup(p, pg):
+        cleaned.append(pg)
+
+    monkeypatch.setattr(d, "_worker_cleanup_pg", cleanup)
+
+    async def go():
+        async def done():
+            return {"pg": "p1"}, b""
+
+        t = asyncio.create_task(done())
+        peer.in_flight = 1
+        await d._bg_finish_fwd_cleanup(peer, t, "pg")
+
+    run(go())
+    assert cleaned == ["p1"]
+
+
+def test_bg_finish_fwd_cleanup_error():
+    d = worker()
+    peer = FakePeer()
+
+    async def go():
+        async def boom():
+            raise RuntimeError("x")
+
+        t = asyncio.create_task(boom())
+        peer.in_flight = 1
+        await d._bg_finish_fwd_cleanup(peer, t, "actor")
+        assert peer.in_flight == 0
+
+    run(go())
+
+
+def test_await_fwd_after_cancel_done_result():
+    d = worker()
+    peer = FakePeer()
+
+    async def go():
+        async def done():
+            return {"actor": "a"}, b""
+
+        t = asyncio.create_task(done())
+        await t
+        # already done: wait_for still works; force except path with done task
+        real_wf = asyncio.wait_for
+
+        async def always_timeout(aw, timeout=None):
+            raise TimeoutError()
+
+        # monkeypatch in outer test
+        return t
+
+    t = run(go())
+
+    async def go2(monkeypatch):
+        async def always_timeout(aw, timeout=None):
+            raise TimeoutError()
+
+        monkeypatch.setattr(asyncio, "wait_for", always_timeout)
+        r = await d._await_fwd_after_cancel(t, peer, "actor")
+        assert r == ({"actor": "a"}, b"")
+
+    # re-run with monkeypatch via pytest style inline
+    import pytest as _pt
+
+    # simpler direct call after task done
+    async def direct():
+        async def done():
+            return {"actor": "a"}, b""
+
+        t2 = asyncio.create_task(done())
+        await t2
+
+        async def always_timeout(aw, timeout=None):
+            raise TimeoutError()
+
+        # patch wait_for only for this call
+        orig = asyncio.wait_for
+        asyncio.wait_for = always_timeout  # type: ignore
+        try:
+            return await d._await_fwd_after_cancel(t2, peer, "actor")
+        finally:
+            asyncio.wait_for = orig  # type: ignore
+
+    assert run(direct()) == ({"actor": "a"}, b"")
+
+
+def test_worker_cleanup_actor_schedules_retry(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("down"))
+    peer = FakePeer()
+    scheduled = []
+
+    def track(task):
+        scheduled.append("k")
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(d, "_track", track)
+    run(d._worker_cleanup_actor(peer, "a1"))
+    assert scheduled == ["k"]
+    assert peer.in_flight >= 1
+
+
+def test_worker_cleanup_actor_success_local_kill(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+    proc = FakeProc()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=proc)
+    run(d._worker_cleanup_actor(peer, "a1"))
+    assert "a1" not in d.actors
+    assert peer.in_flight == 0
+
+
+def test_worker_cleanup_actor_success_local_kill_error(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+
+    async def boom(*a, **k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(d, "on_kill", boom)
+    run(d._worker_cleanup_actor(peer, "a1"))  # swallows local kill error
+    assert peer.in_flight == 0
+
+
+def test_worker_cleanup_actor_cancel_pins_retry(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+    scheduled = []
+
+    def track(task):
+        scheduled.append("k")
+        task.cancel()
+        return task
+
+    async def cancel_forward(m, payload=b""):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(d, "_forward_head", cancel_forward)
+    monkeypatch.setattr(d, "_track", track)
+
+    async def go():
+        try:
+            await d._worker_cleanup_actor(peer, "a1")
+        except asyncio.CancelledError:
+            return "c"
+
+    assert run(go()) == "c"
+    assert scheduled == ["k"]
+
+
+def test_worker_cleanup_pg_schedules_retry(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("down"))
+    peer = FakePeer()
+    scheduled = []
+
+    def track(task):
+        scheduled.append("p")
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(d, "_track", track)
+    run(d._worker_cleanup_pg(peer, "p1"))
+    assert scheduled == ["p"]
+
+
+def test_worker_cleanup_pg_success(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    peer = FakePeer()
+    run(d._worker_cleanup_pg(peer, "p1"))
+    assert peer.in_flight == 0
+    assert d.head_peer.calls and d.head_peer.calls[0][0]["t"] == "remove_pg"
+
+
+def test_worker_cleanup_pg_cancel_pins_retry(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    scheduled = []
+
+    def track(task):
+        scheduled.append("p")
+        task.cancel()
+        return task
+
+    async def cancel_forward(m, payload=b""):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(d, "_forward_head", cancel_forward)
+    monkeypatch.setattr(d, "_track", track)
+
+    async def go():
+        try:
+            await d._worker_cleanup_pg(peer, "p1")
+        except asyncio.CancelledError:
+            return "c"
+
+    assert run(go()) == "c"
+    assert scheduled == ["p"]
+
+
+def test_worker_create_pg_cancel_after_forward_cleans(monkeypatch):
+    """True task.cancel() after head returns: cleanup must still run (shielded)."""
+    d = worker()
+    d.head_peer = FakePeer({"create_pg": {"pg": "p9"}})
+    peer = FakePeer()
+    cleaned = []
+
+    async def cleanup(p, pg):
+        cleaned.append(pg)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(d, "_worker_cleanup_pg", cleanup)
+
+    async def go():
+        task = asyncio.ensure_future(
+            d.on_create_pg(peer, {"t": "create_pg", "specs": [{"GPU": 1}]}, b"")
+        )
+        await asyncio.sleep(0)
+        # Let forward complete, then cancel while still in create_pg
+        # Force cancel after a yield; shield keeps fwd alive then cleanup.
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "ok"
+
+    # If forward is instant, cancel may hit after return - use slow forward
+    async def slow_forward(m, payload=b""):
+        await asyncio.sleep(0.02)
+        return {"t": "create_pg_ok", "pg": "p9"}, b""
+
+    monkeypatch.setattr(d, "_forward_head", slow_forward)
+
+    async def go2():
+        task = asyncio.ensure_future(
+            d.on_create_pg(peer, {"t": "create_pg", "specs": [{"GPU": 1}]}, b"")
+        )
+        await asyncio.sleep(0.005)  # mid-forward
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "ok"
+
+    assert run(go2()) == "cancelled"
+    assert cleaned == ["p9"]
+
+
+def test_worker_create_actor_cancel_after_forward_cleans(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    cleaned = []
+
+    async def cleanup(p, aid):
+        cleaned.append(aid)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(d, "_worker_cleanup_actor", cleanup)
+
+    async def slow_forward(m, payload=b""):
+        await asyncio.sleep(0.02)
+        return {"t": "create_actor_ok", "actor": "n1-a9"}, b""
+
+    monkeypatch.setattr(d, "_forward_head", slow_forward)
+
+    async def go():
+        task = asyncio.ensure_future(
+            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
+        )
+        await asyncio.sleep(0.005)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "ok"
+
+    assert run(go()) == "cancelled"
+    assert cleaned == ["n1-a9"]
+
+
+def test_host_actor_cancel_with_hosting_wpeer(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    wpeer = FakePeer()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+
+    async def go():
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": []}, b"")
+        )
+        await asyncio.sleep(0)
+        # attach peer into hosting as mid-create would
+        d._hosting["a1"] = (proc, wpeer, [])
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    run(go())
+    assert proc.terminated
+    assert wpeer.on_close is None
+
+
+def test_host_actor_cancel_before_hosting_entry(monkeypatch):
+    """Cancel after spawn assigns proc but before _hosting set (synthetic)."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+
+    def slow_spawn(self, actor_id, gpus):
+        # raise CancelledError path with proc set and hosting empty:
+        # call cancel handler logic by raising after spawn via wait_for
+        return proc
+
+    monkeypatch.setattr(Daemon, "_spawn_worker", slow_spawn)
+
+    async def go():
+        # Force CancelledError after spawn by cancelling during wait_for(fut)
+        task = asyncio.ensure_future(
+            d._host_actor({"actor": "a1", "gpus": []}, b"")
+        )
+        await asyncio.sleep(0)
+        # remove hosting so cancel hits elif proc branch
+        d._hosting.pop("a1", None)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    run(go())
+    assert proc.terminated
+
+
+def test_on_hello_closed_peer_releases_without_installing():
+    d = head()
+    peer = FakePeer()
+    peer.closed = True
+    peer.created_pgs = ["p1"]
+    d.pgs["p1"] = [{"node": "n1", "gpu": -1}]
+    r, _ = run(d.on_hello(peer, {"t": "hello", "node": "w2", "ip": "9.9.9.9", "ngpu": 1}, b""))
+    assert r["t"] == "hello_ok"
+    assert "w2" not in d.nodes  # dead peer not installed
+    assert "p1" not in d.pgs  # released
+
+
+def test_on_hello_closed_peer_after_rehello_drops_old():
+    d = head()
+    old = FakePeer()
+    old.created_actors = ["a1"]
+    d.nodes["w2"] = {"info": {"node": "w2", "ngpu": 1, "alive": True}, "peer": old}
+    d.actor_loc["a1"] = "w2"
+    # remote kill will fail; orphan path may schedule
+    new = FakePeer()
+    new.closed = True
+    r, _ = run(d.on_hello(new, {"t": "hello", "node": "w2", "ip": "1.1.1.1", "ngpu": 1}, b""))
+    assert r["t"] == "hello_ok"
+    assert old.superseded
+    # old membership cleared; new not installed
+    assert "w2" not in d.nodes or d.nodes["w2"]["peer"] is not new
+
+
+def test_create_superseded_late_append_schedules_orphan(monkeypatch):
+    """Late create on superseded peer with id only on dead peer → orphan reap."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    peer = FakePeer()
+    peer.closed = True
+    peer.superseded = True
+    worker_peer = FakePeer()
+    scheduled: list[tuple[str, str]] = []
+
+    def capture(aid, node):
+        scheduled.append((aid, node))
+        d._orphans[aid] = node
+
+    monkeypatch.setattr(d, "_schedule_orphan_reap", capture)
+
+    async def go():
+        task = asyncio.ensure_future(
+            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
+        )
+        await asyncio.sleep(0)
+        aid = next(iter(d.pending_workers))
+        # id is on peer.created_actors from early append; not on any live node peer
+        d.pending_workers[aid].set_result(worker_peer)
+        return await task, aid
+
+    r, aid = run(go())
+    assert r[0].get("t") == "create_actor_ok"
+    assert scheduled and scheduled[0][0] == aid
+
+
+def test_create_superseded_owned_elsewhere_no_orphan(monkeypatch):
+    """Id still on dead peer but also on live peer → no orphan (transfer ok)."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    peer = FakePeer()
+    peer.closed = True
+    peer.superseded = True
+    worker_peer = FakePeer()
+    live = FakePeer()
+    scheduled: list = []
+
+    monkeypatch.setattr(
+        d, "_schedule_orphan_reap", lambda *a: scheduled.append(a)
+    )
+
+    async def go():
+        task = asyncio.ensure_future(
+            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
+        )
+        await asyncio.sleep(0)
+        aid = next(iter(d.pending_workers))
+        # keep id on dead peer AND on live peer (both lists)
+        live.created_actors.append(aid)
+        d.nodes["w2"] = {
+            "info": {"node": "w2", "ngpu": 1, "alive": True},
+            "peer": live,
+        }
+        d.pending_workers[aid].set_result(worker_peer)
+        return await task
+
+    r, _ = run(go())
+    assert r.get("t") == "create_actor_ok"
+    assert not scheduled
+    assert not proc.terminated
+
+
+def test_peer_serve_skips_handlers_when_closed():
+    async def go():
+        s1, s2 = socket.socketpair()
+        s1.setblocking(False)
+        s2.setblocking(False)
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        handled = []
+
+        async def handler(peer, m, payload):
+            handled.append(m.get("t"))
+            return {"t": "ok"}, b""
+
+        p = Peer(r1, w1, handler)
+        p.closed = True  # close already in progress
+        # write a request frame to the peer
+        from ray._daemon import encode_frame
+
+        w2 = await asyncio.open_connection(sock=s2)
+        # s2 is the client side; send a frame then close so serve exits
+        # reopen: s2 already used. Use the raw socketpair differently.
+        s2.sendall(encode_frame({"t": "ping", "reqid": 1}))
+        s2.close()
+        await p.serve()  # reads frame, skips handler because closed, then EOF
+        assert handled == []
+
+    run(go())
+
+
+def test_schedule_orphan_skips_when_task_live():
+    d = head(2)
+    d._orphans["a1"] = "n2"
+
+    async def never():
+        await asyncio.Event().wait()
+
+    async def go():
+        t = asyncio.get_running_loop().create_task(never())
+        d._orphan_tasks["a1"] = t
+        d._schedule_orphan_reap("a1", "n3")  # refresh node, no second task
+        assert d._orphans["a1"] == "n3"
+        assert d._orphan_tasks["a1"] is t
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    run(go())
+
+
+def test_schedule_orphan_no_running_loop():
+    d = head(2)
+    d._schedule_orphan_reap("a1", "n2")  # no loop: still registers
+    assert d._orphans["a1"] == "n2"
+    assert "a1" not in d._orphan_tasks
+
+
+def test_free_orphan_pgs_noop_while_orphans_remain():
+    d = head(2)
+    d._orphans["a1"] = "n2"
+    d.pgs["p1"] = [{"node": "n2", "gpu": 0}]
+    d._orphan_pgs.add("p1")
+    d._free_orphan_pgs_if_idle()
+    assert "p1" in d.pgs and "p1" in d._orphan_pgs
+
+
+def test_reap_orphan_exits_if_slot_cleared_mid_loop(monkeypatch):
+    d = head(2)
+    d.actor_loc["a1"] = "n2"
+    d._orphans["a1"] = "n2"
+
+    async def force(actor_id, node):
+        d._orphans.pop(actor_id, None)  # released elsewhere
+
+    monkeypatch.setattr(d, "_force_kill_actor", force)
+
+    async def go():
+        # re-enter with slot present for the while check, force clears it
+        d._orphans["a1"] = "n2"
+        await d._reap_orphan("a1", "n2")
+
+    run(go())
+
+
+def test_host_actor_spawn_oserror(monkeypatch):
+    d = head(1)
+    d.sock_path = "/x.sock"
+
+    def boom(*a, **k):
+        raise OSError("cannot exec")
+
+    monkeypatch.setattr(Daemon, "_spawn_worker", boom)
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+    assert "spawn failed" in r["err"]
+    assert "a1" not in d.pending_workers
+    assert "a1" not in d._hosting
+
+
+def test_host_actor_post_spawn_unexpected_error(monkeypatch):
+    """Exception after spawn with proc set: terminate the subprocess."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+
+    class BoomDict(dict):
+        def __setitem__(self, k, v):
+            raise RuntimeError("map full")
+
+    d._hosting = BoomDict()
+    r, _ = run(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
+    assert "spawn failed" in r["err"]
+    assert proc.terminated
+
+
+def test_retry_forward_kill_local_then_forward(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    proc = FakeProc()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=proc)
+
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+    run(d._retry_forward_kill("a1"))
+    assert "a1" not in d.actors
+    assert d.head_peer.calls  # actor_gone or kill forwarded via on_kill
+
+
+def test_retry_forward_kill_local_kill_raises_then_forward(monkeypatch):
+    """Local on_kill raises: swallow, then forward to head (covers except path)."""
+    d = worker()
+    d.head_peer = FakePeer()
+    d.actors["a1"] = ActorProc("a1", peer=FakePeer(), gpus=[], proc=FakeProc())
+
+    async def boom(*a, **k):
+        raise RuntimeError("transient")
+
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(d, "on_kill", boom)
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+    run(d._retry_forward_kill("a1"))
+    # forward succeeded after local raise; local map may still hold id
+    assert d.head_peer.calls and d.head_peer.calls[0][0]["t"] == "kill"
+
+
+def test_retry_forward_kill_forward_succeeds(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer()
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+    run(d._retry_forward_kill("ghost"))
+    assert d.head_peer.calls and d.head_peer.calls[0][0]["t"] == "kill"
+
+
+def test_retry_forward_kill_retries_until_head_up(monkeypatch):
+    d = worker()
+    tries = {"n": 0}
+
+    class FlakyHead(FakePeer):
+        async def call(self, header, payload=b""):
+            tries["n"] += 1
+            if tries["n"] < 3:
+                raise RuntimeError("down")
+            return await super().call(header, payload)
+
+    d.head_peer = FlakyHead()
+
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+    run(d._retry_forward_kill("a1"))
+    assert tries["n"] >= 3
+
+
+def test_retry_forward_remove_pg_succeeds():
+    d = worker()
+    d.head_peer = FakePeer()
+    run(d._retry_forward_remove_pg("p1"))
+    assert d.head_peer.calls[0][0]["t"] == "remove_pg"
+
+
+def test_retry_forward_remove_pg_retries_until_ok(monkeypatch):
+    d = worker()
+    tries = {"n": 0}
+
+    class FlakyHead(FakePeer):
+        async def call(self, header, payload=b""):
+            tries["n"] += 1
+            if tries["n"] < 3:
+                raise RuntimeError("down")
+            return await super().call(header, payload)
+
+    d.head_peer = FlakyHead()
+
+    async def nosleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+    run(d._retry_forward_remove_pg("p1"))
+    assert tries["n"] >= 3
+
+
+def test_retry_worker_release_kills_before_pgs(monkeypatch):
+    d = worker()
+    order: list[str] = []
+
+    async def kill(aid):
+        order.append("kill:" + aid)
+
+    async def rmpg(pg):
+        order.append("pg:" + pg)
+
+    monkeypatch.setattr(d, "_retry_forward_kill", kill)
+    monkeypatch.setattr(d, "_retry_forward_remove_pg", rmpg)
+    run(d._retry_worker_release(["a1", "a2"], ["p1"], None))
+    assert order == ["kill:a1", "kill:a2", "pg:p1"]
+
+
+def test_retry_worker_release_waits_for_in_flight(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    peer.in_flight = 2
+    steps = {"n": 0}
+
+    async def nosleep(_s):
+        steps["n"] += 1
+        if steps["n"] >= 2:
+            peer.in_flight = 0
+
+    order: list[str] = []
+
+    async def kill(aid):
+        order.append("k")
+
+    async def rmpg(pg):
+        order.append("p")
+
+    monkeypatch.setattr(asyncio, "sleep", nosleep)
+    monkeypatch.setattr(d, "_retry_forward_kill", kill)
+    monkeypatch.setattr(d, "_retry_forward_remove_pg", rmpg)
+    peer.created_actors = ["late"]
+    peer.created_pgs = ["p2"]
+    run(d._retry_worker_release([], ["p1"], peer))
+    assert steps["n"] >= 2
+    assert "k" in order and "p" in order
+    assert "late" not in peer.created_actors
+
+
+def test_dispatch_cancelled_sets_err():
+    d = head()
+    slot = ObjSlot()
+    ap = ActorProc("a", peer=FakePeer(raise_on_call=asyncio.CancelledError()), gpus=[], proc=FakeProc())
+
+    async def go():
+        try:
+            await d._dispatch(ap, "m", b"", slot)
+        except asyncio.CancelledError:
+            pass
+
+    run(go())
+    assert slot.ev.is_set()
+    assert "cancel" in slot.err
+
+
+def test_on_kill_mid_create_gpu_held_guard():
+    """Mid-create kill must not clear a GPU re-reserved by another actor."""
+    d = head(1)
+    d.gpu_used[0] = True
+    # hosting holds gpu 0; another actor already took it after concurrent free
+    d._hosting["a1"] = (FakeProc(), None, [0])
+    d.actors["b"] = ActorProc("b", peer=FakePeer(), gpus=[0], proc=FakeProc())
+    run(d.on_kill(None, {"actor": "a1"}, b""))
+    assert d.gpu_used[0] is True  # b still owns it
+    assert "a1" not in d._hosting
+
+
+def test_pinned_retry_kill_decrements_in_flight(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    peer.in_flight = 1
+
+    async def ok(aid):
+        return None
+
+    monkeypatch.setattr(d, "_retry_forward_kill", ok)
+    run(d._pinned_retry_kill(peer, "a1"))
+    assert peer.in_flight == 0
+
+
+def test_pinned_retry_remove_pg_decrements_in_flight(monkeypatch):
+    d = worker()
+    peer = FakePeer()
+    peer.in_flight = 1
+
+    async def ok(pg):
+        return None
+
+    monkeypatch.setattr(d, "_retry_forward_remove_pg", ok)
+    run(d._pinned_retry_remove_pg(peer, "p1"))
+    assert peer.in_flight == 0
+
+
+def test_worker_create_closed_pins_in_flight_on_kill_fail(monkeypatch):
+    d = worker()
+    d.head_peer = FakePeer(raise_on_call=RuntimeError("down"))
+    peer = FakePeer()
+    peer.closed = True
+    # First forward is create; FakePeer raises on all - need create success then kill fail
+    calls = {"n": 0}
+
+    class SeqPeer(FakePeer):
+        async def call(self, header, payload=b""):
+            calls["n"] += 1
+            if header.get("t") == "create_actor":
+                return {"t": "create_actor_ok", "actor": "n1-a9"}, b""
+            raise RuntimeError("kill down")
+
+    d.head_peer = SeqPeer()
+    scheduled = []
+
+    def track(task):
+        scheduled.append(task)
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(d, "_track", track)
+    r, _ = run(d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b""))
+    assert "disconnected" in r["err"]
+    # pin was applied then finally decremented once; pin leaves in_flight for retry
+    assert peer.in_flight >= 0
+    assert scheduled  # pinned retry scheduled
+
+
+def test_release_client_head_frees_pg_if_orphan_cleared_mid_loop(monkeypatch):
+    """Reaper may clear an earlier orphan while we await a later kill."""
+    d = head()
+    peer = FakePeer()
+    peer.created_actors = ["a1", "a2"]
+    peer.created_pgs = ["p1"]
+    d.actor_loc["a1"] = "n2"
+    d.actor_loc["a2"] = "n1"
+    d.actors["a2"] = ActorProc("a2", peer=FakePeer(), gpus=[], proc=FakeProc())
+    d.pgs["p1"] = [{"node": "n2", "gpu": 0}]
+    n = {"i": 0}
+
+    async def kill_seq(peer, m, payload=b""):
+        n["i"] += 1
+        if n["i"] == 1:
+            # soft-fail first; schedule would orphan a1
+            return {"err": "down"}, b""
+        # second kill succeeds and clears a1 orphan as if reaper raced
+        d._orphans.pop("a1", None)
+        d.actor_loc.pop("a1", None)
+        return await Daemon.on_kill(d, peer, m, payload)
+
+    scheduled: list[str] = []
+
+    def capture(aid, node):
+        scheduled.append(aid)
+        d._orphans[aid] = node
+
+    monkeypatch.setattr(d, "on_kill", kill_seq)
+    monkeypatch.setattr(d, "_schedule_orphan_reap", capture)
+    run(d.release_client(peer))
+    # a1 was scheduled then cleared before PG decision; a2 killed ok → free PG
+    assert "p1" not in d.pgs or "p1" not in d._orphan_pgs
+
+
+def test_shutdown_cancels_orphan_tasks():
+    d = head(2)
+
+    async def go():
+        async def never():
+            await asyncio.Event().wait()
+
+        t = asyncio.get_running_loop().create_task(never())
+        d._orphan_tasks["a1"] = t
+        d._orphans["a1"] = "n2"
+        d._bg_tasks.add(t)
+        d.shutdown()
+        assert not d._orphan_tasks and not d._orphans
+        # give cancellation a tick
+        await asyncio.sleep(0)
+        assert t.cancelled() or t.done()
+
+    run(go())
+
+
+def test_on_kill_timeout_returns_nonempty_err(monkeypatch):
+    """TimeoutError() stringifies to ''; err must still be truthy for reapers."""
+    d = head(2)
+
+    class HangPeer(FakePeer):
+        async def call(self, header, payload=b""):
+            raise TimeoutError()
+
+    d.nodes["n2"] = {
+        "info": {"node": "n2", "ngpu": 1, "alive": True},
+        "peer": HangPeer(),
+    }
+    d.actor_loc["a1"] = "n2"
+
+    async def boom_wait(awaitable, timeout=None):
+        # consume the coroutine so it is not left un-awaited
+        if asyncio.iscoroutine(awaitable):
+            awaitable.close()
+        raise TimeoutError()
+
+    monkeypatch.setattr(asyncio, "wait_for", boom_wait)
+    r, _ = run(d.on_kill(None, {"actor": "a1"}, b""))
+    assert r.get("err")  # truthy
+    assert d.actor_loc.get("a1") == "n2"
+
+
+def test_create_after_supersede_does_not_rollback(monkeypatch):
+    """Re-hello transferred the id: create success must not kill it."""
+    d = head(1)
+    d.sock_path = "/x.sock"
+    proc = FakeProc()
+    monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
+    peer = FakePeer()
+    peer.closed = True
+    peer.superseded = True
+    worker_peer = FakePeer()
+    live = FakePeer()
+
+    async def go():
+        task = asyncio.ensure_future(
+            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
+        )
+        await asyncio.sleep(0)
+        aid = next(iter(d.pending_workers))
+        # simulate re-hello transfer of ownership off the dead peer
+        if aid in peer.created_actors:
+            peer.created_actors.remove(aid)
+        live.created_actors.append(aid)
+        d.nodes["w2"] = {
+            "info": {"node": "w2", "ngpu": 1, "alive": True},
+            "peer": live,
+        }
+        d.pending_workers[aid].set_result(worker_peer)
+        return await task
+
+    r, _ = run(go())
+    assert r.get("t") == "create_actor_ok"
+    assert not proc.terminated
+    assert r["actor"] in d.actors

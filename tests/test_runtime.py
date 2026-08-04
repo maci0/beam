@@ -222,9 +222,29 @@ def test_status_nodes_empty(monkeypatch):
 # ---- _get_ip ----------------------------------------------------------------
 
 
-def test_get_ip_returns_str():
+def test_get_ip_returns_str(monkeypatch):
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
+    monkeypatch.delenv("VLLM_HOST_IP", raising=False)
     ip = ray._get_ip()
     assert isinstance(ip, str) and ip.count(".") == 3
+
+
+def test_get_ip_socket_heuristic(monkeypatch):
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
+    monkeypatch.delenv("VLLM_HOST_IP", raising=False)
+
+    class OkSock:
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return ("9.9.9.9", 0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ray.socket, "socket", lambda *a, **k: OkSock())
+    assert ray._get_ip() == "9.9.9.9"
 
 
 def test_get_ip_fallback(monkeypatch):

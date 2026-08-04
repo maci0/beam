@@ -132,3 +132,50 @@ def test_peer_call_does_not_mutate_caller_header():
         await task
 
     asyncio.run(run())
+
+
+def test_peer_call_on_closed_raises():
+    async def run():
+        class FakeWriter:
+            def write(self, b):
+                raise AssertionError("must not write after close")
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        p = Peer(reader=None, writer=FakeWriter(), handler=None)
+        p.closed = True
+        try:
+            await p.call({"t": "x"})
+            raise AssertionError("expected ConnectionError")
+        except ConnectionError as e:
+            assert "closed" in str(e)
+        assert p.pending == {}
+
+    asyncio.run(run())
+
+
+def test_peer_send_on_closed_raises():
+    async def run():
+        class FakeWriter:
+            def write(self, b):
+                raise AssertionError("must not write")
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        p = Peer(reader=None, writer=FakeWriter(), handler=None)
+        p.closed = True
+        try:
+            await p.send({"t": "x"})
+            raise AssertionError("expected ConnectionError")
+        except ConnectionError:
+            pass
+
+    asyncio.run(run())
