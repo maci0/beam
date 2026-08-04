@@ -27,6 +27,12 @@ def _runtime_path() -> str:
 
 
 def _local_ip() -> str:
+    # Prefer an explicit cluster IP (same vars as ray._get_ip / get_node_ip_address)
+    # so multi-homed hosts don't advertise the default-route interface via
+    # membership / `ray status` while the shim advertises the LAN address.
+    env_ip = os.environ.get("BEAM_NODE_IP") or os.environ.get("VLLM_HOST_IP")
+    if env_ip:
+        return env_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -67,6 +73,7 @@ def _usage() -> int:
         "  ray stop                                    stop the local daemon, clean its runtime files\n\n"
         "environment:\n"
         "  BEAM_NUM_GPUS     override detected GPU count (set on boxes without /dev/nvidia*)\n"
+        "  BEAM_NODE_IP      advertise this address (else VLLM_HOST_IP, else default-route IP)\n"
         "  BEAM_RUNTIME_DIR  daemon state dir (default ~/.beam)\n"
         "  BEAM_SOCK         daemon unix socket (else read from the runtime dir)\n"
         "  BEAM_WORKER_CMD   how to launch an actor (default 'python3 -m ray._worker')\n"

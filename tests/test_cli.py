@@ -50,8 +50,31 @@ def test_local_ip_falls_back_on_oserror(monkeypatch):
         def close(self):
             pass
 
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
+    monkeypatch.delenv("VLLM_HOST_IP", raising=False)
     monkeypatch.setattr(_cli.socket, "socket", lambda *a, **k: DeadSock())
     assert _cli._local_ip() == "127.0.0.1"
+
+
+def test_local_ip_prefers_beam_node_ip(monkeypatch):
+    monkeypatch.setenv("BEAM_NODE_IP", "10.1.2.3")
+    monkeypatch.delenv("VLLM_HOST_IP", raising=False)
+
+    class BoomSock:
+        def connect(self, addr):
+            raise AssertionError("must not probe default route when env is set")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_cli.socket, "socket", lambda *a, **k: BoomSock())
+    assert _cli._local_ip() == "10.1.2.3"
+
+
+def test_local_ip_falls_back_to_vllm_host_ip(monkeypatch):
+    monkeypatch.delenv("BEAM_NODE_IP", raising=False)
+    monkeypatch.setenv("VLLM_HOST_IP", "10.4.5.6")
+    assert _cli._local_ip() == "10.4.5.6"
 
 
 # ---- _usage / main ----------------------------------------------------------

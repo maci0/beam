@@ -308,7 +308,15 @@ class Daemon:
             },
             "peer": peer,
         }
-        peer.on_close = lambda: self._drop_node(node, peer)
+        # Free PGs/actors this worker connection owns (driver-on-worker forwards
+        # track ownership on this peer), then drop membership. Without the
+        # release, a dead worker leaked placement groups that still reserved
+        # GPUs on live nodes.
+        async def _on_worker_close() -> None:
+            await self.release_client(peer)
+            self._drop_node(node, peer)
+
+        peer.on_close = _on_worker_close
         return {"t": "hello_ok"}, b""
 
     def _drop_node(self, node: str, peer: Peer | None = None) -> None:
@@ -465,12 +473,17 @@ class Daemon:
             except Exception as e:
                 # roll back placement so a failed create leaks neither the
                 # actor_loc routing entry nor a greedily-reserved GPU.
+                # Only free gpu_used when the failed placement was local: gpus
+                # are indices on the *owner* node. Clearing them against the
+                # head's gpu_used after a remote failure would free the wrong
+                # (head) GPUs whenever the remote index overlaps a local one.
                 self.actor_loc.pop(actor_id, None)
                 if peer is not None and actor_id in peer.created_actors:
                     peer.created_actors.remove(actor_id)
-                for g in gpus:
-                    if 0 <= g < len(self.gpu_used):
-                        self.gpu_used[g] = False
+                if node == self.node_id:
+                    for g in gpus:
+                        if 0 <= g < len(self.gpu_used):
+                            self.gpu_used[g] = False
                 return {"err": str(e)}, b""
         # worker node: a head push carries a pre-assigned "actor" id; a request
         # from a local driver does not, so route it to the head for placement.

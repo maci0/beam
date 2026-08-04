@@ -502,6 +502,24 @@ def test_on_create_actor_rollback_on_worker_failure(monkeypatch):
     assert peer.created_actors == []  # ownership entry removed
 
 
+def test_on_create_actor_remote_rollback_does_not_free_head_gpus():
+    """Remote create failure must not clear head gpu_used by remote GPU index.
+
+    The rollback frees indices against the owner node's GPU table. Remote
+    bundle indices are not head indices; treating them as such would free a
+    local non-pg reservation that happens to share the same integer index.
+    """
+    d = head(2)
+    d.gpu_used[0] = True  # local non-pg actor already holds head GPU 0
+    remote = FakePeer(raise_on_call=RuntimeError("spawn failed"))
+    d.nodes["n2"] = {"info": {"node": "n2", "ngpu": 2, "alive": True}, "peer": remote}
+    d.pgs["p"] = [{"node": "n2", "gpu": 0}]  # same index, different node
+    r, _ = run(d.on_create_actor(FakePeer(), {"t": "create_actor", "pg": "p", "bundle": 0}, b""))
+    assert "spawn failed" in r["err"]
+    assert d.gpu_used[0] is True  # head GPU 0 still reserved
+    assert d.actor_loc == {}
+
+
 def test_on_create_actor_greedy_gpu_rollback(monkeypatch):
     """A greedy (non-pg) GPU actor that fails to start must return its reserved
     GPU to the pool."""
@@ -710,7 +728,34 @@ def test_on_hello_registers_node():
     r, _ = run(d.on_hello(peer, {"t": "hello", "node": "n2", "ip": "9.9.9.9", "ngpu": 3}, b""))
     assert r["t"] == "hello_ok"
     assert d.nodes["n2"]["info"]["ngpu"] == 3 and d.nodes["n2"]["peer"] is peer
-    assert peer.on_close is not None  # wired to _drop_node
+    assert peer.on_close is not None  # wired to release + _drop_node
+
+
+def test_on_hello_close_releases_owned_pgs_and_drops_node():
+    """Worker disconnect must free PGs/actors tracked on that connection
+    (driver-on-worker ownership), not only drop membership. Otherwise a PG
+    that reserved a head GPU stays forever after the worker dies."""
+    d = head(2)
+    peer = FakePeer()
+    run(d.on_hello(peer, {"t": "hello", "node": "n2", "ip": "9.9.9.9", "ngpu": 2}, b""))
+    # PG spans head + worker; ownership is on the worker connection because the
+    # driver sat on that worker and the create_pg was forwarded.
+    d.pgs["p1"] = [{"node": "n1", "gpu": 0}, {"node": "n2", "gpu": 0}]
+    d.actor_loc["a-remote"] = "n3"  # actor on a third node, owned by this driver
+    d.actor_loc["a-on-n2"] = "n2"
+    peer.created_pgs = ["p1"]
+    peer.created_actors = ["a-remote", "a-on-n2"]
+    # third node so on_kill of a-remote has somewhere to route
+    other = FakePeer()
+    d.nodes["n3"] = {"info": {"node": "n3", "ngpu": 1, "alive": True}, "peer": other}
+
+    run(peer.on_close())
+
+    assert "n2" not in d.nodes
+    assert "p1" not in d.pgs  # head GPU reservation released
+    assert "a-on-n2" not in d.actor_loc
+    assert "a-remote" not in d.actor_loc
+    assert other.calls and other.calls[0][0]["t"] == "kill"
 
 
 def test_on_hello_rejected_on_worker():
