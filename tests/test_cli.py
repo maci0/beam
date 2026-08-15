@@ -556,9 +556,7 @@ def test_stop_concurrent_live_stop_waits(tmp_path, monkeypatch, capsys):
     sock = tmp_path / "daemon.sock"
     sock.write_text("")
     with open(tmp_path / "daemon.json", "w") as f:
-        json.dump(
-            {"pid": 55, "stopping": True, "sock": str(sock), "stopped": 1}, f
-        )
+        json.dump({"pid": 55, "stopping": True, "sock": str(sock), "stopped": 1}, f)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
     probes = {"n": 0}
 
@@ -677,7 +675,6 @@ def test_stop_abandoned_does_not_clobber_new_claim(tmp_path, monkeypatch, capsys
         json.dump({"pid": 55, "stopping": True, "sock": str(sock)}, f)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
     real_rename = os.rename
-    real_link = os.link
 
     def rename_and_reclaim(src, dst):
         real_rename(src, dst)
@@ -685,9 +682,7 @@ def test_stop_abandoned_does_not_clobber_new_claim(tmp_path, monkeypatch, capsys
         with open(claim, "w") as f:
             json.dump({"pid": 99, "sock": str(sock)}, f)
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "rename", rename_and_reclaim)
     # hold re-check sees live pid 55? seized still has stopping:55 but path is 99
     # After seize, doc is stopping with pid 55; kill(55) ProcessLookupError → clean
@@ -952,12 +947,9 @@ def test_stop_reread_runtime_error_falls_back(tmp_path, monkeypatch, capsys):
     def fake_rename(src, dst):
         # seize then leave corrupt content for the open/json path
         os.rename.__wrapped__(src, dst) if hasattr(os.rename, "__wrapped__") else None
-        real = os.rename
         # use builtins: already renamed by us
-        import shutil
 
         # simpler: rename works, then corrupt doomed
-        path = src
         # Actually monkeypatch replaces rename entirely — implement with open/rename
         raise AssertionError("use real rename below")
 
@@ -1272,9 +1264,7 @@ def test_claim_runtime_seized_active_stop_hold(tmp_path, monkeypatch):
     with open(tmp_path / "daemon.json", "w") as f:
         json.dump({"pid": 42, "stopping": True}, f)
     monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError())
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError()))
     monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)  # stop still alive
     err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
     assert err is not None and "already running" in err
@@ -1326,9 +1316,7 @@ def test_claim_runtime_seized_stop_hold_eperm(tmp_path, monkeypatch):
     with open(tmp_path / "daemon.json", "w") as f:
         json.dump({"pid": 42, "stopping": True}, f)
     monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError())
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError()))
     monkeypatch.setattr(
         _cli.os, "kill", lambda pid, sig: (_ for _ in ()).throw(PermissionError("x"))
     )
@@ -1389,9 +1377,7 @@ def test_claim_runtime_seized_live_restore_fails(tmp_path, monkeypatch):
         raise OSError("cannot restore")
 
     monkeypatch.setattr(_cli.os, "rename", rename_once)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError())
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda src, dst: (_ for _ in ()).throw(FileExistsError()))
     monkeypatch.setattr(_cli.os, "kill", lambda pid, sig: None)
     err = _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3})
     assert err is not None and "already running" in err
@@ -1722,12 +1708,8 @@ def test_stop_abandoned_rename_fails(tmp_path, monkeypatch, capsys):
     with open(tmp_path / "daemon.json", "w") as f:
         json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
-    monkeypatch.setattr(
-        _cli.os, "rename", lambda s, d: (_ for _ in ()).throw(OSError("busy"))
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(_cli.os, "rename", lambda s, d: (_ for _ in ()).throw(OSError("busy")))
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
 
@@ -1752,9 +1734,7 @@ def test_stop_abandoned_restore_rename_fails(tmp_path, monkeypatch, capsys):
             return
         raise OSError("restore busy")
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "rename", rename_then_fail_restore)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
@@ -1811,9 +1791,7 @@ def test_stop_abandoned_eperm_restore_fails(tmp_path, monkeypatch, capsys):
         raise PermissionError("eperm")
 
     monkeypatch.setattr(_cli.os, "kill", kill_seq)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nope"))
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nope")))
     assert _cli._stop() == 1
 
 
@@ -1830,9 +1808,7 @@ def test_stop_abandoned_live_restore_fails(tmp_path, monkeypatch, capsys):
         return None
 
     monkeypatch.setattr(_cli.os, "kill", kill_seq)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nope"))
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("nope")))
     assert _cli._stop() == 1
 
 
@@ -1880,12 +1856,8 @@ def test_stop_abandoned_restore_exists_unlink_fails(tmp_path, monkeypatch, capsy
         return None
 
     monkeypatch.setattr(_cli.os, "kill", kill_seq)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(FileExistsError())
-    )
-    monkeypatch.setattr(
-        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(FileExistsError()))
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x")))
     assert _cli._stop() == 1
 
 
@@ -1902,18 +1874,12 @@ def test_stop_abandoned_restore_oserror_unlink_fails(tmp_path, monkeypatch, caps
         return None
 
     monkeypatch.setattr(_cli.os, "kill", kill_seq)
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("link"))
-    )
-    monkeypatch.setattr(
-        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("un"))
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("link")))
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("un")))
     assert _cli._stop() == 1
 
 
-def test_stop_abandoned_path_reclaimed_remove_seized_fails(
-    tmp_path, monkeypatch, capsys
-):
+def test_stop_abandoned_path_reclaimed_remove_seized_fails(tmp_path, monkeypatch, capsys):
     sock = tmp_path / "daemon.sock"
     sock.write_text("x")
     with open(tmp_path / "daemon.json", "w") as f:
@@ -1926,13 +1892,9 @@ def test_stop_abandoned_path_reclaimed_remove_seized_fails(
         with open(tmp_path / "daemon.json", "w") as f:
             json.dump({"pid": 99, "sock": str(sock)}, f)
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "rename", rename_and_reclaim)
-    monkeypatch.setattr(
-        _cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x"))
-    )
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x")))
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
 
@@ -1952,9 +1914,7 @@ def test_stop_abandoned_bad_seized_json(tmp_path, monkeypatch, capsys):
         with open(dst, "w") as f:
             f.write("{not json")
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "rename", rename_corrupt)
     assert _cli._stop() == 0
     assert "cleaned leftover stop state" in capsys.readouterr().out
@@ -1972,30 +1932,20 @@ def test_stop_abandoned_reclaim_link_exists(tmp_path, monkeypatch, capsys):
         links["n"] += 1
         raise FileExistsError()
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "link", link_exists)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
     assert links["n"] >= 1
 
 
-def test_stop_abandoned_reclaim_link_exists_unlink_fails(
-    tmp_path, monkeypatch, capsys
-):
+def test_stop_abandoned_reclaim_link_exists_unlink_fails(tmp_path, monkeypatch, capsys):
     with open(tmp_path / "daemon.json", "w") as f:
         json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(FileExistsError())
-    )
-    monkeypatch.setattr(
-        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(FileExistsError()))
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x")))
     assert _cli._stop() == 0
 
 
@@ -2003,31 +1953,19 @@ def test_stop_abandoned_reclaim_link_oserror(tmp_path, monkeypatch, capsys):
     with open(tmp_path / "daemon.json", "w") as f:
         json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("e"))
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("e")))
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
 
 
-def test_stop_abandoned_reclaim_link_oserror_unlink_fails(
-    tmp_path, monkeypatch, capsys
-):
+def test_stop_abandoned_reclaim_link_oserror_unlink_fails(tmp_path, monkeypatch, capsys):
     with open(tmp_path / "daemon.json", "w") as f:
         json.dump({"pid": 55, "stopping": True, "sock": "/x"}, f)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("e"))
-    )
-    monkeypatch.setattr(
-        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("e")))
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x")))
     assert _cli._stop() == 0
 
 
@@ -2044,17 +1982,13 @@ def test_stop_abandoned_reclaim_then_not_stopping(tmp_path, monkeypatch, capsys)
         with open(dst, "w") as f:
             json.dump({"pid": 99, "sock": str(sock)}, f)  # no stopping
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "link", link_then_mutate)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
 
 
-def test_stop_abandoned_reclaim_ownership_lost_remove_fails(
-    tmp_path, monkeypatch, capsys
-):
+def test_stop_abandoned_reclaim_ownership_lost_remove_fails(tmp_path, monkeypatch, capsys):
     sock = tmp_path / "daemon.sock"
     sock.write_text("x")
     with open(tmp_path / "daemon.json", "w") as f:
@@ -2067,13 +2001,9 @@ def test_stop_abandoned_reclaim_ownership_lost_remove_fails(
         with open(dst, "w") as f:
             json.dump({"pid": 99, "stopping": True, "sock": str(sock)}, f)
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "link", link_then_mutate)
-    monkeypatch.setattr(
-        _cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x"))
-    )
+    monkeypatch.setattr(_cli.os, "remove", lambda p: (_ for _ in ()).throw(OSError("x")))
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
 
@@ -2091,9 +2021,7 @@ def test_stop_abandoned_reclaim_then_bad_json(tmp_path, monkeypatch, capsys):
         with open(dst, "w") as f:
             f.write("{bad")
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "link", link_corrupt)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
@@ -2115,9 +2043,7 @@ def test_stop_abandoned_hold_finally_unlink_fails(tmp_path, monkeypatch, capsys)
             raise OSError("busy")
         return real_unlink(p)
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "unlink", unlink_flaky)
     assert _cli._stop() == 0
     assert "cleaned leftover stop state" in capsys.readouterr().out
@@ -2149,9 +2075,7 @@ def test_link_restore_exists_unlink_fail(tmp_path, monkeypatch):
         f.write('{"pid":1}')
     with open(seized, "w") as f:
         f.write("{}")
-    monkeypatch.setattr(
-        _cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x"))
-    )
+    monkeypatch.setattr(_cli.os, "unlink", lambda p: (_ for _ in ()).throw(OSError("x")))
     assert _cli._link_restore(seized, path) is False
 
 
@@ -2161,9 +2085,7 @@ def test_link_restore_oserror_keeps_seized(tmp_path, monkeypatch):
     seized = path + ".seized"
     with open(seized, "w") as f:
         f.write("{}")
-    monkeypatch.setattr(
-        _cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("link"))
-    )
+    monkeypatch.setattr(_cli.os, "link", lambda s, d: (_ for _ in ()).throw(OSError("link")))
     assert _cli._link_restore(seized, path) is False
     assert os.path.exists(seized)
 
@@ -2256,7 +2178,9 @@ def test_stop_abandoned_precheck_not_stopping_live(tmp_path, monkeypatch, capsys
 
     monkeypatch.setattr(_cli, "_read_runtime", read_fn)
     monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: None if p == 99 else (_ for _ in ()).throw(ProcessLookupError())
+        _cli.os,
+        "kill",
+        lambda p, s: None if p == 99 else (_ for _ in ()).throw(ProcessLookupError()),
     )
     assert _cli._stop() == 1
     assert "still running" in capsys.readouterr().err
@@ -2275,9 +2199,7 @@ def test_stop_abandoned_precheck_not_stopping_no_live(tmp_path, monkeypatch, cap
         return {"pid": 0, "sock": "/x"}  # not stopping, no live pid
 
     monkeypatch.setattr(_cli, "_read_runtime", read_fn)
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
@@ -2296,9 +2218,7 @@ def test_stop_abandoned_precheck_read_fails(tmp_path, monkeypatch, capsys):
         raise OSError("gone")
 
     monkeypatch.setattr(_cli, "_read_runtime", read_fn)
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
 
@@ -2373,9 +2293,7 @@ def test_stop_abandoned_toctou_ownership_lost(tmp_path, monkeypatch, capsys):
             with real_open(dst, "w") as f:
                 json.dump({"pid": 99, "sock": str(sock)}, f)
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(_cli.os, "link", link_then_steal)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
@@ -2402,7 +2320,7 @@ def test_stop_abandoned_second_toctou_foreign(tmp_path, monkeypatch, capsys):
             own_reads["n"] += 1
             # After stopclean hold is in place, second ownership re-check (4th+
             # path read depending on flow) returns foreign
-            data = f.read()
+            f.read()
             f.seek(0)
             if own_reads["n"] >= 3:
                 f.close()
@@ -2420,9 +2338,7 @@ def test_stop_abandoned_second_toctou_foreign(tmp_path, monkeypatch, capsys):
                 return Fake()
         return f
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(builtins, "open", open_spy)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
@@ -2446,6 +2362,7 @@ def test_stop_abandoned_second_toctou_bad_json(tmp_path, monkeypatch, capsys):
         if str(file) == path_s and "r" in str(mode):
             own_reads["n"] += 1
             if own_reads["n"] >= 3:
+
                 class Fake:
                     def __enter__(self):
                         return self
@@ -2459,9 +2376,7 @@ def test_stop_abandoned_second_toctou_bad_json(tmp_path, monkeypatch, capsys):
                 return Fake()
         return real_open(file, *a, **k)
 
-    monkeypatch.setattr(
-        _cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError())
-    )
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr(builtins, "open", open_spy)
     assert _cli._stop() == 0
     assert "another stop finished" in capsys.readouterr().out
@@ -2535,6 +2450,7 @@ def test_stop_normal_second_ownership_bad_json(tmp_path, monkeypatch, capsys):
         if str(file) == path and "r" in str(mode):
             open_count["n"] += 1
             if open_count["n"] >= 3:
+
                 class Fake:
                     def __enter__(self):
                         return self
