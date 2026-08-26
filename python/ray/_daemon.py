@@ -22,6 +22,21 @@ import subprocess
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+# ---- tuning ----
+
+# Peer RPC deadline: every daemon-to-daemon call (kill, remove_pg, forward) is
+# bounded so one wedged node cannot stall a release or a cleanup path.
+_RPC_TIMEOUT = 30.0
+# A worker daemon has this long to dial back after the head asks it to host an
+# actor. Generous: it covers image-cold container start on the worker node.
+_WORKER_DIAL_BACK_TIMEOUT = 120.0
+# _terminate: poll budget between SIGTERM and SIGKILL, then the post-kill reap.
+_TERM_POLLS = 10
+_TERM_POLL_INTERVAL = 0.05
+_KILL_WAIT = 0.5
+# Backoff between attempts to dial the head on worker startup.
+_HEAD_DIAL_RETRY_INTERVAL = 1.0
+
 
 def _terminate(proc: subprocess.Popen | None) -> bool:
     """Best-effort kill of an actor worker subprocess that hasn't already exited.
@@ -42,22 +57,22 @@ def _terminate(proc: subprocess.Popen | None) -> bool:
     except OSError:
         pass
     # Brief poll loop (no long blocking wait on the event-loop thread).
-    for _ in range(10):
+    for _ in range(_TERM_POLLS):
         if proc.poll() is not None:
             return True
         try:
-            proc.wait(timeout=0.05)
+            proc.wait(timeout=_TERM_POLL_INTERVAL)
             return True
-        except Exception:
-            pass
+        except (subprocess.TimeoutExpired, OSError):
+            pass  # still running, or already reaped by someone else
     try:
         proc.kill()
     except OSError:
         pass
     try:
-        proc.wait(timeout=0.5)
-    except Exception:
-        pass
+        proc.wait(timeout=_KILL_WAIT)
+    except (subprocess.TimeoutExpired, OSError):
+        pass  # caller re-checks poll() below and keeps the GPUs if still alive
     return proc.poll() is not None
 
 
@@ -117,6 +132,10 @@ class Peer:
         # in-flight create_actor/create_pg RPCs (worker driver peers): release
         # must not free PGs while a create is still running against them.
         self.in_flight = 0
+        # Set when the same node id re-hellos on a new connection: ownership has
+        # moved to superseded_by, so this peer's release must not free it.
+        self.superseded = False
+        self.superseded_by: Peer | None = None
 
     async def serve(self) -> None:
         try:
@@ -218,7 +237,7 @@ class Peer:
             # forever; cancel stragglers after the budget.
             tasks = list(self._tasks)
             if tasks:
-                _done, pending = await asyncio.wait(tasks, timeout=30.0)
+                _done, pending = await asyncio.wait(tasks, timeout=_RPC_TIMEOUT)
                 for t in pending:
                     t.cancel()
                 if pending:
@@ -370,7 +389,7 @@ class Daemon:
             except OSError:
                 if attempt == retries - 1:
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(_HEAD_DIAL_RETRY_INTERVAL)
         self.head_peer = Peer(reader, writer, self.handle)
 
         # If the head link dies, reap local actors: the head cannot RPC-kill us
@@ -414,10 +433,10 @@ class Daemon:
         if old is not None:
             old_peer = old.get("peer")
             if old_peer is not None and old_peer is not peer:
-                old_peer.superseded = True  # type: ignore[attr-defined]
+                old_peer.superseded = True
                 # So in-flight release_client can hand claimed PGs to the new peer
                 # after transfer cleared old lists (avoids free-under-live-actor).
-                old_peer.superseded_by = peer  # type: ignore[attr-defined]
+                old_peer.superseded_by = peer
                 peer.created_actors.extend(old_peer.created_actors)
                 peer.created_pgs.extend(old_peer.created_pgs)
                 old_peer.created_actors.clear()
@@ -425,6 +444,7 @@ class Daemon:
                 # stragglers after transfer: release only what is still on old_peer
                 old_peer.on_close = lambda p=old_peer: self.release_client(p)
                 await old_peer.close()
+
         # Free PGs/actors this worker connection owns (driver-on-worker forwards
         # track ownership on this peer), then drop membership. Without the
         # release, a dead worker leaked placement groups that still reserved
@@ -521,11 +541,9 @@ class Daemon:
                 try:
                     r, pl = await asyncio.shield(fwd_task)
                 except asyncio.CancelledError:
-                    rpl = await self._await_fwd_after_cancel(fwd_task, peer, "pg")
-                    if rpl is not None and peer is not None and rpl[0].get("pg"):
-                        await asyncio.shield(
-                            self._worker_cleanup_pg(peer, rpl[0]["pg"])
-                        )
+                    fwd = await self._await_fwd_after_cancel(fwd_task, peer, "pg")
+                    if fwd is not None and peer is not None and fwd[0].get("pg"):
+                        await asyncio.shield(self._worker_cleanup_pg(peer, fwd[0]["pg"]))
                     raise
                 if peer is not None and r.get("pg"):
                     if peer.closed:
@@ -652,24 +670,18 @@ class Daemon:
                 # Client disconnected while create was in flight.
                 # Re-hello supersede: ownership usually moved to the new peer.
                 # A late _handle that only appended after transfer still has the
-                # id on this dead peer — orphan-reap instead of silent leak.
+                # id on this dead peer: orphan-reap instead of silent leak.
                 if peer is not None and peer.closed:
-                    if getattr(peer, "superseded", False):
+                    if peer.superseded:
                         if actor_id in peer.created_actors:
                             peer.created_actors.remove(actor_id)
                             owned_elsewhere = False
                             for rec in self.nodes.values():
                                 p = rec.get("peer")
-                                if (
-                                    p is not None
-                                    and p is not peer
-                                    and actor_id in getattr(p, "created_actors", ())
-                                ):
+                                if p is not None and p is not peer and actor_id in p.created_actors:
                                     owned_elsewhere = True
                                     break
-                            if not owned_elsewhere and self._actor_still_tracked(
-                                actor_id
-                            ):
+                            if not owned_elsewhere and self._actor_still_tracked(actor_id):
                                 self._schedule_orphan_reap(actor_id, node)
                         return resp, rpl
                     await self._rollback_failed_create(peer, actor_id, node, gpus)
@@ -694,11 +706,9 @@ class Daemon:
                 try:
                     r, pl = await asyncio.shield(fwd_task)
                 except asyncio.CancelledError:
-                    rpl = await self._await_fwd_after_cancel(fwd_task, peer, "actor")
-                    if rpl is not None and peer is not None and rpl[0].get("actor"):
-                        await asyncio.shield(
-                            self._worker_cleanup_actor(peer, rpl[0]["actor"])
-                        )
+                    fwd = await self._await_fwd_after_cancel(fwd_task, peer, "actor")
+                    if fwd is not None and peer is not None and fwd[0].get("actor"):
+                        await asyncio.shield(self._worker_cleanup_actor(peer, fwd[0]["actor"]))
                     raise
                 if peer is not None and r.get("actor"):
                     aid = r["actor"]
@@ -728,15 +738,11 @@ class Daemon:
         own GPUs on the head). Pin in_flight and finish cleanup in the background.
         """
         try:
-            return await asyncio.wait_for(asyncio.shield(fwd_task), timeout=30)
+            return await asyncio.wait_for(asyncio.shield(fwd_task), timeout=_RPC_TIMEOUT)
         except Exception:
             if peer is not None and not fwd_task.done():
                 peer.in_flight += 1
-                self._track(
-                    asyncio.create_task(
-                        self._bg_finish_fwd_cleanup(peer, fwd_task, kind)
-                    )
-                )
+                self._track(asyncio.create_task(self._bg_finish_fwd_cleanup(peer, fwd_task, kind)))
             elif peer is not None and fwd_task.done() and not fwd_task.cancelled():
                 try:
                     return fwd_task.result()
@@ -744,9 +750,7 @@ class Daemon:
                     return None
             return None
 
-    async def _bg_finish_fwd_cleanup(
-        self, peer: Peer, fwd_task: asyncio.Task, kind: str
-    ) -> None:
+    async def _bg_finish_fwd_cleanup(self, peer: Peer, fwd_task: asyncio.Task, kind: str) -> None:
         """Wait for a late head create and kill/remove if it succeeded."""
         try:
             r, _pl = await fwd_task
@@ -769,7 +773,7 @@ class Daemon:
         try:
             await asyncio.wait_for(
                 self._forward_head({"t": "kill", "actor": aid}),
-                timeout=30,
+                timeout=_RPC_TIMEOUT,
             )
             if aid in self.actors:
                 try:
@@ -794,18 +798,14 @@ class Daemon:
         try:
             await asyncio.wait_for(
                 self._forward_head({"t": "remove_pg", "pg": pg_id}),
-                timeout=30,
+                timeout=_RPC_TIMEOUT,
             )
             peer.in_flight = max(0, peer.in_flight - 1)
         except asyncio.CancelledError:
-            self._track(
-                asyncio.create_task(self._pinned_retry_remove_pg(peer, pg_id))
-            )
+            self._track(asyncio.create_task(self._pinned_retry_remove_pg(peer, pg_id)))
             raise
         except Exception:
-            self._track(
-                asyncio.create_task(self._pinned_retry_remove_pg(peer, pg_id))
-            )
+            self._track(asyncio.create_task(self._pinned_retry_remove_pg(peer, pg_id)))
 
     async def _force_kill_actor(self, actor_id: str, node: str) -> None:
         """Kill an actor by known owner node (works even if actor_loc was cleared).
@@ -826,7 +826,7 @@ class Daemon:
                 return
             try:
                 await asyncio.wait_for(
-                    p.call({"t": "kill", "actor": actor_id}), timeout=30
+                    p.call({"t": "kill", "actor": actor_id}), timeout=_RPC_TIMEOUT
                 )
             except Exception:
                 return  # keep actor_loc for retry
@@ -835,11 +835,7 @@ class Daemon:
             pass
 
     def _actor_still_tracked(self, actor_id: str) -> bool:
-        return (
-            actor_id in self.actor_loc
-            or actor_id in self.actors
-            or actor_id in self._hosting
-        )
+        return actor_id in self.actor_loc or actor_id in self.actors or actor_id in self._hosting
 
     async def _rollback_failed_create(
         self,
@@ -884,9 +880,7 @@ class Daemon:
         if t is not None and not t.done():
             return
         try:
-            task = asyncio.get_running_loop().create_task(
-                self._reap_orphan(actor_id, node)
-            )
+            task = asyncio.get_running_loop().create_task(self._reap_orphan(actor_id, node))
         except RuntimeError:
             # No running loop (unit tests calling sync helpers): id is still
             # registered in _orphans for a later schedule under a live loop.
@@ -975,19 +969,15 @@ class Daemon:
                     self._free_local_gpus(gpus)
                     return {"err": "actor %s killed during create" % actor_id}, b""
                 # still alive: keep hosting (finally will not drop)
-                return {
-                    "err": "actor %s process still alive after kill" % actor_id
-                }, b""
+                return {"err": "actor %s process still alive after kill" % actor_id}, b""
             try:
-                peer = await asyncio.wait_for(fut, timeout=120)
+                peer = await asyncio.wait_for(fut, timeout=_WORKER_DIAL_BACK_TIMEOUT)
             except asyncio.TimeoutError:
                 self.pending_workers.pop(actor_id, None)
                 if _terminate(proc):
                     self._free_local_gpus(gpus)
                     return {"err": "worker for %s did not attach" % actor_id}, b""
-                return {
-                    "err": "worker for %s did not attach (process still alive)" % actor_id
-                }, b""
+                return {"err": "worker for %s did not attach (process still alive)" % actor_id}, b""
             except Exception as e:
                 # e.g. kill during create set_exception on the attach future
                 self.pending_workers.pop(actor_id, None)
@@ -995,8 +985,7 @@ class Daemon:
                     self._free_local_gpus(gpus)
                     return {"err": "actor %s create aborted: %s" % (actor_id, e)}, b""
                 return {
-                    "err": "actor %s create aborted (process still alive): %s"
-                    % (actor_id, e)
+                    "err": "actor %s create aborted (process still alive): %s" % (actor_id, e)
                 }, b""
             try:
                 await peer.call({"t": "init"}, payload)  # instantiate the pickled class
@@ -1009,15 +998,10 @@ class Daemon:
                     self._free_local_gpus(gpus)
                     return {"err": "actor %s init failed: %s" % (actor_id, e)}, b""
                 return {
-                    "err": "actor %s init failed (process still alive): %s"
-                    % (actor_id, e)
+                    "err": "actor %s init failed (process still alive): %s" % (actor_id, e)
                 }, b""
             # kill raced create / worker died after init: do not publish a doomed actor
-            if (
-                actor_id not in self._hosting
-                or actor_id in self._kill_pending
-                or peer.closed
-            ):
+            if actor_id not in self._hosting or actor_id in self._kill_pending or peer.closed:
                 self._kill_pending.discard(actor_id)
                 try:
                     peer.on_close = None
@@ -1028,9 +1012,7 @@ class Daemon:
                 if _terminate(proc):
                     self._free_local_gpus(gpus)
                     return {"err": "actor %s killed during create" % actor_id}, b""
-                return {
-                    "err": "actor %s process still alive after kill" % actor_id
-                }, b""
+                return {"err": "actor %s process still alive after kill" % actor_id}, b""
             self.actors[actor_id] = ActorProc(actor_id, peer, gpus, proc)
             return {"t": "create_actor_ok", "actor": actor_id, "gpus": gpus}, b""
         except asyncio.CancelledError:
@@ -1185,7 +1167,7 @@ class Daemon:
                 # release_client) that lacks a well-formed type field.
                 try:
                     await asyncio.wait_for(
-                        p.call({"t": "kill", "actor": actor_id}), timeout=30
+                        p.call({"t": "kill", "actor": actor_id}), timeout=_RPC_TIMEOUT
                     )
                 except Exception as e:
                     # keep actor_loc so a later kill/retry can still route.
@@ -1217,12 +1199,8 @@ class Daemon:
                     # Always reap even if close is cancelled (CancelledError).
                     # Only free GPU indices when the process is confirmed gone.
                     if _terminate(proc):
-                        held = {
-                            g for ap2 in self.actors.values() for g in ap2.gpus
-                        }
-                        held.update(
-                            g for _p, _w, gs in self._hosting.values() for g in gs
-                        )
+                        held = {g for ap2 in self.actors.values() for g in ap2.gpus}
+                        held.update(g for _p, _w, gs in self._hosting.values() for g in gs)
                         for g in gpus:
                             if 0 <= g < len(self.gpu_used) and g not in held:
                                 self.gpu_used[g] = False
@@ -1231,9 +1209,7 @@ class Daemon:
                         self._hosting[actor_id] = (proc, wpeer, list(gpus))
                         if self.is_head:
                             self.actor_loc[actor_id] = self.node_id
-                        return {
-                            "err": "actor %s process still alive after kill" % actor_id
-                        }, b""
+                        return {"err": "actor %s process still alive after kill" % actor_id}, b""
                 return {"t": "kill_ok"}, b""
             if not self.is_head:
                 # Kill from head for an unknown local id: tombstone so a create
@@ -1259,9 +1235,7 @@ class Daemon:
                 # Only free GPU indices when the process is confirmed gone.
                 if _terminate(ap.proc):
                     held = {g for a in self.actors.values() for g in a.gpus}
-                    held.update(
-                        g for _p, _w, gs in self._hosting.values() for g in gs
-                    )
+                    held.update(g for _p, _w, gs in self._hosting.values() for g in gs)
                     for g in ap.gpus:
                         if 0 <= g < len(self.gpu_used) and g not in held:
                             self.gpu_used[g] = False
@@ -1346,7 +1320,7 @@ class Daemon:
         the recovery path. PGs are deferred while orphans remain so GPU
         bundles are not double-booked with live actor processes.
         """
-        if getattr(peer, "superseded", False):
+        if peer.superseded:
             return
         if not self.is_head:
             # a local driver on a worker node: the head owns placement and
@@ -1356,7 +1330,7 @@ class Daemon:
             # while actors are still being reaped.
             pending_pgs: list[str] = []
             for pg_id in list(peer.created_pgs):
-                if getattr(peer, "superseded", False):
+                if peer.superseded:
                     break
                 if pg_id not in peer.created_pgs:
                     continue
@@ -1364,7 +1338,7 @@ class Daemon:
                 pending_pgs.append(pg_id)
             failed_actors: list[str] = []
             for actor_id in list(peer.created_actors):
-                if getattr(peer, "superseded", False):
+                if peer.superseded:
                     break  # remaining ids transferred; still free claimed ones
                 if actor_id not in peer.created_actors:
                     continue
@@ -1373,7 +1347,7 @@ class Daemon:
                 try:
                     await asyncio.wait_for(
                         self._forward_head({"t": "kill", "actor": actor_id}),
-                        timeout=30,
+                        timeout=_RPC_TIMEOUT,
                     )
                     forward_ok = True
                 except Exception:
@@ -1393,9 +1367,7 @@ class Daemon:
             if failed_actors or peer.in_flight > 0:
                 self._track(
                     asyncio.create_task(
-                        self._retry_worker_release(
-                            failed_actors, pending_pgs, peer
-                        )
+                        self._retry_worker_release(failed_actors, pending_pgs, peer)
                     )
                 )
             else:
@@ -1403,18 +1375,16 @@ class Daemon:
                     try:
                         await asyncio.wait_for(
                             self._forward_head({"t": "remove_pg", "pg": pg_id}),
-                            timeout=30,
+                            timeout=_RPC_TIMEOUT,
                         )
                     except Exception:
-                        self._track(
-                            asyncio.create_task(self._retry_forward_remove_pg(pg_id))
-                        )
+                        self._track(asyncio.create_task(self._retry_forward_remove_pg(pg_id)))
             return
         # Claim PGs before any kill await so re-hello cannot transfer them while
         # actors are still being reaped (would double-book bundle GPUs).
         claimed_pgs: list[str] = []
         for pg_id in list(peer.created_pgs):
-            if getattr(peer, "superseded", False):
+            if peer.superseded:
                 break
             if pg_id not in peer.created_pgs:
                 continue
@@ -1422,7 +1392,7 @@ class Daemon:
             claimed_pgs.append(pg_id)
         orphaned: list[str] = []
         for actor_id in list(peer.created_actors):
-            if getattr(peer, "superseded", False):
+            if peer.superseded:
                 break
             if actor_id not in peer.created_actors:
                 continue
@@ -1440,8 +1410,8 @@ class Daemon:
                 self._schedule_orphan_reap(actor_id, node)
                 orphaned.append(actor_id)
         # Real re-hello clears created_actors before this resumes.
-        if getattr(peer, "superseded", False) and claimed_pgs:
-            target = getattr(peer, "superseded_by", None)
+        if peer.superseded and claimed_pgs:
+            target = peer.superseded_by
             if target is not None and not target.closed:
                 # Live replacement peer will release these on disconnect.
                 target.created_pgs.extend(claimed_pgs)
@@ -1461,9 +1431,7 @@ class Daemon:
                 peer.created_pgs.extend(claimed_pgs)
                 claimed_pgs = []
         # Defer PG free while ANY orphan remains (global, not just this call).
-        defer_pgs = bool(self._orphans) or any(
-            self._actor_still_tracked(a) for a in orphaned
-        )
+        defer_pgs = bool(self._orphans) or any(self._actor_still_tracked(a) for a in orphaned)
         for pg_id in claimed_pgs:
             if defer_pgs:
                 # Keep PG reservation until orphan actors are gone.
@@ -1533,7 +1501,7 @@ class Daemon:
             try:
                 await asyncio.wait_for(
                     self._forward_head({"t": "kill", "actor": actor_id}),
-                    timeout=30,
+                    timeout=_RPC_TIMEOUT,
                 )
                 return
             except Exception:
@@ -1551,7 +1519,7 @@ class Daemon:
             try:
                 await asyncio.wait_for(
                     self._forward_head({"t": "remove_pg", "pg": pg_id}),
-                    timeout=30,
+                    timeout=_RPC_TIMEOUT,
                 )
                 return
             except Exception:

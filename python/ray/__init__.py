@@ -65,6 +65,9 @@ def _need() -> DaemonClient:
     return _client
 
 
+# ray.wait has no push notification; poll the daemon at this interval.
+_WAIT_POLL_INTERVAL = 0.005
+
 # ---- object refs ----
 
 
@@ -100,7 +103,7 @@ def get(refs: ObjectRef | Iterable[ObjectRef], timeout: float | None = None) -> 
     deadline = None if timeout is None else time.time() + timeout
     out = []
     for ref in items:
-        if getattr(ref, "_has_value", False):
+        if ref._has_value:
             out.append(ref._value)
             continue
         req: dict[str, Any] = {"t": "get", "obj": ref.id}
@@ -130,14 +133,14 @@ def wait(
         ready: list[ObjectRef] = []
         not_ready: list[ObjectRef] = []
         for ref in refs:
-            if getattr(ref, "_has_value", False):
+            if ref._has_value:
                 ready.append(ref)
                 continue
             resp, _ = _need().request({"t": "stat", "obj": ref.id})
             (ready if resp.get("ready") else not_ready).append(ref)
         if len(ready) >= num_returns or (deadline and time.time() >= deadline):
             return ready, not_ready
-        time.sleep(0.005)
+        time.sleep(_WAIT_POLL_INTERVAL)
 
 
 # ---- actors ----
