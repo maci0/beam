@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/maci0/beam/actions/workflows/ci.yml"><img src="https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="coverage">
-  <img src="https://img.shields.io/badge/tests-273-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-512-brightgreen" alt="tests">
   <img src="https://img.shields.io/badge/mypy-strict-blue" alt="mypy strict">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="python 3.9+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license AGPL-3.0"></a>
@@ -21,18 +21,18 @@ The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactl
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
 ([vLLM parallelism & scaling](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/).)
 
-**~1,470 lines, 124 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
+**3,331 lines, 126 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
 (see [docs/DESIGN.md](docs/DESIGN.md#size-vs-ray)).
 
 ## Documentation
 
-- [docs/DESIGN.md](docs/DESIGN.md) — rationale and scope (why it's this small, the contract)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, topology, end-to-end startup walkthrough
-- [docs/PROTOCOL.md](docs/PROTOCOL.md) — wire format and every message type
-- [docs/API.md](docs/API.md) — the full ray surface implemented, mapped to daemon ops
-- [docs/OPERATIONS.md](docs/OPERATIONS.md) — multi-node deploy, NCCL/RoCE, memory, troubleshooting
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — file map, tests, keeping the shim in sync with vLLM
-- [test/dgx/README.md](test/dgx/README.md) — the two-node DGX Spark harness
+- [docs/DESIGN.md](docs/DESIGN.md): rationale and scope (why it's this small, the contract)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, topology, end-to-end startup walkthrough
+- [docs/PROTOCOL.md](docs/PROTOCOL.md): wire format and every message type
+- [docs/API.md](docs/API.md): the full ray surface implemented, mapped to daemon ops
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): multi-node deploy, NCCL/RoCE, memory, troubleshooting
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): file map, tests, keeping the shim in sync with vLLM
+- [test/dgx/README.md](test/dgx/README.md): the two-node DGX Spark harness
 
 ## Deploy into the stock vllm-openai image (no rebuild)
 
@@ -120,7 +120,7 @@ placement, and actor RPC without devices.
 The **Vulkan-over-gloo** rows close the full cross-node data plane end to end
 (MessageQueue broadcast/response over zmq **and** the tensor-parallel all-reduce
 over gloo). The last row does it across **two CPU architectures and two GPU
-vendors at once** — half the model sharded onto an x86 AMD RDNA2 card, half onto
+vendors at once**: half the model sharded onto an x86 AMD RDNA2 card, half onto
 an aarch64 NVIDIA Blackwell GPU, each computing on Vulkan, reducing over gloo;
 beam ships the same actor bytecode to both (same Python minor version) and the
 node-agnostic control plane does not care about arch or vendor. Cross-node
@@ -130,7 +130,7 @@ availability (homogeneous 2-node NVIDIA/AMD with a real RDMA network), never by
 beam. Harnesses for it are ready: `test/run_rocm_cluster.sh` (SSH-into-node) and
 `test/run_rocm_azure.sh` (VM + docker).
 
-Two gotchas surfaced closing the gloo row, both worth knowing for any multi-node
+Three gotchas surfaced closing the gloo row, all worth knowing for any multi-node
 deploy (see [docs/OPERATIONS.md](docs/OPERATIONS.md)):
 
 - **Node IP on multi-homed hosts.** vLLM advertises its zmq queues at
@@ -165,9 +165,11 @@ bump as a CI gate:
 | var | meaning |
 |-----|---------|
 | `BEAM_NUM_GPUS`    | override detected GPU count |
+| `BEAM_NODE_IP`     | advertise this address (else `VLLM_HOST_IP`, else default-route IP) |
 | `BEAM_RUNTIME_DIR` | daemon state dir (default `~/.beam`) |
 | `BEAM_SOCK`        | daemon unix socket (else read from the runtime dir) |
 | `BEAM_WORKER_CMD`  | how to launch a python actor (default `python3 -m ray._worker`) |
+| `BEAM_BOOTSTRAP`   | force the bootstrap that normally runs only inside a container |
 
 ## Not implemented (by design)
 

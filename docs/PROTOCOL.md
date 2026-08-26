@@ -32,8 +32,8 @@ TCP connection, and the daemon↔actor-worker unix socket.
 A request carries `t` + `reqid` + type-specific fields. Its response echoes
 `reqid` with `resp=true`, sets `t` to `<request>_ok` (e.g. `create_actor` →
 `create_actor_ok`, `get` → `get_ok`), and carries either the reply fields below
-or `err`. Even messages whose reply column is "—" still get an acknowledgement
-frame (`hello_ok`, `init_ok`, `kill_ok`, …) that the caller awaits; "—" means it
+or `err`. Even messages whose reply column is `n/a` still get an acknowledgement
+frame (`hello_ok`, `init_ok`, `kill_ok`, …) that the caller awaits; `n/a` means it
 carries no fields beyond the standard `t`/`reqid`/`resp`. A single connection is
 a bidirectional mux: both ends may issue requests; responses are matched by
 `reqid`.
@@ -44,20 +44,20 @@ Payload column: ✓ means the frame carries a cloudpickled payload.
 
 | `t`             | direction              | request fields        | reply fields           | payload |
 |-----------------|------------------------|-----------------------|------------------------|---------|
-| `hello`         | worker daemon → head   | `node` `ip` `ngpu`    | —                      |         |
-| `worker_hello`  | actor worker → daemon  | `actor`               | —                      |         |
-| `status`        | client/worker → head   | —                     | `nodes[]`              |         |
+| `hello`         | worker daemon → head   | `node` `ip` `ngpu`    | n/a                      |         |
+| `worker_hello`  | actor worker → daemon  | `actor`               | n/a                      |         |
+| `status`        | client/worker → head   | n/a                     | `nodes[]`              |         |
 | `create_pg`     | client → head          | `specs[]`             | `pg`                   |         |
-| `remove_pg`     | client → head          | `pg`                  | —                      |         |
+| `remove_pg`     | client → head          | `pg`                  | n/a                      |         |
 | `pg_table`      | client → head          | `pg` (optional)       | `data`                 |         |
-| `resources`     | client → head          | —                     | `data`                 |         |
+| `resources`     | client → head          | n/a                     | `data`                 |         |
 | `create_actor`  | client → head → owner  | `ngpu` `pg` `bundle`  | `actor` `gpus` `node`  | ✓ (in)  |
-| `init`          | daemon → actor worker  | —                     | —                      | ✓ (in)  |
+| `init`          | daemon → actor worker  | n/a                     | n/a                      | ✓ (in)  |
 | `call`          | client → head → owner  | `actor` `method`      | `obj`                  | ✓ (in)  |
-| `method`        | daemon → actor worker  | `method`              | —                      | ✓ both  |
-| `kill`          | client → head → owner  | `actor`               | —                      |         |
-| `put`           | client → local daemon  | —                     | `obj`                  | ✓ (in)  |
-| `get`           | client → head → owner  | `obj`                 | —                      | ✓ (out) |
+| `method`        | daemon → actor worker  | `method`              | n/a                      | ✓ both  |
+| `kill`          | client → head → owner  | `actor`               | n/a                      |         |
+| `put`           | client → local daemon  | n/a                     | `obj`                  | ✓ (in)  |
+| `get`           | client → head → owner  | `obj`                 | n/a                      | ✓ (out) |
 | `stat`          | client → head → owner  | `obj`                 | `ready` (bool)         |         |
 
 Notes:
@@ -80,8 +80,8 @@ flowchart TD
     REQ["request reaches a daemon<br/>(create_actor / call / kill)"] --> ISHEAD{head?}
     ISHEAD -->|yes| PLACE["decide owner node,<br/>route to it (or host locally)"]
     ISHEAD -->|no| HASID{"pre-assigned id?<br/>(actor field present)"}
-    HASID -->|"yes — pushed by head"| LOCAL["host / dispatch locally"]
-    HASID -->|"no — from a local driver"| FWD["forward to head"]
+    HASID -->|"yes: pushed by head"| LOCAL["host / dispatch locally"]
+    HASID -->|"no: from a local driver"| FWD["forward to head"]
     FWD --> PLACE
 ```
 

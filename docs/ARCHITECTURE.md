@@ -133,7 +133,7 @@ sequenceDiagram
 6. **Model load + NCCL.** vLLM broadcasts `init_device` / `load_model` /
    `determine_num_available_blocks` as actor method calls. Inside those, the
    workers run `torch.distributed.init_process_group(backend="nccl")` and build
-   the NCCL communicator over RoCE — directly between nodes, not through beam.
+   the NCCL communicator over RoCE, directly between nodes, not through beam.
 
 7. **Serving.** vLLM calls `handle.run()` on each worker; that method never
    returns (it is the worker's execution loop, fed by vLLM's own shared-memory
@@ -154,7 +154,7 @@ machinery; beam is idle except for the occasional liveness `stat`.
 - **Per-actor serialization:** each actor has an `asyncio.Lock`; calls to the
   same actor run one at a time (Ray semantics), calls to different actors run
   concurrently. The long-lived `run()` call holds its actor's lock for the
-  server's lifetime, which is correct — that actor is busy.
+  server's lifetime, which is correct: that actor is busy.
 - **Shim client:** one unix socket guarded by a threading lock; the driver's ray
   calls serialize through it. This is fine because vLLM's hot path uses its own
   MessageQueue, so ray calls after startup are infrequent (mostly liveness).
@@ -171,7 +171,7 @@ run starving the next.
 An earlier version had a Go daemon. The shim is forced to be Python (in-process
 `import ray`) and the actor workers are Python (they run vLLM's torch code), so
 Go was the only non-Python piece: it added a second language, arm64
-cross-compilation, a static binary to ship, and a wire protocol written twice —
+cross-compilation, a static binary to ship, and a wire protocol written twice,
 all for a control plane that does a handful of tiny RPCs per step, where Go's
 speed buys nothing. Collapsing to one language removed the build step entirely
 and made runtime injection a single bind mount.

@@ -16,7 +16,7 @@ here.
 | `ray.shutdown()`      | close the client                                     |
 | `ray.__version__`     | reports `"2.43.0"` so vLLM version/metadata checks pass |
 
-`address`, `runtime_env`, and other kwargs are accepted and ignored — beam
+`address`, `runtime_env`, and other kwargs are accepted and ignored; beam
 always uses the local daemon.
 
 ## Actors
@@ -92,12 +92,12 @@ immediately.
 Separate opt-in integrations and the compiled-DAG data plane, none on the
 multi-node NCCL inference path:
 
-- `ray.data`, `ray.data.llm.*` — Ray Data batch inference
-- `ray.serve`, `ray.serve.llm.*` — Ray Serve deployments
-- `ray.experimental.channel.*` — compiled-DAG accelerator channels (vLLM gates
+- `ray.data`, `ray.data.llm.*`: Ray Data batch inference
+- `ray.serve`, `ray.serve.llm.*`: Ray Serve deployments
+- `ray.experimental.channel.*`: compiled-DAG accelerator channels (vLLM gates
   this on `ray.experimental.compiled_dag_ref`, which beam omits, so vLLM keeps
   the default per-worker-RPC path)
-- `ray._private.accelerators.TPUAcceleratorManager` — TPU only
+- `ray._private.accelerators.TPUAcceleratorManager`: TPU only
 
 If a future vLLM version moves one of these onto the core path, the scanner flags
 it as MISSING and the fix is to add a stub or a daemon op.
