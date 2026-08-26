@@ -1205,6 +1205,10 @@ def test_claim_runtime_replaces_stale(tmp_path, monkeypatch):
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
     _write_runtime(tmp_path, monkeypatch, {"sock": "/s", "pid": 9})
     monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    # The seize path kill(0)s the pid out of the file. Say it is dead rather
+    # than depending on whether pid 9 happens to exist on the host (it does
+    # inside a CI container, where kill(0) raises EPERM and reads as live).
+    monkeypatch.setattr(_cli.os, "kill", lambda p, s: (_ for _ in ()).throw(ProcessLookupError()))
     assert _cli._claim_runtime({"sock": "/s", "node": "n", "head": True, "pid": 3}) is None
 
 
