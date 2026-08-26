@@ -67,7 +67,7 @@ def main():
     assert ray.get(ref) == {"a": [1, 2, 3], "b": ("x", 9)}
     print("B put/get OK")
 
-    # C: wait — fast ready, slow not, with timeout=0 (non-blocking poll)
+    # C: wait, fast ready, slow not, with timeout=0 (non-blocking poll)
     slow = w0.slow.remote(0.5)
     fast = w1.echo.remote(7)
     ray.get(fast)  # make sure fast has completed
