@@ -62,7 +62,7 @@ Three things must be right:
 ### 1. RDMA device access
 
 `--network host --gpus all` is not enough. The NVIDIA container runtime injects
-**GPUs**, not RDMA NICs — the verbs devices (`/dev/infiniband/uverbs*`,
+**GPUs**, not RDMA NICs. The verbs devices (`/dev/infiniband/uverbs*`,
 `rdma_cm`) are a different kernel subsystem and are not auto-injected. A plain
 `-v /dev/infiniband` bind mount exposes the device nodes but docker's
 device-cgroup still denies opening them (which is what makes `--privileged`
@@ -175,7 +175,7 @@ and the driver's Vulkan ICD will only initialize against a matching libc:
 
 - **Match the base image to the host's distro** (its glibc). A driver built for
   Ubuntu 24.04 (glibc 2.39) returns `VK_ERROR_INITIALIZATION_FAILED` under a
-  22.04 (glibc 2.35) image — even though `nvidia-smi`/CUDA work. The failure is
+  22.04 (glibc 2.35) image, even though `nvidia-smi`/CUDA work. The failure is
   silent at the ICD-negotiation step.
 - **Install the X/GL userland** `libGLX_nvidia` pulls in: `libx11-6 libxext6
   libglvnd0 libgl1 libegl1 libvulkan1 libxcb1 libxau6 libxdmcp6`.
@@ -255,7 +255,7 @@ TCP socket instead, and bump `GPUS_PER_NODE`/`TP_SIZE` to use all 8 GPUs/node.
 ## CPU inference
 
 vLLM's CPU backend (gloo, `device=cpu`) lets nodes without a GPU participate, but
-the stock `vllm/vllm-openai` image is CUDA-only — CPU inference needs a
+the stock `vllm/vllm-openai` image is CUDA-only: CPU inference needs a
 CPU-built image (vLLM's `Dockerfile.cpu`) or a CPU wheel. beam itself is
 indifferent to the device: the control plane is identical, only the actors'
 `torch.distributed` backend changes (gloo instead of nccl). With a CPU image,

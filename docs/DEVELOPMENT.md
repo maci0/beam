@@ -45,6 +45,7 @@ test/                    end-to-end harnesses (shell)
   run_e2e.sh             single head, 4 fake GPUs
   run_multinode.sh       GPU-less head + 4-GPU worker, colocated
   run_edge.sh            edge cases (errors, wait, parallelism, kill, leak-fix)
+  run_driver_on_worker.sh  driver on a worker node, head stays pure control plane
   run_3node.sh           3 real machines: this host head + 2 sparks (needs SSH)
   run_cpu_cluster.sh     N real machines, CPU-only control plane (3, 4, ... nodes)
   run_cpuhead_gpuworkers.sh  CPU head + 2 GPU workers, vLLM TP=2 (sparks)
@@ -124,4 +125,4 @@ To cover a newly-required symbol:
 - Annotations use `from __future__ import annotations` where PEP604 unions appear,
   so the shim imports on Python 3.9+.
 - The daemon never unpickles payloads; only the shim and the actor worker do.
-  Keep it that way — it is what lets the daemon stay agnostic to vLLM's classes.
+  Keep it that way: it is what lets the daemon stay agnostic to vLLM's classes.

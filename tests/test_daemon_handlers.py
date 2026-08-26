@@ -7,6 +7,7 @@ nodes)."""
 import asyncio
 import os
 import socket
+import subprocess
 import sys
 
 import pytest
@@ -37,6 +38,8 @@ class FakePeer:
         self.raise_on_call = raise_on_call
         self.calls = []
         self.closed = False
+        self.superseded = False
+        self.superseded_by = None
         self.created_actors = []
         self.created_pgs = []
         self.in_flight = 0
@@ -154,8 +157,6 @@ def test_terminate_kill_oserror_and_wait_fail():
 
         def kill(self):
             raise OSError("nope")
-
-    import subprocess as sp
 
     _terminate(Stubborn())  # all errors swallowed
 
@@ -823,6 +824,7 @@ def test_reap_orphan_keeps_slot_on_cancel_if_still_tracked(monkeypatch):
 
     run(go())
     assert "a1" in d._orphans  # still needs reaping
+
     # restart is allowed because the previous task is done
     async def schedule_under_loop():
         d._schedule_orphan_reap("a1", "n2")
@@ -1175,9 +1177,7 @@ def test_host_actor_aborted_by_kill_during_attach(monkeypatch):
     monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         # simulate on_kill mid-create (attach not yet done)
         fut = d.pending_workers["a1"]
@@ -1357,7 +1357,7 @@ def test_stale_worker_close_skips_release():
     d.pgs["p-should-not-drop"] = [{"node": "n1", "gpu": 0}]
     d.actor_loc["a-owned"] = "n2"
     run(d.on_hello(new, {"t": "hello", "node": "n2", "ip": "x", "ngpu": 1}, b""))
-    assert old.closed and getattr(old, "superseded", False)
+    assert old.closed and old.superseded
     # ownership moved to the new peer so a later disconnect still cleans up
     assert "p-should-not-drop" in new.created_pgs
     assert "a-owned" in new.created_actors
@@ -1645,7 +1645,7 @@ def test_release_client_continue_on_missing_ids_in_snapshot():
 
     peer.created_actors = GhostList(["ghost"])
     peer.created_pgs = GhostList(["ghost-pg"])
-    # no real work — both continue; ensure no crash
+    # no real work: both continue; ensure no crash
     run(d.release_client(peer))
 
 
@@ -1779,8 +1779,6 @@ def test_terminate_waits_then_kills(monkeypatch):
             if "kill" not in self.steps:
                 raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
             return 0
-
-    import subprocess as sp
 
     p = Stubborn()
     _terminate(p)
@@ -2524,7 +2522,7 @@ def test_peer_close_fails_pending_before_drain():
         r2, w2 = await asyncio.open_connection(sock=s2)
 
         async def bounce(peer, m, payload):
-            # call back on the same peer — would hang if pending not failed first
+            # call back on the same peer: would hang if pending not failed first
             return await peer.call({"t": "echo"}, b"")
 
         p = Peer(r1, w1, bounce)
@@ -2737,9 +2735,7 @@ def test_host_actor_aborts_publish_if_peer_closed(monkeypatch):
     worker_peer.closed = True  # already dead when attach completes
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": []}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": []}, b""))
         await asyncio.sleep(0)
         d.pending_workers["a1"].set_result(worker_peer)
         return await task
@@ -2759,9 +2755,7 @@ def test_host_actor_peer_closed_proc_still_alive(monkeypatch):
     worker_peer.closed = True
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         d.pending_workers["a1"].set_result(worker_peer)
         return await task
@@ -2814,9 +2808,7 @@ def test_host_actor_finally_keeps_hosting_if_alive(monkeypatch):
     monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         # kill mid-create while still hosting
         r, _ = await d.on_kill(None, {"actor": "a1"}, b"")
@@ -2867,9 +2859,7 @@ def test_host_actor_cancel_keeps_hosting_if_alive(monkeypatch):
     d.gpu_used[0] = True
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         task.cancel()
         try:
@@ -2890,9 +2880,7 @@ def test_host_actor_cancel_frees_if_proc_dies(monkeypatch):
     d.gpu_used[0] = True
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         task.cancel()
         try:
@@ -2914,9 +2902,7 @@ def test_host_actor_cancel_restores_hosting_if_popped(monkeypatch):
     d.gpu_used[0] = True
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         d._hosting.pop("a1", None)  # simulate concurrent clear
         task.cancel()
@@ -2973,9 +2959,7 @@ def test_host_actor_init_fail_still_alive(monkeypatch):
     wp = FakePeer(raise_on_call=RuntimeError("init boom"))
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         d.pending_workers["a1"].set_result(wp)
         return await task
@@ -2988,11 +2972,9 @@ def test_host_actor_init_fail_still_alive(monkeypatch):
 def test_host_actor_spawn_fail_still_alive(monkeypatch):
     d = head(1)
     d.sock_path = "/x.sock"
-    proc = _immortal()
     d.gpu_used[0] = True
 
     def boom_spawn(self, aid, gpus):
-        # set proc then raise after hosting would need... spawn raises before hosting
         raise RuntimeError("exec failed")
 
     monkeypatch.setattr(Daemon, "_spawn_worker", boom_spawn)
@@ -3107,9 +3089,7 @@ def test_host_actor_cancel_terminates_proc(monkeypatch):
     d.gpu_used[0] = True
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": [0]}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": [0]}, b""))
         await asyncio.sleep(0)
         task.cancel()
         try:
@@ -3237,38 +3217,10 @@ def test_bg_finish_fwd_cleanup_error():
 
 
 def test_await_fwd_after_cancel_done_result():
+    """wait_for times out but the forward already finished: return its result."""
     d = worker()
     peer = FakePeer()
 
-    async def go():
-        async def done():
-            return {"actor": "a"}, b""
-
-        t = asyncio.create_task(done())
-        await t
-        # already done: wait_for still works; force except path with done task
-        real_wf = asyncio.wait_for
-
-        async def always_timeout(aw, timeout=None):
-            raise TimeoutError()
-
-        # monkeypatch in outer test
-        return t
-
-    t = run(go())
-
-    async def go2(monkeypatch):
-        async def always_timeout(aw, timeout=None):
-            raise TimeoutError()
-
-        monkeypatch.setattr(asyncio, "wait_for", always_timeout)
-        r = await d._await_fwd_after_cancel(t, peer, "actor")
-        assert r == ({"actor": "a"}, b"")
-
-    # re-run with monkeypatch via pytest style inline
-    import pytest as _pt
-
-    # simpler direct call after task done
     async def direct():
         async def done():
             return {"actor": "a"}, b""
@@ -3479,9 +3431,7 @@ def test_worker_create_actor_cancel_after_forward_cleans(monkeypatch):
     monkeypatch.setattr(d, "_forward_head", slow_forward)
 
     async def go():
-        task = asyncio.ensure_future(
-            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
-        )
+        task = asyncio.ensure_future(d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b""))
         await asyncio.sleep(0.005)
         task.cancel()
         try:
@@ -3502,9 +3452,7 @@ def test_host_actor_cancel_with_hosting_wpeer(monkeypatch):
     monkeypatch.setattr(Daemon, "_spawn_worker", _spawn_stub(proc))
 
     async def go():
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": []}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": []}, b""))
         await asyncio.sleep(0)
         # attach peer into hosting as mid-create would
         d._hosting["a1"] = (proc, wpeer, [])
@@ -3534,9 +3482,7 @@ def test_host_actor_cancel_before_hosting_entry(monkeypatch):
 
     async def go():
         # Force CancelledError after spawn by cancelling during wait_for(fut)
-        task = asyncio.ensure_future(
-            d._host_actor({"actor": "a1", "gpus": []}, b"")
-        )
+        task = asyncio.ensure_future(d._host_actor({"actor": "a1", "gpus": []}, b""))
         await asyncio.sleep(0)
         # remove hosting so cancel hits elif proc branch
         d._hosting.pop("a1", None)
@@ -3597,9 +3543,7 @@ def test_create_superseded_late_append_schedules_orphan(monkeypatch):
     monkeypatch.setattr(d, "_schedule_orphan_reap", capture)
 
     async def go():
-        task = asyncio.ensure_future(
-            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
-        )
+        task = asyncio.ensure_future(d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b""))
         await asyncio.sleep(0)
         aid = next(iter(d.pending_workers))
         # id is on peer.created_actors from early append; not on any live node peer
@@ -3624,14 +3568,10 @@ def test_create_superseded_owned_elsewhere_no_orphan(monkeypatch):
     live = FakePeer()
     scheduled: list = []
 
-    monkeypatch.setattr(
-        d, "_schedule_orphan_reap", lambda *a: scheduled.append(a)
-    )
+    monkeypatch.setattr(d, "_schedule_orphan_reap", lambda *a: scheduled.append(a))
 
     async def go():
-        task = asyncio.ensure_future(
-            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
-        )
+        task = asyncio.ensure_future(d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b""))
         await asyncio.sleep(0)
         aid = next(iter(d.pending_workers))
         # keep id on dead peer AND on live peer (both lists)
@@ -3666,9 +3606,7 @@ def test_peer_serve_skips_handlers_when_closed():
         # write a request frame to the peer
         from ray._daemon import encode_frame
 
-        w2 = await asyncio.open_connection(sock=s2)
-        # s2 is the client side; send a frame then close so serve exits
-        # reopen: s2 already used. Use the raw socketpair differently.
+        # s2 is the client side: send a frame then close so serve() exits.
         s2.sendall(encode_frame({"t": "ping", "reqid": 1}))
         s2.close()
         await p.serve()  # reads frame, skips handler because closed, then EOF
@@ -3801,6 +3739,7 @@ def test_retry_forward_kill_local_kill_raises_then_forward(monkeypatch):
 def test_retry_forward_kill_forward_succeeds(monkeypatch):
     d = worker()
     d.head_peer = FakePeer()
+
     async def nosleep(_s):
         return None
 
@@ -3907,7 +3846,9 @@ def test_retry_worker_release_waits_for_in_flight(monkeypatch):
 def test_dispatch_cancelled_sets_err():
     d = head()
     slot = ObjSlot()
-    ap = ActorProc("a", peer=FakePeer(raise_on_call=asyncio.CancelledError()), gpus=[], proc=FakeProc())
+    ap = ActorProc(
+        "a", peer=FakePeer(raise_on_call=asyncio.CancelledError()), gpus=[], proc=FakeProc()
+    )
 
     async def go():
         try:
@@ -4083,9 +4024,7 @@ def test_create_after_supersede_does_not_rollback(monkeypatch):
     live = FakePeer()
 
     async def go():
-        task = asyncio.ensure_future(
-            d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b"")
-        )
+        task = asyncio.ensure_future(d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b""))
         await asyncio.sleep(0)
         aid = next(iter(d.pending_workers))
         # simulate re-hello transfer of ownership off the dead peer

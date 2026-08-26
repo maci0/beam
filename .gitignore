@@ -8,3 +8,8 @@ __pycache__/
 .venv/
 .mypy_cache/
 **/dist/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.scratch/
