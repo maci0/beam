@@ -1014,7 +1014,12 @@ class Daemon:
                     return {"err": "actor %s killed during create" % actor_id}, b""
                 return {"err": "actor %s process still alive after kill" % actor_id}, b""
             self.actors[actor_id] = ActorProc(actor_id, peer, gpus, proc)
-            return {"t": "create_actor_ok", "actor": actor_id, "gpus": gpus}, b""
+            # local host owns the actor; include the owner node like the remote
+            # create path in on_create_actor (which sets "node": node).
+            return (
+                {"t": "create_actor_ok", "actor": actor_id, "gpus": gpus, "node": self.node_id},
+                b"",
+            )
         except asyncio.CancelledError:
             # Peer.close drain cancelled us: never leave a zombie worker untracked.
             self.pending_workers.pop(actor_id, None)

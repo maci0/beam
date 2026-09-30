@@ -619,6 +619,7 @@ def test_on_create_actor_cpu_local_host(monkeypatch):
 
     r, _ = run(go())
     assert r["t"] == "create_actor_ok"
+    assert r["node"] == "n1"  # the local host reports its owner node, like the remote path
     aid = r["actor"]
     assert d.actor_loc[aid] == "n1" and aid in peer.created_actors
 
