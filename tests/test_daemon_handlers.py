@@ -2488,8 +2488,11 @@ def test_peer_close_drains_handler_tasks_before_on_close():
         s1.setblocking(False)
         r1, w1 = await asyncio.open_connection(sock=s1)
 
+        started = asyncio.Event()
+
         async def slow_handler(peer, m, payload):
             order.append("handle_start")
+            started.set()
             await asyncio.sleep(0.01)
             order.append("handle_done")
             return {"t": "ok"}, b""
@@ -2504,7 +2507,7 @@ def test_peer_close_drains_handler_tasks_before_on_close():
         t = asyncio.create_task(p._handle({"t": "x", "reqid": 1}, b""))
         p._tasks.add(t)
         t.add_done_callback(p._tasks.discard)
-        await asyncio.sleep(0)  # let handle_start run
+        await started.wait()  # the handler is definitely in flight
         await p.close()
         assert order == ["handle_start", "handle_done", "on_close"]
         s2.close()
@@ -3376,42 +3379,32 @@ def test_worker_create_pg_cancel_after_forward_cleans(monkeypatch):
 
     monkeypatch.setattr(d, "_worker_cleanup_pg", cleanup)
 
+    # Block the forward on events instead of a wall-clock sleep: the test
+    # controls exactly when the head reply lands, so the cancel below is always
+    # delivered mid-forward, on a fast machine and a loaded CI runner alike.
     async def go():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def gated_forward(m, payload=b""):
+            entered.set()
+            await release.wait()
+            return {"t": "create_pg_ok", "pg": "p9"}, b""
+
+        monkeypatch.setattr(d, "_forward_head", gated_forward)
         task = asyncio.ensure_future(
             d.on_create_pg(peer, {"t": "create_pg", "specs": [{"GPU": 1}]}, b"")
         )
-        await asyncio.sleep(0)
-        # Let forward complete, then cancel while still in create_pg
-        # Force cancel after a yield; shield keeps fwd alive then cleanup.
-        await asyncio.sleep(0)
+        await entered.wait()  # the forward task is now in flight and pinned
         task.cancel()
+        release.set()  # let the shielded forward finish after the cancel
         try:
             await task
         except asyncio.CancelledError:
             return "cancelled"
         return "ok"
 
-    # If forward is instant, cancel may hit after return - use slow forward
-    async def slow_forward(m, payload=b""):
-        await asyncio.sleep(0.02)
-        return {"t": "create_pg_ok", "pg": "p9"}, b""
-
-    monkeypatch.setattr(d, "_forward_head", slow_forward)
-
-    async def go2():
-        task = asyncio.ensure_future(
-            d.on_create_pg(peer, {"t": "create_pg", "specs": [{"GPU": 1}]}, b"")
-        )
-        await asyncio.sleep(0.005)  # mid-forward
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            return "cancelled"
-        return "ok"
-
-    assert run(go2()) == "cancelled"
-    assert cleaned == ["p9"]
+    assert run(go()) == "cancelled"
+    assert cleaned == ["p9"], "cancel must still release the head-side placement group"
 
 
 def test_worker_create_actor_cancel_after_forward_cleans(monkeypatch):
@@ -3425,16 +3418,21 @@ def test_worker_create_actor_cancel_after_forward_cleans(monkeypatch):
 
     monkeypatch.setattr(d, "_worker_cleanup_actor", cleanup)
 
-    async def slow_forward(m, payload=b""):
-        await asyncio.sleep(0.02)
-        return {"t": "create_actor_ok", "actor": "n1-a9"}, b""
-
-    monkeypatch.setattr(d, "_forward_head", slow_forward)
-
     async def go():
+        # Gated forward: the cancel below is delivered mid-forward by
+        # construction, not by racing a wall-clock sleep.
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def gated_forward(m, payload=b""):
+            entered.set()
+            await release.wait()
+            return {"t": "create_actor_ok", "actor": "n1-a9"}, b""
+
+        monkeypatch.setattr(d, "_forward_head", gated_forward)
         task = asyncio.ensure_future(d.on_create_actor(peer, {"t": "create_actor", "ngpu": 0}, b""))
-        await asyncio.sleep(0.005)
+        await entered.wait()
         task.cancel()
+        release.set()
         try:
             await task
         except asyncio.CancelledError:

@@ -94,8 +94,11 @@ def test_kill_sends_kill(monkeypatch):
 
 
 def test_kill_non_handle_is_noop(monkeypatch):
+    """vLLM's teardown calls ray.kill on ids it may not own; a non-handle must be
+    swallowed, never raise and never reach the daemon."""
     fc = use(monkeypatch, FakeClient())
     ray.kill("not an actor")
+    ray.kill(None)
     assert fc.sent == []
 
 

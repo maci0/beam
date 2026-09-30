@@ -392,11 +392,15 @@ def test_fuzz_detect_gpus_counts_glob(devs):
             assert _daemon.detect_gpus() == len(devs)
 
 
-# ---- new_node_id fuzz -------------------------------------------------------
+# ---- new_node_id -----------------------------------------------------------
 
 
-@settings(max_examples=50)
-@given(st.integers(min_value=0, max_value=100))
-def test_fuzz_new_node_id_unique(_n):
-    ids = {_daemon.new_node_id() for _ in range(20)}
-    assert all(i.startswith("n") and len(i) == 9 for i in ids)
+def test_new_node_id_unique_and_well_formed():
+    """Distinctness is load-bearing: a collision would merge two workers into
+    one membership entry, so two daemons on different hosts would silently share
+    a node id and route to the wrong one."""
+    ids = [_daemon.new_node_id() for _ in range(20)]
+    assert len(set(ids)) == 20, "new_node_id returned a duplicate node id"
+    for i in ids:
+        assert i[0] == "n" and len(i) == 9
+        int(i[1:], 16)  # the suffix is hex, as owner_of/parse expect

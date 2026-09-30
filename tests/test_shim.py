@@ -114,6 +114,32 @@ def test_wait_timeout_returns_partial(monkeypatch):
     assert ready == [] and len(not_ready) == 1
 
 
+def test_wait_num_returns_zero_returns_immediately(monkeypatch):
+    """num_returns=0 asks for nothing, so wait must not block: the caller wants
+    an empty ready set back now, not a poll loop that never satisfies it."""
+    use(monkeypatch, FakeClient({"stat": {"ready": False}}))
+    ready, not_ready = ray.wait([ray.ObjectRef("a")], num_returns=0, timeout=None)
+    # zero wanted is met by the first pass, so nothing lands in ready
+    assert ready == [] and not_ready == [ray.ObjectRef("a")]
+
+
+def test_wait_empty_refs(monkeypatch):
+    use(monkeypatch, FakeClient())
+    assert ray.wait([], num_returns=1, timeout=1) == ([], [])  # no hang on empty input
+
+
+def test_get_empty_body_yields_none(monkeypatch):
+    """A get_ok with no payload is a None value, not a decode error."""
+    use(monkeypatch, FakeClient({"get": {}}))
+    assert ray.get(ray.ObjectRef("n1-o1")) is None
+
+
+def test_get_empty_list(monkeypatch):
+    fc = use(monkeypatch, FakeClient())
+    assert ray.get([]) == []
+    assert fc.sent == []  # nothing to fetch, no daemon round-trip
+
+
 # ---- deadlines run on the monotonic clock ----
 class SteppingClock:
     """Stands in for the `time` module with a wall clock that jumps forward or

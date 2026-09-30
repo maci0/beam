@@ -69,7 +69,10 @@ def test_owner_of_never_crashes(s):
 
 def test_node_id_format():
     nid = new_node_id()
-    assert nid[0] == "n" and len(nid) == 9 and int(nid[1:], 16) >= 0
+    assert nid[0] == "n" and len(nid) == 9
+    # the suffix must be lowercase hex: membership keys and owner_of match on it
+    assert nid[1:] == nid[1:].lower()
+    int(nid[1:], 16)  # raises if the suffix is not hex
 
 
 def test_detect_gpus(monkeypatch):
