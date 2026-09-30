@@ -37,8 +37,17 @@ its assigned GPU in `CUDA_VISIBLE_DEVICES`, single-threaded.
 | symbol                       | maps to                                       |
 |------------------------------|-----------------------------------------------|
 | `ray.put(obj)`               | `put` → `ObjectRef`                           |
-| `ray.get(ref \| [refs])`     | `get` (blocks until ready); unpickles result  |
+| `ray.get(ref \| [refs], timeout)` | `get` (blocks until ready); unpickles result |
 | `ray.wait(refs, num_returns, timeout)` | poll `stat`; returns `(ready, not_ready)` |
+
+Timeouts are elapsed-time budgets on the monotonic clock, so an NTP step, a
+manual clock change, or a host suspend cannot end a call early or extend it. The
+budget bounds the whole call, not just the polling: each round-trip is sent with
+the time remaining, so a daemon that stops answering (a worker node dropped
+mid-cluster) ends `get` with `GetTimeoutError` and returns from `wait` at the
+timeout instead of hanging past it. A ref that is already resolved is returned
+immediately whatever budget is left, and `timeout=0` is a non-blocking poll, not
+"always fail".
 
 Results are passed inline through the hub. This is fine for vLLM's small control
 returns; beam is not an object store for tensors (vLLM never passes tensors

@@ -36,6 +36,16 @@ _TERM_POLL_INTERVAL = 0.05
 _KILL_WAIT = 0.5
 # Backoff between attempts to dial the head on worker startup.
 _HEAD_DIAL_RETRY_INTERVAL = 1.0
+# Floor on a client-supplied per-request budget (a `stat` hop). asyncio rounds a
+# sub-millisecond deadline to 0 and would time out without ever making the hop.
+_STAT_HOP_FLOOR = 0.001
+
+
+def _hop_budget(requested: float | None) -> float:
+    """Deadline for a client-budgeted hop, clamped into (0, _RPC_TIMEOUT]."""
+    if requested is None:
+        return _RPC_TIMEOUT
+    return max(_STAT_HOP_FLOOR, min(_RPC_TIMEOUT, requested))
 
 
 def _terminate(proc: subprocess.Popen | None) -> bool:
@@ -1285,28 +1295,55 @@ class Daemon:
         slot = self.objects.get(obj_id)
         if slot is None:
             return {"err": "unknown object %s" % obj_id}, b""
-        timeout = m.get("timeout")
-        try:
-            await asyncio.wait_for(slot.ev.wait(), timeout)
-        except asyncio.TimeoutError:
-            return {"err": "GetTimeoutError: object %s not ready in %ss" % (obj_id, timeout)}, b""
+        # "wait for the result" vs "is it there yet": asyncio.wait_for(ev, 0)
+        # raises TimeoutError without ever checking the flag, so a client that
+        # asks for a value the actor already returned is told "not ready in 0.0s"
+        # and raises GetTimeoutError on a ref that is done. A ready slot answers
+        # immediately, whatever the remaining budget; only a not-ready slot with a
+        # budget is worth waiting on. A missing/None budget waits forever.
+        if slot.ev.is_set():
+            pass
+        elif m.get("timeout") is None:
+            await slot.ev.wait()
+        else:
+            try:
+                await asyncio.wait_for(slot.ev.wait(), m["timeout"])
+            except asyncio.TimeoutError:
+                timeout = m["timeout"]
+                return {
+                    "err": "GetTimeoutError: object %s not ready in %ss" % (obj_id, timeout)
+                }, b""
         if slot.err:
             return {"err": slot.err}, b""
         return {"t": "get_ok", "obj": obj_id}, slot.data
 
     async def on_stat(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         """Report readiness without blocking (backs ray.wait). 'ready' is a plain
-        bool, never an error, so the client does not raise on not-ready."""
+        bool, never an error, so the client does not raise on not-ready.
+
+        When the client sent a `timeout` (its remaining wait budget), the hop to
+        the owner is bounded by it: an unbounded hop to a node that has dropped
+        would block this handler for the full _RPC_TIMEOUT, so the client's
+        `stat` poll outlives the deadline it was promised. An expired budget
+        answers not-ready, which is all the caller does with it anyway.
+        """
         obj_id = m["obj"]
+        hop = _hop_budget(m.get("timeout"))
         owner = owner_of(obj_id)
         if owner != self.node_id:
             if self.is_head:
                 p = self._peer_for(owner)
                 if p is None:
                     return {"t": "stat_ok", "ready": False}, b""
-                r, _ = await p.call(m)
+                try:
+                    r, _ = await asyncio.wait_for(p.call(m), timeout=hop)
+                except Exception:
+                    return {"t": "stat_ok", "ready": False}, b""
                 return r, b""
-            return await self._forward_head(m)
+            try:
+                return await asyncio.wait_for(self._forward_head(m), timeout=hop)
+            except Exception:
+                return {"t": "stat_ok", "ready": False}, b""
         slot = self.objects.get(obj_id)
         return {"t": "stat_ok", "ready": bool(slot and slot.ev.is_set())}, b""
 

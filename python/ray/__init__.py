@@ -128,11 +128,18 @@ def get(refs: ObjectRef | Iterable[ObjectRef], timeout: float | None = None) -> 
         if left is not None:
             req["timeout"] = left
         try:
-            _, body = _need().request(req)
+            # Bound the socket read by the same budget the daemon gets, so an
+            # unreachable daemon ends the get at the deadline instead of
+            # hanging past it.
+            _, body = _budgeted(_need(), req, left)
         except RuntimeError as e:
             if "GetTimeoutError" in str(e):
                 raise GetTimeoutError(str(e)) from None
             raise
+        except TimeoutError as e:
+            raise GetTimeoutError(
+                "GetTimeoutError: object %s not ready in %ss" % (ref.id, left)
+            ) from e
         out.append(_proto.loads(body) if body else None)
     return out[0] if single else out
 
@@ -147,6 +154,7 @@ def wait(
     refs = list(refs)
     num_returns = min(num_returns, len(refs))  # never block waiting for more than exist
     deadline = _deadline(timeout)
+    client = _need()
     while True:
         ready: list[ObjectRef] = []
         not_ready: list[ObjectRef] = []
@@ -154,11 +162,41 @@ def wait(
             if ref._has_value:
                 ready.append(ref)
                 continue
-            resp, _ = _need().request({"t": "stat", "obj": ref.id})
+            resp, _ = _stat(client, ref, _remaining(deadline))
             (ready if resp.get("ready") else not_ready).append(ref)
         if len(ready) >= num_returns or (deadline and time.monotonic() >= deadline):
             return ready, not_ready
-        time.sleep(_WAIT_POLL_INTERVAL)
+        # Never sleep past the deadline: ray.wait is polled on a fixed cadence
+        # (vLLM's liveness thread), so oversleeping here compounds every cycle.
+        left = _remaining(deadline)
+        if left is not None and left <= 0:
+            return ready, not_ready
+        time.sleep(_WAIT_POLL_INTERVAL if left is None else min(_WAIT_POLL_INTERVAL, left))
+
+
+def _budgeted(client: Any, header: dict[str, Any], left: float | None) -> tuple[dict, bytes]:
+    """One round-trip, bounded by the caller's remaining deadline budget.
+
+    A request issued under a deadline must not block longer than that deadline,
+    so the budget is passed to the client and applied to the socket read: a
+    daemon that is slow, or a hop to a peer node that has dropped, would
+    otherwise hold the caller well past the budget it was promised. Clients
+    without a timeout parameter (test doubles) are simply called unbudgeted.
+    """
+    try:
+        return client.request(header, timeout=left)
+    except TypeError:  # client.request takes no budget
+        return client.request(header)
+
+
+def _stat(client: Any, ref: ObjectRef, left: float | None) -> tuple[dict, bytes]:
+    """A `stat` that the caller can time out on: a daemon that misses the
+    budget is reported not-ready (never an error), and the wait loop's own
+    deadline check decides whether to poll again."""
+    try:
+        return _budgeted(client, {"t": "stat", "obj": ref.id}, left)
+    except TimeoutError:
+        return {"t": "stat_ok", "ready": False}, b""
 
 
 # ---- actors ----

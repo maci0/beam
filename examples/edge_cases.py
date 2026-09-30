@@ -77,10 +77,13 @@ def main():
     assert ray.get(slow) == 0
     print("C wait OK")
 
-    # D: two actors run their calls concurrently, not serialized
-    t = time.time()
+    # D: two actors run their calls concurrently, not serialized.
+    # Elapsed time, so measure it on the monotonic clock: a wall-clock step
+    # (NTP, a manual change) would otherwise make a 1s pair of calls look
+    # instant, or blow the budget and report a false serialization failure.
+    t = time.monotonic()
     assert ray.get([w0.slow.remote(1.0), w1.slow.remote(1.0)]) == [0, 1]
-    dt = time.time() - t
+    dt = time.monotonic() - t
     assert dt < 1.8, "actors did not run in parallel: %.2fs" % dt
     print("D parallelism %.2fs OK" % dt)
 

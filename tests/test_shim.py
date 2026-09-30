@@ -140,6 +140,66 @@ def test_get_empty_list(monkeypatch):
     assert fc.sent == []  # nothing to fetch, no daemon round-trip
 
 
+def test_get_timeout_ends_at_the_deadline_when_the_daemon_never_answers(monkeypatch):
+    """A get issued with a timeout must end at that timeout even if the daemon
+    is unreachable: without a bound on the socket read, the caller hangs."""
+
+    class Unreachable:
+        def request(self, header, payload=b"", timeout=None):
+            if timeout is None:
+                raise AssertionError("get sent no budget; the read cannot be bounded")
+            raise TimeoutError("socket timed out")
+
+    monkeypatch.setattr(ray, "_need", lambda: Unreachable())
+    started = _time.monotonic()
+    with pytest.raises(GetTimeoutError, match="n1-o1"):
+        ray.get(ray.ObjectRef("n1-o1"), timeout=0.05)
+    assert _time.monotonic() - started < 1.0
+
+
+def test_get_passes_the_remaining_budget_to_the_daemon(monkeypatch):
+    seen = []
+
+    class Recorder:
+        def request(self, header, payload=b"", timeout=None):
+            seen.append((header.get("timeout"), timeout))
+            return {"t": "get_ok"}, _proto.dumps(1)
+
+    monkeypatch.setattr(ray, "_need", lambda: Recorder())
+    ray.get(ray.ObjectRef("a"), timeout=1.0)
+    assert seen and seen[0][0] is not None
+    # the daemon's budget and the socket budget are the same remaining time
+    assert seen[0][1] == pytest.approx(seen[0][0])
+
+
+def test_get_without_a_timeout_sends_no_budget(monkeypatch):
+    seen = []
+
+    class Recorder:
+        def request(self, header, payload=b"", timeout=None):
+            seen.append((header.get("timeout"), timeout))
+            return {"t": "get_ok"}, _proto.dumps(1)
+
+    monkeypatch.setattr(ray, "_need", lambda: Recorder())
+    assert ray.get(ray.ObjectRef("a")) == 1
+    assert seen == [(None, None)]
+
+
+def test_budgeted_falls_back_for_a_client_without_a_budget(monkeypatch):
+    """Clients whose request() takes no timeout kwarg keep working."""
+
+    class OldClient:
+        def __init__(self):
+            self.n = 0
+
+        def request(self, header, payload=b""):
+            self.n += 1
+            return {"t": "get_ok"}, _proto.dumps(self.n)
+
+    monkeypatch.setattr(ray, "_need", lambda: OldClient())
+    assert ray.get(ray.ObjectRef("a"), timeout=1.0) == 1
+
+
 # ---- deadlines run on the monotonic clock ----
 class SteppingClock:
     """Stands in for the `time` module with a wall clock that jumps forward or
@@ -212,6 +272,110 @@ def test_remaining_never_negative():
     assert ray._deadline(None) is None
     assert ray._remaining(ray._deadline(5.0)) == pytest.approx(5.0, abs=0.5)
     assert ray._remaining(_time.monotonic() - 1.0) == 0.0  # expired, clamped
+
+
+def test_wait_bounds_a_slow_stat_with_its_timeout(monkeypatch):
+    """The wait budget must reach the stat round-trip, not just the sleep: a
+    daemon that answers late (owner node dropped) must not push wait far past
+    the timeout the caller was promised."""
+    seen = []
+
+    class SlowDaemon:
+        def request(self, header, payload=b"", timeout=None):
+            seen.append(timeout)
+            raise TimeoutError("stat timed out")
+
+    monkeypatch.setattr(ray, "_need", lambda: SlowDaemon())
+    started = _time.monotonic()
+    ready, not_ready = ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=0.05)
+    elapsed = _time.monotonic() - started
+    assert ready == [] and len(not_ready) == 1
+    assert seen and all(t is not None and t <= 0.05 for t in seen), seen
+    assert elapsed < 0.2, "wait ran %.3fs past a 0.05s budget" % elapsed
+
+
+def test_wait_sends_no_budget_without_a_timeout(monkeypatch):
+    seen = []
+
+    class NeverReady:
+        def __init__(self):
+            self.n = 0
+
+        def request(self, header, payload=b"", timeout=None):
+            seen.append(timeout)
+            self.n += 1
+            if self.n >= 2:
+                return {"t": "stat_ok", "ready": True}, b""
+            return {"t": "stat_ok", "ready": False}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: NeverReady())
+    monkeypatch.setattr(ray.time, "sleep", lambda s: None)
+    ready, _ = ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=None)
+    assert len(ready) == 1 and seen and all(t is None for t in seen), seen
+
+
+def test_wait_falls_back_for_a_client_without_a_budget(monkeypatch):
+    """A client whose request() takes no timeout kwarg is still polled."""
+
+    class OldClient:
+        def request(self, header, payload=b""):
+            return {"t": "stat_ok", "ready": True}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: OldClient())
+    ready, _ = ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=1)
+    assert len(ready) == 1
+
+
+def test_wait_does_not_oversleep_the_deadline(monkeypatch):
+    """The poll sleep is clipped to the remaining budget, so a wait on a fixed
+    cadence (vLLM's liveness thread) does not drift past its timeout."""
+    slept = []
+
+    class NeverReady:
+        def request(self, header, payload=b"", timeout=None):
+            return {"t": "stat_ok", "ready": False}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: NeverReady())
+    monkeypatch.setattr(ray.time, "sleep", lambda s: slept.append(s))
+    ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=0.02)
+    assert slept, "wait never polled"
+    assert max(slept) <= 0.02, slept
+
+
+def test_wait_returns_when_the_clock_steps_past_the_deadline(monkeypatch):
+    """A forward clock step that lands between the deadline check and the sleep
+    must end the wait, not clip the sleep to a negative value."""
+    clock = _time.monotonic()
+
+    class SteppingMonotonic:
+        """Steps forward on the 4th reading: _deadline, the per-stat budget,
+        the deadline check, then the pre-sleep budget."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def time(self):
+            return _time.time()
+
+        def monotonic(self):
+            self.calls += 1
+            return _time.monotonic() + (3600.0 if self.calls >= 4 else 0.0)
+
+        def sleep(self, seconds):
+            assert seconds >= 0, "wait asked to sleep %rs" % seconds
+            _time.sleep(0)
+
+    class NeverReady:
+        def request(self, header, payload=b"", timeout=None):
+            return {"t": "stat_ok", "ready": False}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: NeverReady())
+    monkeypatch.setattr(ray, "time", SteppingMonotonic())
+    started = _time.monotonic()
+    ready, not_ready = ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=10.0)
+    assert _time.monotonic() - started < 1.0
+    assert ready == [] and len(not_ready) == 1
+    assert clock  # keep the name used
 
 
 # ---- remote / options ----

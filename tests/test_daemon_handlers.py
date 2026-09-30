@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import time as _time
 
 import pytest
 from hypothesis import given, settings
@@ -436,6 +437,68 @@ def test_on_get_timeout_path():
     assert "GetTimeoutError" in r["err"] and "n1-o1" in r["err"]
 
 
+def test_on_get_without_a_budget_waits_for_the_slot_to_fill():
+    """No timeout means wait as long as it takes: a plain ray.get(ref) must
+    return once the actor's call finishes, not time out and not return early."""
+    d = head()
+    slot = ObjSlot()
+    d.objects["n1-o1"] = slot
+
+    async def scenario():
+        get_task = asyncio.ensure_future(
+            d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1"}, b"")
+        )
+        await asyncio.sleep(0.01)  # handler is parked on the unset event
+        assert not get_task.done()
+        slot.data = b"late"
+        slot.ev.set()
+        return await asyncio.wait_for(get_task, 1.0)
+
+    r, body = run(scenario())
+    assert r["t"] == "get_ok" and body == b"late"
+
+
+def test_on_get_ready_slot_never_waits():
+    """A slot the actor already filled answers on the spot, whatever budget the
+    client sent, so the wait branch is never entered for a done ref."""
+    d = head()
+    slot = ObjSlot()
+    slot.data = b"v"
+    slot.ev.set()
+    d.objects["n1-o1"] = slot
+    r, body = run(d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1", "timeout": 30.0}, b""))
+    assert r["t"] == "get_ok" and body == b"v"
+
+
+def test_on_get_ready_slot_wins_over_expired_budget():
+    """A zero/negative budget on a slot the actor already filled must still
+    return the value: `asyncio.wait_for(ev, 0)` raises without ever checking the
+    flag, so the budget is bounded by the slot's state, never the reverse."""
+    d = head()
+    slot = ObjSlot()
+    slot.data = b"done"
+    slot.ev.set()
+    d.objects["n1-o1"] = slot
+    for budget in (0, 0.0, -1.0):
+        r, body = run(d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1", "timeout": budget}, b""))
+        assert r["t"] == "get_ok" and body == b"done", (budget, r)
+    # a not-ready slot with the same exhausted budget still times out
+    d.objects["n1-o2"] = ObjSlot()
+    r2, _ = run(d.on_get(FakePeer(), {"t": "get", "obj": "n1-o2", "timeout": 0.0}, b""))
+    assert "GetTimeoutError" in r2["err"]
+
+
+def test_on_get_null_timeout_on_ready_slot():
+    """An explicit null budget means "wait forever", not "wait zero seconds"."""
+    d = head()
+    slot = ObjSlot()
+    slot.data = b"v"
+    slot.ev.set()
+    d.objects["n1-o1"] = slot
+    r, body = run(d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1", "timeout": None}, b""))
+    assert r["t"] == "get_ok" and body == b"v"
+
+
 def test_on_get_propagates_slot_error():
     d = head()
     slot = ObjSlot()
@@ -496,6 +559,51 @@ def test_on_stat_remote_owner_routes():
     d.nodes["n2"] = {"info": {"node": "n2"}, "peer": other}
     r, _ = run(d.on_stat(FakePeer(), {"t": "stat", "obj": "n2-o1"}, b""))
     assert r["ready"] is True
+
+
+def test_on_stat_hop_is_bounded_by_the_client_budget():
+    """A stat that has to reach a remote owner must not block the handler past
+    the caller's budget: a wedged peer would otherwise stall the driver's
+    ray.wait poll for the full _RPC_TIMEOUT."""
+    d = head()
+    seen = []
+
+    class Wedged(FakePeer):
+        async def call(self, header, payload=b""):
+            seen.append(header["obj"])
+            await asyncio.sleep(30)  # peer never answers
+            raise AssertionError("should have been cut off")
+
+    d.nodes["n2"] = {"info": {"node": "n2"}, "peer": Wedged()}
+    started = _time.monotonic()
+    r, _ = run(d.on_stat(FakePeer(), {"t": "stat", "obj": "n2-o1", "timeout": 0.05}, b""))
+    elapsed = _time.monotonic() - started
+    assert r["ready"] is False  # not ready, never an error
+    assert elapsed < 2.0, "stat hop ignored the 0.05s budget (%.3fs)" % elapsed
+    assert seen == ["n2-o1"]
+
+
+def test_on_stat_worker_hop_is_bounded_by_the_client_budget():
+    d = worker()
+
+    class DeadHead(FakePeer):
+        async def call(self, header, payload=b""):
+            await asyncio.sleep(30)
+            raise AssertionError("should have been cut off")
+
+    d.head_peer = DeadHead()
+    started = _time.monotonic()
+    r, _ = run(d.on_stat(FakePeer(), {"t": "stat", "obj": "n9-o1", "timeout": 0.05}, b""))
+    assert r["ready"] is False
+    assert _time.monotonic() - started < 2.0
+
+
+def test_hop_budget_clamps_to_the_rpc_timeout():
+    assert _daemon._hop_budget(None) == _daemon._RPC_TIMEOUT
+    assert _daemon._hop_budget(0.0) == _daemon._STAT_HOP_FLOOR  # 0 would never fire
+    assert _daemon._hop_budget(-5.0) == _daemon._STAT_HOP_FLOOR
+    assert _daemon._hop_budget(1e9) == _daemon._RPC_TIMEOUT  # never outlive the RPC cap
+    assert _daemon._hop_budget(2.0) == 2.0
 
 
 def test_on_stat_worker_forwards():
