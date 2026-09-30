@@ -32,6 +32,8 @@ as with real Ray, so beam stays small. Pure Python, no build step, one dependenc
 - [docs/API.md](docs/API.md): the full ray surface implemented, mapped to daemon ops
 - [docs/OPERATIONS.md](docs/OPERATIONS.md): multi-node deploy, NCCL/RoCE, memory, troubleshooting
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): file map, tests, keeping the shim in sync with vLLM
+- [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md): attack surface, trust boundaries, threats, and the controls that exist
+- [SECURITY.md](SECURITY.md): what to check before deploying, supported versions, reporting a vulnerability
 - [test/dgx/README.md](test/dgx/README.md): the two-node DGX Spark harness
 
 ## Deploy into the stock vllm-openai image (no rebuild)
@@ -180,12 +182,18 @@ inference path needs none of these.
 ## Security / trust model
 
 beam's control plane is **unauthenticated**, exactly like Ray's. The head binds
-its TCP port (default 6379) on `0.0.0.0`, and the protocol carries cloudpickled
-payloads that worker daemons unpickle and execute. Anyone who can reach the port
-can run code as the daemon user. **Run it only on a trusted, private network**
-(a cluster subnet / VPC), never exposed to the internet. This is the same
-posture Ray documents for its own 6379. Set `--node-ip` to advertise a specific
-address; keep the port behind your firewall/security group.
+its TCP port (default 6379) on `0.0.0.0` — there is no flag to bind it to a
+single interface, so a firewall is the only control — and the protocol carries
+cloudpickled payloads that worker daemons unpickle and execute. Anyone who can
+reach the port can run code as the daemon user: create actors (pickle payloads
+they choose) on any node, kill anyone else's actors, reserve every GPU, read any
+object, and register as a node with a self-declared address. **Run it only on a
+trusted, private network** (a cluster subnet / VPC), never exposed to the
+internet. This is the same posture Ray documents for its own 6379. Set
+`--node-ip` to advertise a specific address; keep the port behind your
+firewall/security group. [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) has the
+full model with file references; [SECURITY.md](SECURITY.md) has the disclosure
+policy.
 
 ## License
 

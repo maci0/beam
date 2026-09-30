@@ -52,7 +52,9 @@ test/                    end-to-end harnesses (shell)
   run_rocm*.sh           AMD ROCm: single-node + cross-node harnesses
   dgx/                   two-node DGX Spark harness over SSH (see test/dgx/README.md)
 
-docs/                    DESIGN + ARCHITECTURE/PROTOCOL/API/OPERATIONS/DEVELOPMENT + logo.svg
+docs/                    DESIGN + ARCHITECTURE/PROTOCOL/API/OPERATIONS/DEVELOPMENT
+                          + THREAT_MODEL (attack surface, boundaries, controls) + logo.svg
+SECURITY.md              deployment checklist, supported versions, disclosure policy
 ```
 
 ## Running the tests
@@ -125,4 +127,8 @@ To cover a newly-required symbol:
 - Annotations use `from __future__ import annotations` where PEP604 unions appear,
   so the shim imports on Python 3.9+.
 - The daemon never unpickles payloads; only the shim and the actor worker do.
-  Keep it that way: it is what lets the daemon stay agnostic to vLLM's classes.
+  Keeping it that way is what lets the daemon stay agnostic to vLLM's classes.
+  It still *stores and forwards* payloads verbatim (`on_put` keeps them in
+  `self.objects`, `_daemon.py:1258-1264`, and every handler hands the raw payload
+  to the next hop), so the daemon is an unauthenticated relay for attacker-chosen
+  bytes, not a parser of them. See docs/THREAT_MODEL.md.
