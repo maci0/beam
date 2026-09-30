@@ -14,7 +14,15 @@ from . import _proto
 
 
 def _reply(sock: socket.socket, req: dict, payload: bytes = b"", err: str = "") -> None:
-    header = {"t": req["t"] + "_ok", "reqid": req.get("reqid", 0), "resp": True}
+    # `t` comes off the wire and may be any JSON type (int, list, null); coerce
+    # before concatenating so a malformed header cannot raise inside the error
+    # path and kill the worker.
+    t = req.get("t")
+    header = {
+        "t": (t if isinstance(t, str) else "") + "_ok",
+        "reqid": req.get("reqid", 0),
+        "resp": True,
+    }
     if err:
         header["err"] = err
         payload = b""

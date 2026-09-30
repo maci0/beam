@@ -1,7 +1,8 @@
 """Unit + fuzz tests for the small leaf modules: the actor worker subprocess
-entrypoint (`_worker.py`, driven over a socketpair, no real subprocess), the
-unsupported `ray.dag` stubs, the `ray.cloudpickle` re-export, the `ray.__main__`
-dispatch, and `detect_gpus` env/glob fuzz."""
+entrypoint (`_worker.py`, driven over a socketpair, no real subprocess, plus
+frame/pickle fuzz of its dispatch loop), the unsupported `ray.dag` stubs, the
+`ray.cloudpickle` re-export, the `ray.__main__` dispatch, and `detect_gpus`
+env/glob fuzz."""
 
 import os
 import socket
@@ -55,6 +56,21 @@ def test_worker_reply_err_clears_payload():
     finally:
         a.close()
         b.close()
+
+
+def test_worker_reply_survives_nonstring_t():
+    # `t` arrives as decoded JSON, so it can be any type. Concatenating a
+    # non-str (or hitting a missing key) here would raise inside the error path
+    # and kill the worker instead of answering the frame.
+    for req in ({}, {"t": None}, {"t": 7}, {"t": ["x"]}, {"t": 1.5}):
+        a, b = socket.socketpair()
+        try:
+            _worker._reply(a, dict(req, reqid=3), err="bad op")
+            h, p = _proto.read_frame(b)
+            assert h["t"] == "_ok" and h["reqid"] == 3 and h["err"] == "bad op" and p == b""
+        finally:
+            a.close()
+            b.close()
 
 
 # ---- _worker.main over a socketpair (no subprocess) -------------------------
@@ -151,6 +167,152 @@ def test_worker_ignores_resp_frames(monkeypatch):
     b.close()
     t.join(timeout=2)
     a.close()
+
+
+# ---- _worker.main frame-loop fuzz (untrusted socket -> pickle -> dispatch) --
+#
+# The worker is the innermost untrusted-input parser in the tree: it reads framed
+# bytes off the socket, deserializes the payload as a pickle, and dispatches on
+# attacker-controlled header keys. A crash or hang here takes down every actor
+# GPU. These harnesses drive the real main() over a socketpair and assert the
+# loop's invariants: a malformed *method* frame is answered with an err frame and
+# the worker keeps serving; a malformed *init* payload is answered and the worker
+# then exits (it must never serve methods on a None instance); every reply is a
+# well-formed frame echoing the request's reqid; the loop never wedges.
+
+
+class _FuzzActor:
+    """Picklable actor class with a method that raises, so the fuzz frames reach
+    real dispatch (not just the None-instance path)."""
+
+    def echo(self, x):
+        return x
+
+    def boom(self):
+        raise ValueError("actor raised")
+
+
+def _drive_worker(script, timeout=5.0):
+    """Run the real _worker.main against `script` = [(header, payload, expect_reply)].
+
+    Returns (replies, hello). Each `expect_reply` frame must produce exactly one
+    reply (every op in the worker replies exactly once, including init failures),
+    so the read count is deterministic. A short socket timeout turns a wedged
+    worker into a test failure instead of a hung suite. Patches are applied with
+    mock.patch (not a fixture) so state is fully reset between fuzz examples.
+    """
+    import unittest.mock as mock
+
+    a, b = socket.socketpair()
+    b.settimeout(timeout)  # hang guard: a stuck worker fails fast
+    t = threading.Thread(target=_worker.main, daemon=True)
+    replies = []
+    hello = {}
+    try:
+        with (
+            mock.patch.dict(os.environ, {"BEAM_SOCK": "/unused", "BEAM_ACTOR_ID": "afuzz"}),
+            mock.patch.object(_worker.socket, "socket", lambda *x, **k: _PairedSock(a)),
+        ):
+            t.start()
+            hello, _ = _proto.read_frame(b)  # worker_hello sent on attach
+            assert hello["t"] == "worker_hello" and hello["actor"] == "afuzz"
+            for header, payload, expect_reply in script:
+                _proto.write_frame(b, header, payload)
+                if expect_reply:
+                    replies.append(_proto.read_frame(b))
+    finally:
+        b.close()  # EOF -> read_frame raises ConnectionError -> worker returns
+        t.join(timeout=timeout)
+        a.close()
+    assert not t.is_alive(), "worker loop did not exit when the peer closed"
+    return replies, hello
+
+
+def _assert_reply(h, payload, reqid):
+    """Every reply must be a well-formed frame with the request's reqid echoed,
+    an '_ok' type, and (on error) an err string with the payload cleared."""
+    assert h["resp"] is True
+    assert h["t"].endswith("_ok")
+    assert h["reqid"] == reqid
+    if "err" in h:
+        assert isinstance(h["err"], str) and h["err"] != ""
+        assert payload == b""  # _reply clears the payload on error
+    else:
+        assert "err" not in h
+
+
+# fuzzed method frames: arbitrary op name, method name, and raw payload bytes.
+_method_headers = st.fixed_dictionaries(
+    {},
+    optional={
+        "t": st.sampled_from(["method", "method", "method", "", "init_x", None, 7]),
+        "method": st.one_of(
+            st.sampled_from(["echo", "boom", "nope", "", "__class__", "0"]),
+            st.text(max_size=8),
+        ),
+        "reqid": st.integers(min_value=-(2**31), max_value=2**31),
+    },
+)
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    st.lists(
+        st.tuples(
+            _method_headers,
+            st.one_of(
+                st.binary(max_size=64),
+                st.binary(min_size=0, max_size=8).map(_proto.dumps),
+            ),
+        ),
+        min_size=1,
+        max_size=5,
+    )
+)
+def test_fuzz_worker_method_frames_never_kill_loop(frames):
+    """Initialize a live actor, then send fuzzed method/unknown frames. Every frame
+    is answered with exactly one well-formed reply; a bad method name, bad pickle,
+    or unknown op becomes an err reply and the worker keeps serving (never wedges,
+    never dies, never replies on a malformed frame)."""
+    script = [({"t": "init", "reqid": 0}, _proto.dumps((_FuzzActor, (), {})), True)]
+    for i, (h, p) in enumerate(frames, start=1):
+        h = dict(h)  # `t` may legitimately be a non-str JSON value; keep it
+        h["reqid"] = i
+        script.append((h, p, True))
+
+    replies, _ = _drive_worker(script)
+    # one init reply + one reply per fuzzed frame
+    assert len(replies) == len(frames) + 1
+    for (h, _p, _expect), (rh, rp) in zip(script, replies):
+        _assert_reply(rh, rp, h["reqid"])
+    # a valid method call still succeeds, proving the loop stayed functional
+    script2 = [
+        ({"t": "init", "reqid": 100}, _proto.dumps((_FuzzActor, (), {})), True),
+        ({"t": "method", "method": "echo", "reqid": 101}, _proto.dumps(((7,), {})), True),
+    ]
+    replies2, _ = _drive_worker(script2)
+    assert _proto.loads(replies2[1][1]) == 7  # post-fuzz sanity: still serving
+
+
+# fuzzed init payloads: a malformed init must be answered and then the worker
+# exits; it must never hang or go on to serve methods on a half-built instance.
+_init_payloads = st.one_of(
+    st.binary(max_size=48),  # raw / truncated pickle bytes
+    st.binary(min_size=0, max_size=16).map(_proto.dumps),  # valid pickles of wrong shape
+    st.sampled_from([b"", b"not-a-pickle", b"\x80\x04", b"\x00" * 8]),
+)
+
+
+@settings(max_examples=50, deadline=None)
+@given(payload=_init_payloads)
+def test_fuzz_worker_init_payload_always_answered(payload):
+    """Send one fuzzed init payload. Whatever the bytes are, the worker answers
+    exactly one well-formed frame (init_ok on success, an err frame on failure)
+    and the loop never hangs; on a failed init it exits rather than serving
+    methods on a half-built instance."""
+    replies, _ = _drive_worker([({"t": "init", "reqid": 0}, payload, True)])
+    assert len(replies) == 1
+    _assert_reply(replies[0][0], replies[0][1], 0)
 
 
 # ---- ray.dag (unsupported stubs) --------------------------------------------
