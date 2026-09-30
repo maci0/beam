@@ -4,6 +4,7 @@ daemon, no sockets, no GPUs."""
 
 import os
 import sys
+import time as _time
 
 import pytest
 from hypothesis import given
@@ -111,6 +112,80 @@ def test_wait_timeout_returns_partial(monkeypatch):
     use(monkeypatch, FakeClient({"stat": {"ready": False}}))
     ready, not_ready = ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=0)
     assert ready == [] and len(not_ready) == 1
+
+
+# ---- deadlines run on the monotonic clock ----
+class SteppingClock:
+    """Stands in for the `time` module with a wall clock that jumps forward or
+    backward mid-wait, exactly as an NTP step, a manual clock change, a
+    leap-second smear, or a host suspend does. The monotonic clock is real, so
+    any deadline built on `time.time()` is wrong here and one built on
+    `time.monotonic()` is not."""
+
+    def __init__(self, step_at_call, delta):
+        self.step_at_call = step_at_call
+        self.delta = delta
+        self.calls = 0
+
+    def time(self):
+        return _time.time() + (self.delta if self.calls >= self.step_at_call else 0.0)
+
+    def monotonic(self):
+        return _time.monotonic()
+
+    def sleep(self, seconds):
+        _time.sleep(seconds)
+
+
+@pytest.fixture
+def stepping_clock(monkeypatch):
+    def install(step_at_call, delta):
+        clock = SteppingClock(step_at_call, delta)
+        monkeypatch.setattr(ray, "time", clock)
+        return clock
+
+    return install
+
+
+def test_wait_survives_forward_clock_step(stepping_clock, monkeypatch):
+    """A +1h step mid-wait must not retire the caller's 0.2s timeout early."""
+    clock = stepping_clock(1, +3600.0)  # step after the first stat poll
+
+    class NeverReady:
+        def request(self, header, payload=b""):
+            clock.calls += 1
+            return {"t": "stat_ok", "ready": False}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: NeverReady())
+    started = _time.monotonic()
+    ready, not_ready = ray.wait([ray.ObjectRef("a")], num_returns=1, timeout=0.2)
+    elapsed = _time.monotonic() - started
+    assert ready == [] and not_ready == [ray.ObjectRef("a")]
+    assert elapsed >= 0.15, "wait gave up after %.3fs: the clock step ended the wait" % elapsed
+
+
+def test_get_per_ref_timeout_ignores_backward_clock_step(stepping_clock, monkeypatch):
+    """A -1h step must not inflate the per-ref timeout past the caller's budget."""
+    clock = stepping_clock(1, -3600.0)  # step between the first and second get
+
+    seen = []
+
+    class Recorder:
+        def request(self, header, payload=b""):
+            clock.calls += 1
+            seen.append(header.get("timeout"))
+            return {"t": "get_ok"}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: Recorder())
+    ray.get([ray.ObjectRef("a"), ray.ObjectRef("b")], timeout=1.0)
+    assert len(seen) == 2 and all(t is not None and t <= 1.0 for t in seen), seen
+
+
+def test_remaining_never_negative():
+    assert ray._remaining(None) is None  # no deadline: no remaining budget
+    assert ray._deadline(None) is None
+    assert ray._remaining(ray._deadline(5.0)) == pytest.approx(5.0, abs=0.5)
+    assert ray._remaining(_time.monotonic() - 1.0) == 0.0  # expired, clamped
 
 
 # ---- remote / options ----

@@ -68,6 +68,23 @@ def _need() -> DaemonClient:
 # ray.wait has no push notification; poll the daemon at this interval.
 _WAIT_POLL_INTERVAL = 0.005
 
+# Timeouts are elapsed-time budgets, so they are measured on the monotonic
+# clock: time.time() moves under an NTP step, a manual clock change, a
+# leap-second smear, or a host suspend, which would make a deadline jump
+# (an hour of the caller's wait skipped) or never arrive (a hang past the
+# timeout). time.monotonic() is unaffected by those and never goes backwards.
+
+
+def _deadline(timeout: float | None) -> float | None:
+    """Deadline on the monotonic clock, or None for "wait forever"."""
+    return None if timeout is None else time.monotonic() + timeout
+
+
+def _remaining(deadline: float | None) -> float | None:
+    """Seconds left before `deadline`, clamped at 0. None means no deadline."""
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
 # ---- object refs ----
 
 
@@ -100,15 +117,16 @@ def get(refs: ObjectRef | Iterable[ObjectRef], timeout: float | None = None) -> 
 
     single = isinstance(refs, ObjectRef)
     items: list[ObjectRef] = [refs] if isinstance(refs, ObjectRef) else list(refs)
-    deadline = None if timeout is None else time.time() + timeout
+    deadline = _deadline(timeout)  # one global deadline, monotonic
     out = []
     for ref in items:
         if ref._has_value:
             out.append(ref._value)
             continue
         req: dict[str, Any] = {"t": "get", "obj": ref.id}
-        if deadline is not None:
-            req["timeout"] = max(0.0, deadline - time.time())  # one global deadline
+        left = _remaining(deadline)
+        if left is not None:
+            req["timeout"] = left
         try:
             _, body = _need().request(req)
         except RuntimeError as e:
@@ -128,7 +146,7 @@ def wait(
 ) -> tuple[list[ObjectRef], list[ObjectRef]]:
     refs = list(refs)
     num_returns = min(num_returns, len(refs))  # never block waiting for more than exist
-    deadline = None if timeout is None else time.time() + timeout
+    deadline = _deadline(timeout)
     while True:
         ready: list[ObjectRef] = []
         not_ready: list[ObjectRef] = []
@@ -138,7 +156,7 @@ def wait(
                 continue
             resp, _ = _need().request({"t": "stat", "obj": ref.id})
             (ready if resp.get("ready") else not_ready).append(ref)
-        if len(ready) >= num_returns or (deadline and time.time() >= deadline):
+        if len(ready) >= num_returns or (deadline and time.monotonic() >= deadline):
             return ready, not_ready
         time.sleep(_WAIT_POLL_INTERVAL)
 
