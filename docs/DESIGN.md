@@ -49,8 +49,10 @@ CLI:
 
     ray start --head [--port 6379] [--num-gpus N]
     ray start --address HOST:PORT [--num-gpus N]
-    ray status
+    ray status      # exit 1 if any node is DOWN
     ray stop
+    ray bootstrap   # install the ray/beam launcher (auto inside a container)
+    ray --help      # stdout, exit 0;  exit 2 on usage errors
 
 Python `import ray`:
 

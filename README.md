@@ -90,6 +90,11 @@ control-plane test, vllm-test) and is verified end-to-end on real GB10 nodes. Se
     uv pip install ./python       # provides `import ray` and the `ray` command
     ray start --head --port 6379          # head, blocks
     ray start --address <HEAD_IP>:6379    # each worker
+    ray status                            # nodes/GPUs; exit 1 if any node is DOWN
+    ray stop                              # stop the local daemon, clean its runtime files
+
+`ray --help` (and `--help` on any command) exits 0 and prints to stdout; exit 1
+means a runtime error (no daemon, node down), exit 2 a usage error.
 
 ## Verify without GPUs
 
@@ -169,7 +174,7 @@ bump as a CI gate:
 | `BEAM_NUM_GPUS`    | override detected GPU count |
 | `BEAM_NODE_IP`     | advertise this address (else `VLLM_HOST_IP`, else default-route IP) |
 | `BEAM_RUNTIME_DIR` | daemon state dir (default `~/.beam`) |
-| `BEAM_SOCK`        | daemon unix socket (else read from the runtime dir) |
+| `BEAM_SOCK`        | actor/worker daemon socket (the CLI reads it from the runtime dir) |
 | `BEAM_WORKER_CMD`  | how to launch a python actor (default `python3 -m ray._worker`) |
 | `BEAM_BOOTSTRAP`   | force the bootstrap that normally runs only inside a container |
 

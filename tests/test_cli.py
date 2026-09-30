@@ -80,9 +80,18 @@ def test_local_ip_falls_back_to_vllm_host_ip(monkeypatch):
 # ---- _usage / main ----------------------------------------------------------
 
 
-def test_usage_returns_2(capsys):
-    assert _cli._usage() == 2
-    assert "drop-in subset of ray" in capsys.readouterr().err
+def test_usage_help_goes_to_stdout_and_exits_0(capsys):
+    """`--help` is a successful request: stdout, exit 0 (git/docker/kubectl)."""
+    assert _cli._usage(0) == 0
+    out = capsys.readouterr()
+    assert "drop-in subset of ray" in out.out and out.err == ""
+
+
+def test_usage_error_goes_to_stderr_and_exits_2(capsys):
+    """Bad usage is an error: stderr, exit 2."""
+    assert _cli._usage(2) == 2
+    out = capsys.readouterr()
+    assert "drop-in subset of ray" in out.err and out.out == ""
 
 
 def test_main_no_args_is_usage():
@@ -90,13 +99,59 @@ def test_main_no_args_is_usage():
 
 
 def test_main_help():
-    assert _cli.main(["--help"]) == 2
-    assert _cli.main(["help"]) == 2
+    assert _cli.main(["--help"]) == 0
+    assert _cli.main(["-h"]) == 0
+    assert _cli.main(["help"]) == 0
+
+
+def test_main_version(capsys):
+    """--version prints to stdout and exits 0, like every well-behaved CLI."""
+    from ray import __version__
+
+    assert _cli.main(["--version"]) == 0
+    assert _cli.main(["-V"]) == 0
+    assert __version__ in capsys.readouterr().out
 
 
 def test_main_unknown_command(capsys):
     assert _cli.main(["frobnicate"]) == 2
     assert "unknown command" in capsys.readouterr().err
+
+
+def test_main_unknown_command_suggests(capsys):
+    """A near miss names a real command instead of just rejecting it."""
+    assert _cli.main(["stat"]) == 2
+    err = capsys.readouterr().err
+    assert "did you mean" in err and ("'start'" in err or "'status'" in err)
+
+
+def test_main_unknown_command_no_suggestion_when_distant(capsys):
+    """A totally unrelated word gets no misleading suggestion."""
+    assert _cli.main(["zzzzqqq"]) == 2
+    assert "did you mean" not in capsys.readouterr().err
+
+
+def test_status_rejects_stray_args(capsys):
+    """`status` has no options; a stray flag must not be silently ignored."""
+    assert _cli.main(["status", "--json"]) == 2
+    assert "unexpected argument" in capsys.readouterr().err
+
+
+def test_stop_rejects_stray_args(capsys):
+    assert _cli.main(["stop", "--force"]) == 2
+    assert "unexpected argument" in capsys.readouterr().err
+
+
+def test_status_stop_bootstrap_help_exit_0(capsys):
+    """Every command answers --help on stdout with 0, not a usage error."""
+    for cmd in ("status", "stop", "bootstrap"):
+        assert _cli.main([cmd, "--help"]) == 0
+        assert "drop-in subset of ray" in capsys.readouterr().out
+
+
+def test_bootstrap_rejects_stray_args(capsys):
+    assert _cli.main(["bootstrap", "--yes"]) == 2
+    assert "unexpected argument" in capsys.readouterr().err
 
 
 def test_main_bootstrap_dispatch(monkeypatch):
@@ -168,6 +223,67 @@ def test_start_node_ip_equals_form(monkeypatch):
     assert captured["node_ip"] == "4.4.4.4"
 
 
+# ---- process-level contract (real `python -m ray`, exit code + stream) -------
+
+_PY_DIR = os.path.join(os.path.dirname(__file__), "..", "python")
+
+
+def _run_ray(*args):
+    """Run `python -m ray` as a real process; return (rc, stdout, stderr)."""
+    import subprocess
+
+    env = dict(os.environ, PYTHONPATH=_PY_DIR, BEAM_RUNTIME_DIR="/nonexistent-beam-cli-test")
+    p = subprocess.run(
+        [sys.executable, "-m", "ray", *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    return p.returncode, p.stdout, p.stderr
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h", "help"])
+def test_process_help_is_stdout_exit_0(flag):
+    """`ray --help` must be pipeable: text on stdout, nothing on stderr, exit 0."""
+    rc, out, err = _run_ray(flag)
+    assert rc == 0
+    assert "usage:" in out and "ray start --head" in out
+    assert err == ""
+
+
+@pytest.mark.parametrize("cmd", ["start", "status", "stop", "bootstrap"])
+def test_process_subcommand_help_exit_0(cmd):
+    rc, out, err = _run_ray(cmd, "--help")
+    assert rc == 0, (out, err)
+    assert "usage:" in out and err == ""
+
+
+def test_process_version_stdout_exit_0():
+    from ray import __version__
+
+    rc, out, err = _run_ray("--version")
+    assert rc == 0 and __version__ in out and err == ""
+
+
+def test_process_no_args_is_usage_error_on_stderr():
+    """No args = missing command: stderr, exit 2, and stdout stays clean for pipes."""
+    rc, out, err = _run_ray()
+    assert rc == 2 and out == "" and "usage:" in err
+
+
+def test_process_unknown_command_exit_2_stderr():
+    rc, out, err = _run_ray("frobnicate")
+    assert rc == 2 and out == "" and "unknown command" in err
+
+
+def test_process_start_bad_flag_value_exit_2_not_crash():
+    """A bad flag value exits 2 cleanly (no traceback), with the flag named."""
+    rc, out, err = _run_ray("start", "--head", "--port", "notaport")
+    assert rc == 2 and out == "" and "--port expects an integer" in err
+    assert "Traceback" not in err
+
+
 # ---- _start arg parsing -----------------------------------------------------
 
 
@@ -176,16 +292,14 @@ def test_start_needs_head_or_address(capsys):
     assert "need --head or --address" in capsys.readouterr().err
 
 
-def test_start_bad_port_exits_2():
-    with pytest.raises(SystemExit) as e:
-        _cli._start(["--head", "--port", "notaport"])
-    assert e.value.code == 2
+def test_start_bad_port_exits_2(capsys):
+    """A bad value returns 2 like every other error path (no SystemExit)."""
+    assert _cli._start(["--head", "--port", "notaport"]) == 2
+    assert "--port expects an integer" in capsys.readouterr().err
 
 
 def test_start_port_missing_value_exits_2(capsys):
-    with pytest.raises(SystemExit) as e:
-        _cli._start(["--head", "--port"])
-    assert e.value.code == 2
+    assert _cli._start(["--head", "--port"]) == 2
     assert "--port expects a value" in capsys.readouterr().err
 
 
@@ -199,10 +313,9 @@ def test_start_negative_num_gpus(capsys):
     assert "must be >= 0" in capsys.readouterr().err
 
 
-def test_start_bad_num_gpus_value():
-    with pytest.raises(SystemExit) as e:
-        _cli._start(["--head", "--num-gpus", "x"])
-    assert e.value.code == 2
+def test_start_bad_num_gpus_value(capsys):
+    assert _cli._start(["--head", "--num-gpus", "x"]) == 2
+    assert "--num-gpus expects an integer" in capsys.readouterr().err
 
 
 def test_start_bad_address_port(capsys):
@@ -210,8 +323,14 @@ def test_start_bad_address_port(capsys):
     assert "port must be numeric" in capsys.readouterr().err
 
 
-def test_start_help_returns_usage():
-    assert _cli._start(["--help"]) == 2
+def test_start_help_returns_usage(capsys):
+    assert _cli._start(["--help"]) == 0
+    assert "drop-in subset of ray" in capsys.readouterr().out
+
+
+def test_start_unknown_flag_suggests(capsys):
+    assert _cli._start(["--head", "--prot", "1"]) == 2
+    assert "did you mean '--port'" in capsys.readouterr().err
 
 
 def test_start_dispatches_to_run_daemon(monkeypatch):

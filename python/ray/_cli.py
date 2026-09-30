@@ -7,6 +7,7 @@ Everything is Python now; there is no separate binary.
 from __future__ import annotations  # keep `X | None` valid on py3.9
 
 import asyncio
+import difflib
 import json
 import os
 import signal
@@ -14,7 +15,7 @@ import socket
 import struct
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from . import _daemon
 
@@ -55,43 +56,98 @@ def _local_ip() -> str:
         s.close()
 
 
+_COMMANDS = ("start", "status", "stop", "bootstrap")
+_HELP_FLAGS = ("-h", "--help", "help")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
-        return _usage()
+        return _usage(2)
     cmd, rest = argv[0], argv[1:]
+    if cmd in _HELP_FLAGS:
+        return _usage(0)
+    if cmd in ("-V", "--version"):
+        from . import __version__
+
+        print("ray (beam) %s" % __version__)
+        return 0
     if cmd == "start":
         return _start(rest)
     if cmd == "status":
-        return _status()
+        return _no_args("status", _status, rest)
     if cmd == "stop":
-        return _stop()
+        return _no_args("stop", _stop, rest)
     if cmd == "bootstrap":
-        bootstrap_env()
-        return 0
-    if cmd in ("-h", "--help", "help"):
-        return _usage()
-    sys.stderr.write("beam: unknown command %r\n" % cmd)
-    return _usage()
+        return _no_args("bootstrap", _bootstrap, rest)
+    sys.stderr.write("beam: unknown command %r%s\n" % (cmd, _suggest(cmd, _COMMANDS)))
+    return _usage(2)
 
 
-def _usage() -> int:
-    sys.stderr.write(
+def _bootstrap() -> int:
+    bootstrap_env()
+    return 0
+
+
+def _suggest(word: str, options: Sequence[str]) -> str:
+    """`; did you mean 'x'?` for a near miss, '' when nothing is close."""
+    close = difflib.get_close_matches(word, options, n=1)
+    return "; did you mean '%s'?" % close[0] if close else ""
+
+
+def _no_args(cmd: str, run: Callable[[], int], args: list[str]) -> int:
+    """Run a command that takes no options, or explain why the args were rejected.
+
+    Stray args used to be discarded, so `ray stop --force` looked like it had
+    forced something when it had done nothing.
+    """
+    for a in args:
+        if a in _HELP_FLAGS:
+            return _usage(0)
+    if args:
+        sys.stderr.write("beam %s: unexpected argument %r\n" % (cmd, args[0]))
+        return 2
+    return run()
+
+
+def _usage(code: int) -> int:
+    """Print usage. 0 -> stdout (explicit `--help`), 2 -> stderr (bad usage)."""
+    text = (
         "beam: a drop-in subset of ray for vLLM distributed inference\n\n"
         "usage:\n"
         "  ray start --head [--port 6379] [--num-gpus N] [--node-ip IP]   start head (blocks)\n"
         "  ray start --address HOST:PORT [--num-gpus N]                   join cluster (blocks)\n"
         "  ray status                                  show cluster nodes/GPUs (exit 1 if any down)\n"
-        "  ray stop                                    stop the local daemon, clean its runtime files\n\n"
+        "  ray stop                                    stop the local daemon, clean its runtime files\n"
+        "  ray bootstrap                              install the ray/beam launcher + beam.pth\n"
+        "  ray --version                               print the version and exit\n\n"
+        "flags:\n"
+        "  -h, --help                 show this help (same for every command)\n"
+        "      --block                accepted for ray compatibility; start always blocks\n\n"
+        "exit codes:\n"
+        "  0  success (--help, --version, clean start/stop)\n"
+        "  1  runtime error: daemon not running/unreachable, a node is down, stop refused\n"
+        "  2  usage error: unknown command/flag, bad or missing flag value\n\n"
         "environment:\n"
         "  BEAM_NUM_GPUS     override detected GPU count (set on boxes without /dev/nvidia*)\n"
         "  BEAM_NODE_IP      advertise this address (else VLLM_HOST_IP, else default-route IP)\n"
         "  BEAM_RUNTIME_DIR  daemon state dir (default ~/.beam)\n"
-        "  BEAM_SOCK         daemon unix socket (else read from the runtime dir)\n"
+        "  BEAM_SOCK         actor/worker daemon socket (the CLI reads it from the runtime dir)\n"
         "  BEAM_WORKER_CMD   how to launch an actor (default 'python3 -m ray._worker')\n"
         "  BEAM_BOOTSTRAP    force bootstrap outside a container (auto inside one)\n"
     )
-    return 2
+    if code:
+        sys.stderr.write(text)
+    else:
+        sys.stdout.write(text)
+    return code
+
+
+_START_FLAGS = ("--head", "--block", "--port", "--address", "--num-gpus", "--node-ip")
+
+
+class _UsageError(Exception):
+    """A bad or missing flag value; `_start` prints it and exits 2."""
 
 
 def _start(args: list[str]) -> int:
@@ -105,8 +161,8 @@ def _start(args: list[str]) -> int:
     def grab(name: str) -> str:
         nonlocal i
         if i + 1 >= len(args):
-            sys.stderr.write("beam: %s expects a value\n" % name)
-            sys.exit(2)
+            sys.stderr.write("beam start: %s expects a value\n" % name)
+            raise _UsageError
         i += 1
         return args[i]
 
@@ -114,60 +170,65 @@ def _start(args: list[str]) -> int:
         try:
             return int(val)
         except ValueError:
-            sys.stderr.write("beam: %s expects an integer, got %r\n" % (name, val))
-            sys.exit(2)
+            sys.stderr.write("beam start: %s expects an integer, got %r\n" % (name, val))
+            raise _UsageError from None
 
-    while i < len(args):
-        a = args[i]
-        if a == "--head":
-            head = True
-        elif a == "--block":
-            pass  # always blocks; accepted for compatibility
-        elif a == "--port":
-            port = as_int(grab("--port"), "--port")
-        elif a.startswith("--port="):
-            port = as_int(a.split("=", 1)[1], "--port")
-        elif a == "--address":
-            address = grab("--address")
-        elif a.startswith("--address="):
-            address = a.split("=", 1)[1]
-        elif a == "--num-gpus":
-            num_gpus = as_int(grab("--num-gpus"), "--num-gpus")
-        elif a.startswith("--num-gpus="):
-            num_gpus = as_int(a.split("=", 1)[1], "--num-gpus")
-        elif a == "--node-ip":
-            node_ip = grab("--node-ip")
-        elif a.startswith("--node-ip="):
-            node_ip = a.split("=", 1)[1]
-        elif a in ("-h", "--help"):
-            return _usage()
-        else:
-            sys.stderr.write("beam: unknown flag %r\n" % a)
-            return 2
-        i += 1
+    try:
+        while i < len(args):
+            a = args[i]
+            if a == "--head":
+                head = True
+            elif a == "--block":
+                pass  # always blocks; accepted for compatibility
+            elif a == "--port":
+                port = as_int(grab("--port"), "--port")
+            elif a.startswith("--port="):
+                port = as_int(a.split("=", 1)[1], "--port")
+            elif a == "--address":
+                address = grab("--address")
+            elif a.startswith("--address="):
+                address = a.split("=", 1)[1]
+            elif a == "--num-gpus":
+                num_gpus = as_int(grab("--num-gpus"), "--num-gpus")
+            elif a.startswith("--num-gpus="):
+                num_gpus = as_int(a.split("=", 1)[1], "--num-gpus")
+            elif a == "--node-ip":
+                node_ip = grab("--node-ip")
+            elif a.startswith("--node-ip="):
+                node_ip = a.split("=", 1)[1]
+            elif a in ("-h", "--help"):
+                return _usage(0)
+            else:
+                sys.stderr.write("beam start: unknown flag %r%s\n" % (a, _suggest(a, _START_FLAGS)))
+                return 2
+            i += 1
+    except _UsageError:
+        return 2
     if not head and not address:
         sys.stderr.write("beam start: need --head or --address HOST:PORT\n")
         return 2
     if address:
         _, _, ap = address.partition(":")
         if ap and not ap.isdigit():
-            sys.stderr.write("beam: --address port must be numeric, got %r\n" % ap)
+            sys.stderr.write("beam start: --address port must be numeric, got %r\n" % ap)
             return 2
     if num_gpus is not None and num_gpus < 0:
-        sys.stderr.write("beam: --num-gpus must be >= 0, got %d\n" % num_gpus)
+        sys.stderr.write("beam start: --num-gpus must be >= 0, got %d\n" % num_gpus)
         return 2
 
     # Refuse to steal a live daemon's unix socket / runtime dir.
     live = _live_daemon_pid()
     if live is not None:
-        sys.stderr.write("beam: daemon already running (pid %d). Run 'ray stop' first.\n" % live)
+        sys.stderr.write(
+            "beam start: daemon already running (pid %d). Run 'ray stop' first.\n" % live
+        )
         return 1
 
     maybe_bootstrap()
     gpus = _daemon.detect_gpus(num_gpus)
     if gpus == 0 and num_gpus is None and not os.environ.get("BEAM_NUM_GPUS"):
         sys.stderr.write(
-            "beam: detected 0 GPUs (no /dev/nvidia*). If this node has GPUs, set "
+            "beam start: detected 0 GPUs (no /dev/nvidia*). If this node has GPUs, set "
             "--num-gpus N or BEAM_NUM_GPUS (e.g. GB10/ROCm device nodes differ).\n"
         )
     node_id = _daemon.new_node_id()
