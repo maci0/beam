@@ -1,6 +1,13 @@
 # Repo-root dev tooling config (the installable package lives in python/).
 # No [project] table here on purpose: this file only configures lint/format/type.
 
+# uv workspace: `uv run` at the root then resolves and installs the shim itself
+# (python/) from python/pyproject.toml. Without it uv finds no project at the
+# root, keeps the lock empty, defaults it to requires-python ">=3.13", and
+# warns "No requires-python value found in the workspace" on every command.
+[tool.uv.workspace]
+members = ["python"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"

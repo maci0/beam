@@ -59,8 +59,19 @@ SECURITY.md              deployment checklist, supported versions, disclosure po
 
 ## Running the tests
 
-Unit + fuzz suite (pytest + hypothesis, no GPUs/torch; 100% coverage of
-`python/ray`, gated in CI):
+Everything below is a `make` target wrapping the exact command CI runs; `make`
+on its own lists them. The only prerequisites are [`uv`](https://docs.astral.sh/uv/)
+and `shellcheck`; no venv setup, no global installs, no GPU.
+
+```
+make check        # everything CI checks: lint, types, shell, unit+fuzz, import, e2e
+make test         # unit + fuzz suite only (~10s, no GPUs)
+make test-one T=tests/test_cli.py::test_start_needs_head_or_address
+make e2e          # the four local control-plane harnesses
+```
+
+Under the hood `make test` is (pytest + hypothesis, no GPUs/torch; 100%
+coverage of `python/ray`, gated in CI):
 
 ```
 uv run --with pytest --with hypothesis --with pytest-cov --with cloudpickle \
@@ -68,13 +79,21 @@ uv run --with pytest --with hypothesis --with pytest-cov --with cloudpickle \
 ```
 
 End-to-end control-plane harnesses (fake GPUs via `BEAM_NUM_GPUS`, need only
-`uv` + cloudpickle):
+`uv` + cloudpickle), also runnable one at a time:
 
 ```
 bash test/run_e2e.sh          # single-node control plane
 bash test/run_multinode.sh    # cross-node routing through the hub
 bash test/run_edge.sh         # error propagation, wait, parallelism, leak-fix, …
+bash test/run_driver_on_worker.sh  # driver on a worker, head is pure control plane
 ```
+
+They keep the daemon runtime dir under `$TMPDIR` (via `test/lib.sh`), not in
+the checkout: the control socket is an AF_UNIX socket, so its path is capped at
+107 bytes and a deep checkout would otherwise fail with a bare
+`AF_UNIX path too long`. `ray start` now refuses a `BEAM_RUNTIME_DIR` that
+overruns that budget and says so, so the same mistake on your own node is a
+one-line error instead of a stack trace.
 
 Real multi-node: `test/run_cpu_cluster.sh` (N CPU machines), or edit
 `test/dgx/config.sh` and run `./test/dgx/dgx.sh all` (two GPU nodes). See the
@@ -83,13 +102,15 @@ Real multi-node: `test/run_cpu_cluster.sh` (N CPU machines), or edit
 ## Lint, format, types
 
 Configured in the repo-root `pyproject.toml`; CI's `lint` job runs all of these
-(see `.github/workflows/ci.yml`):
+(see `.github/workflows/ci.yml`), and `make lint`, `make types`, `make shell`
+run the same commands:
 
 ```
-uvx ruff check python examples scripts tests
-uvx black --check python examples scripts tests
-uvx --with cloudpickle mypy --config-file pyproject.toml python/ray
-shellcheck -x test/*.sh test/dgx/*.sh
+make lint    # uvx ruff check python examples scripts tests
+             # uvx black --check python examples scripts tests
+make types   # uvx --with cloudpickle mypy --config-file pyproject.toml python/ray
+make shell   # shellcheck -x test/*.sh test/dgx/*.sh
+make format  # black, in place
 ```
 
 ruff/black use line-length 100. The library (`python/ray`) is **fully typed**:

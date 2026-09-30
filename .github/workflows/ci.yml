@@ -11,14 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
-      - name: ruff
-        run: uvx ruff check python examples scripts tests
-      - name: black
-        run: uvx black --check python examples scripts tests
+      - name: ruff + black
+        run: make lint
       - name: mypy
-        run: uvx --with cloudpickle mypy --config-file pyproject.toml python/ray
+        run: make types
       - name: shellcheck
-        run: shellcheck -x test/*.sh test/dgx/*.sh
+        run: make shell
 
   test:
     runs-on: ubuntu-latest
@@ -30,22 +28,13 @@ jobs:
         run: python3 -m py_compile python/ray/*.py python/ray/**/*.py
 
       - name: Unit + fuzz tests (100% coverage gate)
-        run: uv run --with pytest --with hypothesis --with pytest-cov --with cloudpickle pytest tests/ -q --cov=ray --cov-report=term-missing --cov-fail-under=100
+        run: make test
 
       - name: Import surface
-        run: PYTHONPATH=python uv run --with cloudpickle python examples/import_check.py
+        run: make import
 
-      - name: Single-node control plane (e2e)
-        run: bash test/run_e2e.sh
-
-      - name: Cross-node routing (multinode)
-        run: bash test/run_multinode.sh
-
-      - name: Edge cases
-        run: bash test/run_edge.sh
-
-      - name: Driver on a worker node
-        run: bash test/run_driver_on_worker.sh
+      - name: Control-plane harnesses (e2e)
+        run: make e2e
 
   vllm-surface:
     # Informational: checks the shim still covers vLLM main. Allowed to fail so a

@@ -1203,6 +1203,7 @@ class Daemon:
                 fut = self.pending_workers.pop(actor_id, None)
                 if fut is not None and not fut.done():
                     fut.set_exception(RuntimeError("actor killed during create"))
+                still_alive = False
                 try:
                     if wpeer is not None:
                         wpeer.on_close = None
@@ -1221,10 +1222,15 @@ class Daemon:
                                 self.gpu_used[g] = False
                     else:
                         # Still alive: restore hosting + routing so still tracked.
+                        # Flagged here and returned after the finally: a `return`
+                        # inside finally swallows any in-flight exception, and is a
+                        # SyntaxError from CPython 3.14 on.
                         self._hosting[actor_id] = (proc, wpeer, list(gpus))
                         if self.is_head:
                             self.actor_loc[actor_id] = self.node_id
-                        return {"err": "actor %s process still alive after kill" % actor_id}, b""
+                        still_alive = True
+                if still_alive:
+                    return {"err": "actor %s process still alive after kill" % actor_id}, b""
                 return {"t": "kill_ok"}, b""
             if not self.is_head:
                 # Kill from head for an unknown local id: tombstone so a create
@@ -1241,6 +1247,7 @@ class Daemon:
             # explicit kill: do not also fire actor_gone via peer.on_close
             # (head already owns the routing update for remote kills).
             ap.peer.on_close = None
+            still_alive = False
             try:
                 await ap.peer.close()  # closing the socket makes the worker exit
             except Exception:
@@ -1260,7 +1267,9 @@ class Daemon:
                     self.actors[actor_id] = ap
                     if self.is_head:
                         self.actor_loc[actor_id] = self.node_id
-                    return {"err": "actor %s process still alive after kill" % actor_id}, b""
+                    still_alive = True
+            if still_alive:
+                return {"err": "actor %s process still alive after kill" % actor_id}, b""
         # Driver-on-worker ray.kill: head still has actor_loc until told.
         if not self.is_head:
             try:

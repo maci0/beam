@@ -8,10 +8,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=test/lib.sh
+. "$ROOT/test/lib.sh"
 source "$ROOT/test/dgx/config.sh"
 SSH="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 THIS_IP=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K\S+')
 RUN="$ROOT/.cpuhead-run"; rm -rf "$RUN"; mkdir -p "$RUN"
+RT="$(beam_runtime_dir cpuhead)"   # short: AF_UNIX caps the socket path
 
 # head daemon on this host (Python pinned to the workers' 3.12; it only routes,
 # but ray.init in the shim must import cleanly)
@@ -23,7 +26,7 @@ cleanup() {
   kill "${HEAD_PID:-}" 2>/dev/null || true
   $SSH "$SSH_USER@$HEAD_IP"   "docker rm -f beam-w1 2>/dev/null" >/dev/null 2>&1 || true
   $SSH "$SSH_USER@$WORKER_IP" "docker rm -f beam-w2 2>/dev/null" >/dev/null 2>&1 || true
-  rm -rf "$RUN"
+  rm -rf "$RUN" "$RT"
 }
 trap cleanup EXIT
 
@@ -31,10 +34,10 @@ echo "=== deploy beam to sparks ==="
 bash "$ROOT/test/dgx/dgx.sh" deploy >/dev/null
 
 echo "=== beam head on this host ($THIS_IP), CPU only, no vLLM ==="
-BEAM_RUNTIME_DIR="$RUN" PYTHONPATH="$ROOT/python" BEAM_NUM_GPUS=0 \
+BEAM_RUNTIME_DIR="$RT" PYTHONPATH="$ROOT/python" BEAM_NUM_GPUS=0 \
   "$VENVPY" -m ray start --head --port "$HEAD_PORT" &
 HEAD_PID=$!
-for _ in $(seq 1 50); do [ -S "$RUN/daemon.sock" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -S "$RT/daemon.sock" ] && break; sleep 0.1; done
 
 wr="--network host --gpus all --ipc host --shm-size 10g ${RDMA_ARGS:-} \
   -v $REMOTE_DIR:/opt/beam:ro -e PYTHONPATH=/opt/beam/python -e BEAM_NUM_GPUS=1 \
@@ -44,10 +47,10 @@ $SSH "$SSH_USER@$HEAD_IP"   "docker rm -f beam-w1 2>/dev/null; docker run -d --n
 $SSH "$SSH_USER@$WORKER_IP" "docker rm -f beam-w2 2>/dev/null; docker run -d --name beam-w2 $wr $IMAGE -m ray start --address $THIS_IP:$HEAD_PORT --block" >/dev/null
 
 for _ in $(seq 1 60); do
-  BEAM_RUNTIME_DIR="$RUN" PYTHONPATH="$ROOT/python" "$VENVPY" -m ray status 2>/dev/null | grep -q "3 nodes" && break; sleep 0.5
+  BEAM_RUNTIME_DIR="$RT" PYTHONPATH="$ROOT/python" "$VENVPY" -m ray status 2>/dev/null | grep -q "3 nodes" && break; sleep 0.5
 done
 echo "=== ray status (head has 0 GPUs) ==="
-BEAM_RUNTIME_DIR="$RUN" PYTHONPATH="$ROOT/python" "$VENVPY" -m ray status
+BEAM_RUNTIME_DIR="$RT" PYTHONPATH="$ROOT/python" "$VENVPY" -m ray status
 
 echo "=== vLLM engine on spark1 (a GPU worker), TP=2, driver routes via the CPU head ==="
 $SSH "$SSH_USER@$HEAD_IP" "docker exec -d beam-w1 bash -lc \"vllm serve $MODEL \

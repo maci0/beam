@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/maci0/beam/actions/workflows/ci.yml"><img src="https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="coverage">
-  <img src="https://img.shields.io/badge/tests-512-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-518-brightgreen" alt="tests">
   <img src="https://img.shields.io/badge/mypy-strict-blue" alt="mypy strict">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="python 3.9+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license AGPL-3.0"></a>
@@ -21,11 +21,12 @@ The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactl
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
 ([vLLM parallelism & scaling](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/).)
 
-**3,331 lines, 126 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
+**3,388 lines, 128 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
 (see [docs/DESIGN.md](docs/DESIGN.md#size-vs-ray)).
 
 ## Documentation
 
+- [CONTRIBUTING.md](CONTRIBUTING.md): setup, the `make` targets, before you open a PR
 - [docs/DESIGN.md](docs/DESIGN.md): rationale and scope (why it's this small, the contract)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, topology, end-to-end startup walkthrough
 - [docs/PROTOCOL.md](docs/PROTOCOL.md): wire format and every message type
@@ -98,10 +99,23 @@ means a runtime error (no daemon, node down), exit 2 a usage error.
 
 ## Verify without GPUs
 
-Both checks fake the GPU count and need no torch/CUDA (only `uv` + cloudpickle):
+Everything below needs only [`uv`](https://docs.astral.sh/uv/) and cloudpickle;
+no GPU, no torch, no venv setup. `make` lists the targets, `make check` runs
+everything CI runs:
+
+    make check                     # lint + types + shellcheck + unit/fuzz + import + e2e
+    make test                      # unit + fuzz suite only, ~10s
+    make e2e                       # the four control-plane harnesses below
+
+Each harness also runs standalone (fake GPUs via `BEAM_NUM_GPUS`):
 
     bash test/run_e2e.sh          # single head, 4 fake GPUs
     bash test/run_multinode.sh    # GPU-less head + a 4-GPU worker, routed through the hub
+    bash test/run_edge.sh         # error propagation, wait, parallelism, leak-fix
+    bash test/run_driver_on_worker.sh  # driver on a worker node
+
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the file map, the lint/type
+setup, and how to keep the shim in sync with vLLM.
 
 ## Validated topologies
 
@@ -173,7 +187,7 @@ bump as a CI gate:
 |-----|---------|
 | `BEAM_NUM_GPUS`    | override detected GPU count |
 | `BEAM_NODE_IP`     | advertise this address (else `VLLM_HOST_IP`, else default-route IP) |
-| `BEAM_RUNTIME_DIR` | daemon state dir (default `~/.beam`) |
+| `BEAM_RUNTIME_DIR` | daemon state dir (default `~/.beam`; keep the path under ~100 bytes, the AF_UNIX socket limit) |
 | `BEAM_SOCK`        | actor/worker daemon socket (the CLI reads it from the runtime dir) |
 | `BEAM_WORKER_CMD`  | how to launch a python actor (default `python3 -m ray._worker`) |
 | `BEAM_BOOTSTRAP`   | force the bootstrap that normally runs only inside a container |

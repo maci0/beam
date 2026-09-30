@@ -29,6 +29,10 @@ _SIGKILL_POLL_INTERVAL = 0.05
 # Unreachable-by-design probe used only to read back the kernel's chosen source
 # address for the default route. No packet is sent (SOCK_DGRAM connect).
 _ROUTE_PROBE_ADDR = ("8.8.8.8", 80)
+# sockaddr_un.sun_path is a fixed 108-byte field: a socket path holds at most
+# 107 bytes on Linux (103 on macOS). Capped a little lower so the check below
+# also catches paths that only blow up once something appends to them.
+_SOCK_PATH_MAX = 100
 
 
 def _runtime_dir() -> str:
@@ -37,6 +41,27 @@ def _runtime_dir() -> str:
 
 def _runtime_path() -> str:
     return os.path.join(_runtime_dir(), "daemon.json")
+
+
+def _check_sock_path(sock: str) -> None:
+    """Refuse a unix-socket path the kernel cannot hold, and say how to fix it.
+
+    sockaddr_un.sun_path is a fixed 108-byte field, so the path plus its NUL
+    must fit in 107 bytes on Linux, 103 on macOS. Past that, bind/connect fails
+    as a bare OSError("AF_UNIX path too long") from deep inside
+    socket.connect(), long after the caller thought its setup had worked.
+    """
+    n = len(sock.encode())
+    if n <= _SOCK_PATH_MAX:
+        return
+    sys.stderr.write(
+        "beam: the daemon socket path is %d bytes, over the %d-byte AF_UNIX limit:\n"
+        "  %s\n"
+        "Point BEAM_RUNTIME_DIR at a shorter directory (it holds only daemon.sock\n"
+        "and daemon.json), e.g. BEAM_RUNTIME_DIR=/tmp/beam, and start again.\n"
+        % (n, _SOCK_PATH_MAX, sock)
+    )
+    sys.exit(1)
 
 
 def _local_ip() -> str:
@@ -131,7 +156,8 @@ def _usage(code: int) -> int:
         "environment:\n"
         "  BEAM_NUM_GPUS     override detected GPU count (set on boxes without /dev/nvidia*)\n"
         "  BEAM_NODE_IP      advertise this address (else VLLM_HOST_IP, else default-route IP)\n"
-        "  BEAM_RUNTIME_DIR  daemon state dir (default ~/.beam)\n"
+        "  BEAM_RUNTIME_DIR  daemon state dir (default ~/.beam; the socket path\n"
+        "                     must stay under ~100 bytes, so keep this dir short)\n"
         "  BEAM_SOCK         actor/worker daemon socket (the CLI reads it from the runtime dir)\n"
         "  BEAM_WORKER_CMD   how to launch an actor (default 'python3 -m ray._worker')\n"
         "  BEAM_BOOTSTRAP    force bootstrap outside a container (auto inside one)\n"
@@ -216,7 +242,10 @@ def _start(args: list[str]) -> int:
         sys.stderr.write("beam start: --num-gpus must be >= 0, got %d\n" % num_gpus)
         return 2
 
-    # Refuse to steal a live daemon's unix socket / runtime dir.
+    # Refuse an unusable socket path, then a live daemon's socket/runtime dir.
+    # Checked here so a deep BEAM_RUNTIME_DIR is a named error instead of a
+    # bare OSError("AF_UNIX path too long") from deep inside connect().
+    _check_sock_path(os.path.join(_runtime_dir(), "daemon.sock"))
     live = _live_daemon_pid()
     if live is not None:
         sys.stderr.write(

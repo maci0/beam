@@ -1,7 +1,11 @@
+# scratch dirs the harnesses in test/ create (each harness cleans up on exit)
 /.e2e-run/
 /.mn-run/
 /.edge-run/
 /.3node-run/
+/.cpuhead-run/
+/.rocm-run/
+/.dow-run/
 /.3dbg/
 __pycache__/
 *.pyc

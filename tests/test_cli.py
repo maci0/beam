@@ -31,6 +31,33 @@ def test_runtime_dir_default(monkeypatch):
     assert d.endswith(".beam")
 
 
+# ---- socket path length preflight -------------------------------------------
+
+
+def test_check_sock_path_accepts_ordinary_paths():
+    _cli._check_sock_path("/tmp/beam/daemon.sock")
+    _cli._check_sock_path("/home/someone/.beam/daemon.sock")
+
+
+def test_check_sock_path_rejects_overlong_path(capsys):
+    """AF_UNIX caps sun_path; a deep BEAM_RUNTIME_DIR must be named, not crash."""
+    long = "/" + "a" * 120 + "/daemon.sock"
+    with pytest.raises(SystemExit) as e:
+        _cli._check_sock_path(long)
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "AF_UNIX" in err and "BEAM_RUNTIME_DIR" in err and long in err
+
+
+def test_start_refuses_overlong_runtime_dir(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path / ("d" * 80)))
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: 12345)
+    with pytest.raises(SystemExit) as e:
+        _cli._start(["--head"])
+    assert e.value.code == 1
+    assert "AF_UNIX" in capsys.readouterr().err
+
+
 # ---- _local_ip --------------------------------------------------------------
 
 

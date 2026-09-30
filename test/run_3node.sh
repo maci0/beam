@@ -6,11 +6,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=test/lib.sh
+. "$ROOT/test/lib.sh"
 source "$ROOT/test/dgx/config.sh"
 SSH="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
 THIS_IP=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K\S+')
 RUN="$ROOT/.3node-run"
+RT="$(beam_runtime_dir 3node)"   # short: AF_UNIX caps the socket path
 rm -rf "$RUN"; mkdir -p "$RUN"
 
 # Local python for the head daemon, its actor worker, and the driver. It MUST
@@ -22,7 +25,7 @@ uv venv --python 3.12 "$RUN/venv" >/dev/null
 VENVPY="$RUN/venv/bin/python"
 uv pip install --python "$VENVPY" cloudpickle >/dev/null
 
-export BEAM_RUNTIME_DIR="$RUN"
+export BEAM_RUNTIME_DIR="$RT"
 export PYTHONPATH="$ROOT/python"
 export BEAM_NUM_GPUS=1
 export BEAM_WORKER_CMD="$VENVPY -m ray._worker"
@@ -34,7 +37,7 @@ cleanup() {
   kill "${HEAD_PID:-}" 2>/dev/null || true
   $SSH "$SSH_USER@$HEAD_IP"   "docker rm -f beam-n1 2>/dev/null" >/dev/null 2>&1 || true
   $SSH "$SSH_USER@$WORKER_IP" "docker rm -f beam-n2 2>/dev/null" >/dev/null 2>&1 || true
-  rm -rf "$RUN"
+  rm -rf "$RUN" "$RT"
 }
 trap cleanup EXIT
 
@@ -44,7 +47,7 @@ bash "$ROOT/test/dgx/dgx.sh" deploy >/dev/null
 echo "=== head on this host ($THIS_IP) ==="
 "$VENVPY" -m ray start --head --port "$HEAD_PORT" &
 HEAD_PID=$!
-for _ in $(seq 1 50); do [ -S "$RUN/daemon.sock" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -S "$RT/daemon.sock" ] && break; sleep 0.1; done
 
 echo "=== worker daemons on both sparks join $THIS_IP:$HEAD_PORT ==="
 $SSH "$SSH_USER@$HEAD_IP"   "docker rm -f beam-n1 2>/dev/null; docker run -d --name beam-n1 $worker_run $IMAGE -m ray start --address $THIS_IP:$HEAD_PORT --block" >/dev/null

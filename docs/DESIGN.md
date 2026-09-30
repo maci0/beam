@@ -15,8 +15,8 @@ figures from ray 2.55.1 installed with `--no-deps`, measured 2026-06:
 
 | | beam | Ray | ratio |
 |---|------|-----|-------|
-| install size | 126 KB | 183 MB | ~1,489× |
-| Python LoC | 3,331 (2,699 non-blank, non-comment) | 643,901 | ~193× |
+| install size | 128 KB | 183 MB | ~1,464× |
+| Python LoC | 3,388 (2,734 non-blank, non-comment) | 643,901 | ~190× |
 | Python files | 21 | 2,417 | ~115× |
 | native libraries | 0 | 11 `.so` (50 MB) | n/a |
 | runtime dependencies | 1 (cloudpickle) | ~12 required (grpcio, protobuf, msgpack, …) + many extras | n/a |

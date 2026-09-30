@@ -310,6 +310,7 @@ vllm serve … --gpu-memory-utilization 0.5 --max-model-len 8192 --enforce-eager
 | workers connect but queues never become ready on a multi-homed host | node advertised its default-route IP, not the cluster LAN | set `BEAM_NODE_IP` per node |
 | `Tensor parallel size (N) exceeds available GPUs (1)` warning | benign: vLLM compares TP to per-node GPUs; beam spreads ranks across nodes | ignore (or add GPUs per node) |
 | `import ray` finds the real ray | a real ray is installed in the image | use the stock vllm-openai image (no ray), or uninstall ray |
+| `AF_UNIX path too long`, or `ray status: cannot reach daemon` on a fresh node | `BEAM_RUNTIME_DIR` is nested too deep: the control socket path is capped at 107 bytes (103 on macOS) | point `BEAM_RUNTIME_DIR` at a short dir, e.g. `/tmp/beam`; `ray start` now names this instead of failing inside `connect()` |
 
 ## Validated configuration
 

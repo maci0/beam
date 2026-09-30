@@ -5,8 +5,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=test/lib.sh
+. "$ROOT/test/lib.sh"
 RUN="$ROOT/.mn-run"
-rm -rf "$RUN"; mkdir -p "$RUN/head" "$RUN/worker"
+RT_HEAD="$(beam_runtime_dir mn-head)"   # short: AF_UNIX caps the socket path
+RT_WORK="$(beam_runtime_dir mn-worker)"
+rm -rf "$RUN"; mkdir -p "$RUN"
 
 uv venv "$RUN/venv" >/dev/null
 VENVPY="$RUN/venv/bin/python"
@@ -18,33 +22,34 @@ export BEAM_WORKER_CMD="$VENVPY -m ray._worker"
 cleanup() {
   kill "${HEAD_PID:-}" 2>/dev/null || true
   kill "${WORK_PID:-}" 2>/dev/null || true
+  rm -rf "$RT_HEAD" "$RT_WORK"
 }
 trap cleanup EXIT
 
 # head: no GPUs, listens on 6380
-BEAM_RUNTIME_DIR="$RUN/head" BEAM_NUM_GPUS=0 \
+BEAM_RUNTIME_DIR="$RT_HEAD" BEAM_NUM_GPUS=0 \
   "$VENVPY" -m ray start --head --port 6380 &
 HEAD_PID=$!
-for _ in $(seq 1 50); do [ -S "$RUN/head/daemon.sock" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -S "$RT_HEAD/daemon.sock" ] && break; sleep 0.1; done
 
 # worker: 4 GPUs, joins the head
-BEAM_RUNTIME_DIR="$RUN/worker" BEAM_NUM_GPUS=4 \
+BEAM_RUNTIME_DIR="$RT_WORK" BEAM_NUM_GPUS=4 \
   "$VENVPY" -m ray start --address 127.0.0.1:6380 &
 WORK_PID=$!
 
 for _ in $(seq 1 50); do
-  if BEAM_RUNTIME_DIR="$RUN/head" "$VENVPY" -m ray status 2>/dev/null | grep -q "2 nodes"; then
+  if BEAM_RUNTIME_DIR="$RT_HEAD" "$VENVPY" -m ray status 2>/dev/null | grep -q "2 nodes"; then
     break
   fi
   sleep 0.2
 done
 
 echo "--- ray status ---"
-BEAM_RUNTIME_DIR="$RUN/head" "$VENVPY" -m ray status
+BEAM_RUNTIME_DIR="$RT_HEAD" "$VENVPY" -m ray status
 
 # driver connects to the HEAD socket; all 4 GPU actors land on the one worker
 # (the only node with GPUs), routed cross-process through the hub
-BEAM_SOCK="$RUN/head/daemon.sock" BEAM_DEMO_EXPECT_NODES=1 \
+BEAM_SOCK="$RT_HEAD/daemon.sock" BEAM_DEMO_EXPECT_NODES=1 \
   "$VENVPY" "$ROOT/examples/driver_demo.py"
 
 echo "multinode: PASS"
