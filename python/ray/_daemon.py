@@ -22,6 +22,8 @@ import subprocess
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import _config
+
 # ---- tuning ----
 
 # Peer RPC deadline: every daemon-to-daemon call (kill, remove_pg, forward) is
@@ -273,11 +275,17 @@ class Peer:
 
 
 def detect_gpus(override: int | None = None) -> int:
+    """GPUs on this node, or the /dev/nvidia* count when none is configured.
+
+    `override` (ray start --num-gpus, already range-checked by the caller) wins
+    over BEAM_NUM_GPUS; a negative override means "not given" (the CLI's None
+    default) and falls through to detection.
+    """
     if override is not None and override >= 0:
         return override
-    env = os.environ.get("BEAM_NUM_GPUS")
-    if env:
-        return int(env)
+    configured = _config.num_gpus()
+    if configured is not None:
+        return configured
     return len(glob.glob("/dev/nvidia[0-9]*"))
 
 
@@ -1080,7 +1088,7 @@ class Daemon:
                 self.gpu_used[g] = False
 
     def _spawn_worker(self, actor_id: str, gpus: list[int]) -> subprocess.Popen:
-        cmdline = os.environ.get("BEAM_WORKER_CMD", "python3 -m ray._worker")
+        cmdline = _config.worker_cmd()
         ids = ",".join(str(g) for g in gpus)
         assert self.sock_path is not None  # serve_unix runs before any actor spawn
         env = dict(os.environ)

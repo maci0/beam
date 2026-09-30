@@ -7,12 +7,14 @@ actor subprocesses, not here.
 
 from __future__ import annotations  # keep `str | None` valid on py3.9
 
-import json
-import os
 import socket
 import threading
 
-from . import _proto
+from . import _config, _proto
+
+
+class DaemonNotRunning(RuntimeError):
+    """No local beam daemon to talk to (no runtime document in BEAM_RUNTIME_DIR)."""
 
 # Smallest budget applied to the socket. A caller-supplied budget measures
 # elapsed waiting, not syscall precision: Python rounds a sub-millisecond
@@ -23,18 +25,33 @@ _SOCKET_TIMEOUT_FLOOR = 0.001
 
 
 def _runtime_sock() -> str:
-    if os.environ.get("BEAM_SOCK"):
-        return os.environ["BEAM_SOCK"]
-    rt_dir = os.environ.get("BEAM_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".beam")
-    with open(os.path.join(rt_dir, "daemon.json")) as f:
-        return json.load(f)["sock"]
+    """Socket of the local daemon: BEAM_SOCK, else daemon.json's recorded path.
+
+    Raises DaemonNotRunning (a RuntimeError, like every other beam failure the
+    driver sees) instead of the bare FileNotFoundError / KeyError / JSONDecodeError
+    that reading the runtime document used to raise.
+    """
+    sock = _config.runtime_sock()
+    if sock is None:
+        raise DaemonNotRunning(
+            "beam: no local daemon found (looked for %s). Start one with "
+            "'ray start --head', or point BEAM_SOCK / BEAM_RUNTIME_DIR at it."
+            % _config.runtime_json_path()
+        )
+    return sock
 
 
 class DaemonClient:
     def __init__(self, sock_path: str | None = None, timeout: float | None = None) -> None:
         self.sock_path = sock_path or _runtime_sock()
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(self.sock_path)
+        try:
+            self._sock.connect(self.sock_path)
+        except OSError as e:
+            raise DaemonNotRunning(
+                "beam: cannot reach the local daemon on %s (%s). Is it running?"
+                % (self.sock_path, e)
+            ) from None
         self._lock = threading.Lock()
         # Default round-trip budget. None = block until the daemon answers,
         # which is what put/get/call want.

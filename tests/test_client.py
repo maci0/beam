@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 import ray._client  # noqa: E402,F401  (ensure the submodule is loaded)
 from ray import _proto  # noqa: E402
-from ray._client import DaemonClient, _runtime_sock  # noqa: E402
+from ray._client import DaemonClient, DaemonNotRunning, _runtime_sock  # noqa: E402
 
 # `ray._client` the attribute is the module-level `_client = None` global, which
 # shadows the submodule on the package. Reach the real module via sys.modules.
@@ -157,10 +157,41 @@ def test_runtime_sock_from_runtime_dir(tmp_path, monkeypatch):
 
 
 def test_runtime_sock_missing_file_raises(tmp_path, monkeypatch):
+    # a missing runtime document now says so, instead of leaking FileNotFoundError
     monkeypatch.delenv("BEAM_SOCK", raising=False)
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
-    with pytest.raises(OSError):
+    with pytest.raises(DaemonNotRunning, match="no local daemon found"):
         _runtime_sock()
+
+
+def test_runtime_sock_malformed_doc_raises(tmp_path, monkeypatch):
+    """A half-written / hand-edited daemon.json must not raise KeyError/JSONDecodeError."""
+    monkeypatch.delenv("BEAM_SOCK", raising=False)
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    with open(os.path.join(str(tmp_path), "daemon.json"), "w") as f:
+        f.write("{not json")
+    with pytest.raises(DaemonNotRunning):
+        _runtime_sock()
+
+    with open(os.path.join(str(tmp_path), "daemon.json"), "w") as f:
+        json.dump({"pid": 7}, f)  # valid JSON, no "sock"
+    with pytest.raises(DaemonNotRunning):
+        _runtime_sock()
+
+
+def test_client_init_reports_unreachable_daemon(monkeypatch):
+    """Connecting to a dead socket path reports it, not a bare OSError."""
+
+    class DeadSock:
+        def connect(self, path):
+            raise OSError("no such file or directory")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_client.socket, "socket", lambda *a, **k: DeadSock())
+    with pytest.raises(DaemonNotRunning, match="cannot reach the local daemon"):
+        DaemonClient(sock_path="/gone.sock")
 
 
 def test_client_init_dials_sock_path(monkeypatch):

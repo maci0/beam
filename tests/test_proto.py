@@ -115,6 +115,19 @@ def test_zero_length_header_rejected():
         _proto.read_frame(BytesSock(struct.pack(">I", 0)))
 
 
+def test_non_object_header_rejected():
+    """A JSON header that is not an object (a bare int here) must be refused.
+
+    Pinned by an explicit test: the garbage fuzzers reach this branch only when
+    hypothesis happens to generate such bytes, so under a different example
+    budget the 100% coverage gate would flap.
+    """
+    body = b"123"
+    frame = struct.pack(">I", len(body)) + body
+    with pytest.raises(ConnectionError, match="not a JSON object"):
+        _proto.read_frame(BytesSock(frame))
+
+
 def test_bad_plen_rejected():
     body = json.dumps({"t": "x", "plen": _proto._MAX_FRAME + 1}).encode()
     frame = struct.pack(">I", len(body)) + body

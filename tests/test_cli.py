@@ -181,6 +181,19 @@ def test_bootstrap_rejects_stray_args(capsys):
     assert "unexpected argument" in capsys.readouterr().err
 
 
+def test_main_reports_config_error(capsys, monkeypatch):
+    """A bad env var reaches the operator as one 'beam:' line and exit 2, not a
+    traceback out of the middle of `ray start`."""
+    from ray import _config
+
+    def _bad_start(_args):
+        raise _config.ConfigError("beam: BEAM_NUM_GPUS must be a non-negative integer, got 'x'")
+
+    monkeypatch.setattr(_cli, "_start", _bad_start)
+    assert _cli.main(["start", "--head"]) == 2
+    assert "BEAM_NUM_GPUS must be" in capsys.readouterr().err
+
+
 def test_main_bootstrap_dispatch(monkeypatch):
     called = []
     monkeypatch.setattr(_cli, "bootstrap_env", lambda: called.append(True))
@@ -560,6 +573,27 @@ def test_run_daemon_exit_missing_claim(tmp_path, monkeypatch, capsys):
     assert aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 0, 6379, None)) == 0
 
 
+def test_run_daemon_head_binds_configured_address(tmp_path, monkeypatch, capsys):
+    """BEAM_BIND_ADDRESS decides which interface the unauthenticated control port
+    listens on; the startup line says which one that was."""
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("BEAM_BIND_ADDRESS", "10.0.0.5")
+    bound = {}
+    _patch_daemon(monkeypatch)
+    orig = _cli._daemon.Daemon.serve_tcp
+
+    async def record(self, host, port):
+        bound["host"] = host
+        await orig(self, host, port)
+
+    monkeypatch.setattr(_cli._daemon.Daemon, "serve_tcp", record)
+    import asyncio as aio
+
+    assert aio.run(_cli._run_daemon(True, "n1", "10.0.0.5", 4, 6379, None)) == 0
+    assert bound["host"] == "10.0.0.5"
+    assert "bound to 10.0.0.5" in capsys.readouterr().out
+
+
 def test_run_daemon_head_bind_failure(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
     _patch_daemon(monkeypatch, head_serve_exc=OSError("addr in use"))
@@ -567,7 +601,7 @@ def test_run_daemon_head_bind_failure(tmp_path, monkeypatch, capsys):
 
     rc = aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 4, 6379, None))
     assert rc == 1
-    assert "cannot bind port" in capsys.readouterr().err
+    assert "cannot bind" in capsys.readouterr().err
 
 
 def test_run_daemon_worker(tmp_path, monkeypatch, capsys):

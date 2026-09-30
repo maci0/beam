@@ -185,12 +185,20 @@ bump as a CI gate:
 
 | var | meaning |
 |-----|---------|
-| `BEAM_NUM_GPUS`    | override detected GPU count |
+| `BEAM_NUM_GPUS`    | override detected GPU count (non-negative integer; omit to count `/dev/nvidia*`) |
 | `BEAM_NODE_IP`     | advertise this address (else `VLLM_HOST_IP`, else default-route IP) |
+| `BEAM_BIND_ADDRESS` | address the head's control port binds (default `0.0.0.0`, every interface) |
 | `BEAM_RUNTIME_DIR` | daemon state dir (default `~/.beam`; keep the path under ~100 bytes, the AF_UNIX socket limit) |
 | `BEAM_SOCK`        | actor/worker daemon socket (the CLI reads it from the runtime dir) |
 | `BEAM_WORKER_CMD`  | how to launch a python actor (default `python3 -m ray._worker`) |
 | `BEAM_BOOTSTRAP`   | force the bootstrap that normally runs only inside a container |
+
+Values are read once, through `python/ray/_config.py`, and validated where they
+are read: a non-numeric or negative `BEAM_NUM_GPUS`, or a `BEAM_NODE_IP` that is
+not an IP literal, fails at `ray start` with a one-line `beam:` message instead
+of being used (a wrong advertised IP otherwise surfaces much later as a cluster
+that forms and then hangs). An empty value counts as unset, so `-e BEAM_NODE_IP`
+with no `=value` falls back to the documented chain rather than advertising "".
 
 ## Not implemented (by design)
 
@@ -201,15 +209,15 @@ inference path needs none of these.
 ## Security / trust model
 
 beam's control plane is **unauthenticated**, exactly like Ray's. The head binds
-its TCP port (default 6379) on `0.0.0.0` — there is no flag to bind it to a
-single interface, so a firewall is the only control — and the protocol carries
-cloudpickled payloads that worker daemons unpickle and execute. Anyone who can
-reach the port can run code as the daemon user: create actors (pickle payloads
-they choose) on any node, kill anyone else's actors, reserve every GPU, read any
-object, and register as a node with a self-declared address. **Run it only on a
-trusted, private network** (a cluster subnet / VPC), never exposed to the
-internet. This is the same posture Ray documents for its own 6379. Set
-`--node-ip` to advertise a specific address; keep the port behind your
+its TCP port (default 6379) on `0.0.0.0` — set `BEAM_BIND_ADDRESS` to the
+cluster LAN address to bind one interface instead, or use a firewall — and the
+protocol carries cloudpickled payloads that worker daemons unpickle and execute.
+Anyone who can reach the port can run code as the daemon user: create actors
+(pickle payloads they choose) on any node, kill anyone else's actors, reserve
+every GPU, read any object, and register as a node with a self-declared address.
+**Run it only on a trusted, private network** (a cluster subnet / VPC), never
+exposed to the internet. This is the same posture Ray documents for its own 6379.
+Set `--node-ip` to advertise a specific address; keep the port behind your
 firewall/security group. [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) has the
 full model with file references; [SECURITY.md](SECURITY.md) has the disclosure
 policy.

@@ -4,6 +4,7 @@ guard, _RuntimeContext accessors, cluster/available resources, nodes, gpu-id
 parsing, and ip lookup. All daemon traffic goes through the FakeClient pattern
 (monkeypatch `ray._need`); no sockets or daemon."""
 
+import ipaddress
 import os
 import sys
 
@@ -13,6 +14,7 @@ from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 import ray  # noqa: E402
+from ray import _config  # noqa: E402
 
 
 class FakeClient:
@@ -235,36 +237,15 @@ def test_get_ip_returns_str(monkeypatch):
 def test_get_ip_socket_heuristic(monkeypatch):
     monkeypatch.delenv("BEAM_NODE_IP", raising=False)
     monkeypatch.delenv("VLLM_HOST_IP", raising=False)
-
-    class OkSock:
-        def connect(self, addr):
-            pass
-
-        def getsockname(self):
-            return ("9.9.9.9", 0)
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(ray.socket, "socket", lambda *a, **k: OkSock())
+    # the probe lives in _config.route_probe_ip now that the env reads moved there
+    monkeypatch.setattr(_config, "route_probe_ip", lambda: "9.9.9.9")
     assert ray._get_ip() == "9.9.9.9"
 
 
 def test_get_ip_fallback(monkeypatch):
     monkeypatch.delenv("BEAM_NODE_IP", raising=False)
     monkeypatch.delenv("VLLM_HOST_IP", raising=False)
-
-    class DeadSock:
-        def connect(self, addr):
-            raise OSError("no route")
-
-        def getsockname(self):
-            raise AssertionError
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(ray.socket, "socket", lambda *a, **k: DeadSock())
+    monkeypatch.setattr(_config, "route_probe_ip", lambda: "127.0.0.1")
     assert ray._get_ip() == "127.0.0.1"
 
 
@@ -272,10 +253,10 @@ def test_get_ip_prefers_beam_node_ip(monkeypatch):
     # an explicitly configured cluster IP wins over the socket heuristic
     monkeypatch.setenv("BEAM_NODE_IP", "10.1.2.3")
 
-    def _no_socket(*a, **k):
-        raise AssertionError("socket must not be used when the IP is configured")
+    def _no_probe():
+        raise AssertionError("route probe must not run when the IP is configured")
 
-    monkeypatch.setattr(ray.socket, "socket", _no_socket)
+    monkeypatch.setattr(_config, "route_probe_ip", _no_probe)
     assert ray._get_ip() == "10.1.2.3"
 
 
@@ -287,20 +268,17 @@ def test_get_ip_falls_back_to_vllm_host_ip(monkeypatch):
 
 @given(st.text(min_size=1).filter(lambda s: s.strip() and "\x00" not in s))
 def test_get_ip_returns_configured_value(ip):
-    import os
+    # Only literal addresses are accepted: a BEAM_NODE_IP that is not an address
+    # is rejected (ConfigError) instead of being advertised to every peer.
+    import unittest.mock as mock
 
-    prev_b = os.environ.get("BEAM_NODE_IP")
-    prev_v = os.environ.get("VLLM_HOST_IP")
-    os.environ.pop("VLLM_HOST_IP", None)
-    os.environ["BEAM_NODE_IP"] = ip
-    try:
-        assert ray._get_ip() == ip
-    finally:
-        os.environ.pop("BEAM_NODE_IP", None)
-        if prev_b is not None:
-            os.environ["BEAM_NODE_IP"] = prev_b
-        if prev_v is not None:
-            os.environ["VLLM_HOST_IP"] = prev_v
+    with mock.patch.dict(os.environ, {"BEAM_NODE_IP": ip}, clear=False):
+        try:
+            got = ray._get_ip()
+        except _config.ConfigError:
+            got = None
+        else:
+            assert got == str(ipaddress.ip_address(ip))
 
 
 # ---- remote with placement-group scheduling strategy ------------------------

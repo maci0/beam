@@ -7,12 +7,12 @@ Only the surface vLLM imports is implemented. See docs/DESIGN.md for the contrac
 from __future__ import annotations  # keep PEP604 annotations valid on py3.9
 
 import os
-import socket
 import time
 from collections.abc import Iterable
 from typing import Any
 
 from . import (
+    _config,
     _proto,
     util,  # noqa: F401  (exposes ray.util.*)
 )
@@ -291,8 +291,7 @@ class _RuntimeContext:
         return os.environ.get("BEAM_NODE_ID") or _local_node_id()
 
     def get_accelerator_ids(self) -> dict[str, list[str]]:
-        ids = os.environ.get("BEAM_GPU_IDS", "")
-        return {"GPU": [g for g in ids.split(",") if g]}
+        return {"GPU": _config.accelerator_ids()}
 
     # some vLLM paths read .gpu_ids directly
     @property
@@ -305,8 +304,7 @@ def get_runtime_context() -> _RuntimeContext:
 
 
 def get_gpu_ids() -> list[int]:
-    ids = os.environ.get("BEAM_GPU_IDS", "")
-    return [int(g) for g in ids.split(",") if g]
+    return _config.gpu_ids()
 
 
 def _status_nodes() -> list[dict]:
@@ -348,26 +346,15 @@ def nodes() -> list[dict]:
 def _local_node_id() -> str:
     import json
 
-    rt_dir = os.environ.get("BEAM_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".beam")
     try:
-        with open(os.path.join(rt_dir, "daemon.json")) as f:
+        with open(os.path.join(_config.runtime_dir(), "daemon.json")) as f:
             return json.load(f)["node"]
     except OSError:
         return "driver"
 
 
 def _get_ip() -> str:
-    # Prefer an explicitly configured cluster IP. The 8.8.8.8 heuristic below
-    # returns the default-route interface, which on a multi-homed host (router,
-    # VM bridges) is often not the cluster LAN the other nodes reach us on.
-    env_ip = os.environ.get("BEAM_NODE_IP") or os.environ.get("VLLM_HOST_IP")
-    if env_ip:
-        return env_ip
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+    # Prefer an explicitly configured cluster IP. The route probe below returns
+    # the default-route interface, which on a multi-homed host (router, VM
+    # bridges) is often not the cluster LAN the other nodes reach us on.
+    return _config.node_ip() or _config.route_probe_ip()

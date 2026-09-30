@@ -17,7 +17,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 
-from . import _daemon
+from . import _config, _daemon
 
 # ---- tuning ----
 
@@ -26,9 +26,6 @@ _EXIT_POLLS = 50
 _EXIT_POLL_INTERVAL = 0.1
 _SIGKILL_POLLS = 20
 _SIGKILL_POLL_INTERVAL = 0.05
-# Unreachable-by-design probe used only to read back the kernel's chosen source
-# address for the default route. No packet is sent (SOCK_DGRAM connect).
-_ROUTE_PROBE_ADDR = ("8.8.8.8", 80)
 # sockaddr_un.sun_path is a fixed 108-byte field: a socket path holds at most
 # 107 bytes on Linux (103 on macOS). Capped a little lower so the check below
 # also catches paths that only blow up once something appends to them.
@@ -36,11 +33,11 @@ _SOCK_PATH_MAX = 100
 
 
 def _runtime_dir() -> str:
-    return os.environ.get("BEAM_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".beam")
+    return _config.runtime_dir()
 
 
 def _runtime_path() -> str:
-    return os.path.join(_runtime_dir(), "daemon.json")
+    return _config.runtime_json_path()
 
 
 def _check_sock_path(sock: str) -> None:
@@ -65,20 +62,11 @@ def _check_sock_path(sock: str) -> None:
 
 
 def _local_ip() -> str:
-    # Prefer an explicit cluster IP (same vars as ray._get_ip / get_node_ip_address)
-    # so multi-homed hosts don't advertise the default-route interface via
-    # membership / `ray status` while the shim advertises the LAN address.
-    env_ip = os.environ.get("BEAM_NODE_IP") or os.environ.get("VLLM_HOST_IP")
-    if env_ip:
-        return env_ip
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(_ROUTE_PROBE_ADDR)
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+    # Prefer an explicit cluster IP (same vars as ray._get_ip /
+    # get_node_ip_address) so multi-homed hosts don't advertise the
+    # default-route interface via membership / `ray status` while the shim
+    # advertises the LAN address.
+    return _config.node_ip() or _config.route_probe_ip()
 
 
 _COMMANDS = ("start", "status", "stop", "bootstrap")
@@ -90,21 +78,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not argv:
         return _usage(2)
     cmd, rest = argv[0], argv[1:]
-    if cmd in _HELP_FLAGS:
-        return _usage(0)
-    if cmd in ("-V", "--version"):
-        from . import __version__
+    try:
+        if cmd in _HELP_FLAGS:
+            return _usage(0)
+        if cmd in ("-V", "--version"):
+            from . import __version__
 
-        print("ray (beam) %s" % __version__)
-        return 0
-    if cmd == "start":
-        return _start(rest)
-    if cmd == "status":
-        return _no_args("status", _status, rest)
-    if cmd == "stop":
-        return _no_args("stop", _stop, rest)
-    if cmd == "bootstrap":
-        return _no_args("bootstrap", _bootstrap, rest)
+            print("ray (beam) %s" % __version__)
+            return 0
+        if cmd == "start":
+            return _start(rest)
+        if cmd == "status":
+            return _no_args("status", _status, rest)
+        if cmd == "stop":
+            return _no_args("stop", _stop, rest)
+        if cmd == "bootstrap":
+            return _no_args("bootstrap", _bootstrap, rest)
+    except _config.ConfigError as e:
+        # bad environment variable: one clear line, not a traceback
+        sys.stderr.write("%s\n" % e)
+        return 2
     sys.stderr.write("beam: unknown command %r%s\n" % (cmd, _suggest(cmd, _COMMANDS)))
     return _usage(2)
 
@@ -161,6 +154,8 @@ def _usage(code: int) -> int:
         "  BEAM_SOCK         actor/worker daemon socket (the CLI reads it from the runtime dir)\n"
         "  BEAM_WORKER_CMD   how to launch an actor (default 'python3 -m ray._worker')\n"
         "  BEAM_BOOTSTRAP    force bootstrap outside a container (auto inside one)\n"
+        "  BEAM_BIND_ADDRESS address the head's control port binds (default 0.0.0.0, i.e. every\n"
+        "                    interface; set the cluster LAN address to narrow it)\n"
     )
     if code:
         sys.stderr.write(text)
@@ -288,7 +283,7 @@ async def _run_daemon(
     address: str | None,
 ) -> int:
     d = _daemon.Daemon(head, node_id, ip, gpus)
-    sock = os.path.join(_runtime_dir(), "daemon.sock")
+    sock = _config.runtime_sock_path()
 
     # Exclusive claim before unlinking the sock, so two concurrent starts cannot
     # both pass the live check and steal each other's socket path.
@@ -311,18 +306,21 @@ async def _run_daemon(
         return 1
 
     if head:
+        bind = _config.bind_address()
         try:
-            await d.serve_tcp("0.0.0.0", port)
+            await d.serve_tcp(bind, port)
         except OSError as e:
             return _fail(
-                "beam head: cannot bind port %d (%s). Another head running? "
-                "Run 'ray stop' first, or pick another --port.\n" % (port, e)
+                "beam head: cannot bind %s:%d (%s). Another head running? "
+                "Run 'ray stop' first, or pick another --port.\n" % (bind, port, e)
             )
         rt["addr"] = "%s:%d" % (ip, port)
         # the control plane is unauthenticated (see SECURITY in README): keep :port
-        # on a trusted/private network only.
+        # on a trusted/private network only. It binds every interface unless
+        # BEAM_BIND_ADDRESS narrows it.
         print(
-            "beam head started on %s:%d (%d GPUs), control port open on 0.0.0.0" % (ip, port, gpus)
+            "beam head started on %s:%d (%d GPUs), control port bound to %s"
+            % (ip, port, gpus, bind)
         )
         print("join with:  ray start --address %s:%d" % (ip, port))
     else:

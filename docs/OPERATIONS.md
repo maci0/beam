@@ -53,6 +53,42 @@ beam detects GPUs from `/dev/nvidia*`. On platforms whose device nodes are not
 `/dev/nvidia*` (DGX Spark / GB10), set `BEAM_NUM_GPUS` explicitly (e.g. `-e
 BEAM_NUM_GPUS=1`).
 
+## Configuration reference
+
+Every variable beam reads lives in `python/ray/_config.py`, which validates it
+where it is read. Bad values fail at `ray start` with one `beam:` line and exit
+2, instead of surfacing as a wrong cluster or a traceback later. Empty is
+treated as unset everywhere, so `-e VAR` without `=value` falls back to the
+documented default rather than being used as `""`.
+
+| var | set by | default | validated |
+|-----|--------|---------|-----------|
+| `BEAM_NUM_GPUS` | operator | count `/dev/nvidia*` | non-negative integer |
+| `BEAM_NODE_IP` | operator | `VLLM_HOST_IP`, else default-route IP | IP literal |
+| `VLLM_HOST_IP` | vLLM | unset | IP literal |
+| `BEAM_BIND_ADDRESS` | operator | `0.0.0.0` | unicast IP literal |
+| `BEAM_RUNTIME_DIR` | operator | `~/.beam` | any path |
+| `BEAM_SOCK` | daemon (worker env), or operator | `BEAM_RUNTIME_DIR/daemon.sock` | any path |
+| `BEAM_WORKER_CMD` | operator | `python3 -m ray._worker` | command line, split with `shlex` |
+| `BEAM_BOOTSTRAP` | operator | unset (bootstrap is automatic in a container) | truthy |
+| `BEAM_NODE_ID`, `BEAM_GPU_IDS`, `BEAM_ACTOR_ID` | daemon, per actor subprocess | unset | internal handoff, not operator input |
+
+`--num-gpus`, `--node-ip` and `--port` are validated at parse time and take
+precedence over the matching variable (`--num-gpus` > `BEAM_NUM_GPUS` > device
+detection).
+
+**`BEAM_BIND_ADDRESS`.** The head's control port is unauthenticated, so by
+default it listens on every interface. On a host with a public and a cluster
+interface, bind the cluster one:
+
+```
+-e BEAM_BIND_ADDRESS=10.0.0.5
+```
+
+The startup line reports what was bound (`beam head started on ... control port
+bound to 10.0.0.5`), which is also the quickest way to verify a setting took
+effect on that node.
+
 ## NCCL over RoCE in containers
 
 The control plane is plain TCP and needs nothing special. The vLLM data plane
@@ -311,6 +347,10 @@ vllm serve … --gpu-memory-utilization 0.5 --max-model-len 8192 --enforce-eager
 | `Tensor parallel size (N) exceeds available GPUs (1)` warning | benign: vLLM compares TP to per-node GPUs; beam spreads ranks across nodes | ignore (or add GPUs per node) |
 | `import ray` finds the real ray | a real ray is installed in the image | use the stock vllm-openai image (no ray), or uninstall ray |
 | `AF_UNIX path too long`, or `ray status: cannot reach daemon` on a fresh node | `BEAM_RUNTIME_DIR` is nested too deep: the control socket path is capped at 107 bytes (103 on macOS) | point `BEAM_RUNTIME_DIR` at a short dir, e.g. `/tmp/beam`; `ray start` now names this instead of failing inside `connect()` |
+| `beam: BEAM_NUM_GPUS must be a non-negative integer, got '…'` | typo or trailing space in the variable | fix the value; omit it to let beam count the device nodes |
+| `beam: BEAM_NODE_IP must be an IP address …` | a hostname or `IP:port` was passed where an address literal is required | pass `10.0.0.5`, or unset it and let beam probe the default route |
+| `beam head: cannot bind …` at startup | `BEAM_BIND_ADDRESS` names an address this host does not have, or the port is taken | check the address exists here (`ip addr`) / run `ray stop` first, or change `--port` |
+| driver aborts with `beam: no local daemon found` | `BEAM_RUNTIME_DIR` does not match the daemon's, or the daemon is not running | point `BEAM_RUNTIME_DIR`/`BEAM_SOCK` at the daemon, or run `ray start --head` |
 
 ## Validated configuration
 
