@@ -5,11 +5,9 @@
 #   docker build -t vllm-beam .
 #   docker build --build-arg BASE=vllm/vllm-openai:v0.23.0 -t vllm-beam .
 #
-# BASE defaults to a floating :latest, so the same source gives a different image
-# whenever upstream moves. Pass the tag you actually tested (v0.23.0 is what
-# docs/OPERATIONS.md records) and record the digest if you need to rebuild the
-# same bytes later.
-ARG BASE=vllm/vllm-openai:latest
+# Default to the version validated in docs/OPERATIONS.md. Override BASE to
+# test a different release; record its digest for byte-identical rebuilds.
+ARG BASE=vllm/vllm-openai:v0.23.0
 
 # uv is the build tool, pinned by version and digest: the same version the
 # Makefile and both workflows pin. Bump the tag and digest together.

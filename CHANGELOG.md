@@ -94,6 +94,10 @@ notice:
 Upgrade: nothing in the `ray` Python surface vLLM imports changed shape. Scripts
 that invoke the CLI must drop stray arguments and may rely on `--help` exiting 0.
 
+### Changed
+
+- The optional Docker image defaults to the validated vLLM v0.23.0 base. `BASE` remains available to test another release.
+
 ## [0.2.0] - 2026-08-26
 
 ### Fixed
