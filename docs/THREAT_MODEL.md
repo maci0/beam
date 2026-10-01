@@ -77,7 +77,7 @@ internet / cluster subnet
 | B3 remote peer → head TCP | `hello`, `create_actor`, `call`, `kill`, `pg_table`, `resources`, `status`, and any message a peer forwards | none; `handle` dispatches `on_<t>` by string (`_daemon.py:407-411`) | Protocol only |
 | B4 daemon → actor subprocess | pickled class + ctor args, pickled call args, `BEAM_*`/`CUDA_VISIBLE_DEVICES` env | none; worker instantiates whatever arrives (`_worker.py:43-45`) | DESIGN/PROTOCOL describe the flow, not the risk |
 | B5 actor subprocess → daemon | method return values | none | — |
-| B6 build → runtime | wheel/sdist contents installed into the vLLM image (`Dockerfile:19-21`) | `examples/import_check.py` smoke test | no |
+| B6 build → runtime | wheel/sdist contents installed into the vLLM image (`Dockerfile:26-28`) | `examples/import_check.py` smoke test | no |
 | B7 secrets → code | daemon environment inherited by every actor (`_daemon.py:1071`) | none | no |
 | B8 local user → runtime files | `daemon.json` contents drive `ray stop` signalling | file-mode check on create only, implicit umask | no |
 

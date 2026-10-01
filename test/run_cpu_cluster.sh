@@ -5,8 +5,8 @@
 # placement + actor RPC on real hardware.
 #
 # Uniform python is required (cloudpickle bytecode compat), so every node runs
-# the same python:3.12-slim container on the host network. Nodes can have
-# different host python / arch; the container makes them uniform.
+# the same container (python 3.12 + uv, pinned by digest) on the host network.
+# Nodes can have different host python / arch; the container makes them uniform.
 #
 # Edit NODES below (first entry = head). Each entry: "name|ssh-opts|host-ip"
 # where ssh-opts is "LOCAL" for the local host (head runs docker locally), else
@@ -32,7 +32,8 @@ else
   )
 fi
 N="${N:-${#NODES[@]}}"
-IMAGE="${IMAGE:-python:3.12-slim}"
+# uv 0.12.14 to match the Makefile and workflows; bump tag and digest together.
+IMAGE="${IMAGE:-ghcr.io/astral-sh/uv:0.12.14-python3.12-trixie-slim@sha256:306caa341c51eb31335800542983ade93e0d7d7c58a88754f29a817e66de8ebc}"
 REMOTE_DIR="${REMOTE_DIR:-$HOME/beam}"
 PORT="${PORT:-6379}"
 HEAD_IP="$(echo "${NODES[0]}" | cut -d'|' -f3)"
@@ -67,11 +68,11 @@ RUN="docker run -d --name beam-cpu --network host -e BEAM_NUM_GPUS=1 \
 # Hash-pinned, from the lock export that ships alongside the shim: every node in
 # the cluster must unpickle what the head pickled, so a floating cloudpickle
 # would break cross-node actor calls silently.
-PREP="pip install -q --no-deps --require-hashes -r /opt/beam/requirements.lock >/dev/null 2>&1"
+PREP="uv pip install --system --quiet --no-deps --require-hashes -r /opt/beam/requirements.lock >/dev/null 2>&1"
 
 echo "=== head on ${HEAD_IP} ==="
 on 0 "$RUN \"$PREP && python3 -m ray start --head --port $PORT --block\"" >/dev/null
-sleep 6  # pip install + daemon up
+sleep 6  # cloudpickle install + daemon up
 
 for i in $(seq 1 $((N-1))); do
   ip="$(echo "${NODES[$i]}" | cut -d'|' -f3)"

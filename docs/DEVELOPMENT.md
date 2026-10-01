@@ -139,7 +139,9 @@ cannot split (a long string, say) still fails the lint job. ruff, black, mypy
 and yamllint are **version-pinned** in the `Makefile` and CI pins uv itself, so
 a new release of any of them cannot change the verdict on a commit that did not
 touch a lintable file; bump the pin deliberately, in the same commit as the
-reformat it forces. The library
+reformat it forces. uv is pinned to one version in four places, bumped together:
+both workflows, the `Dockerfile` uv stage, and the `IMAGE` default in
+`test/run_cpu_cluster.sh` (the last two by tag and digest). The library
 (`python/ray`) is **fully typed**: mypy runs with `disallow_untyped_defs`,
 `disallow_incomplete_defs`, `disallow_untyped_calls`,
 `disallow_untyped_decorators`, `strict_equality`, `extra_checks` and

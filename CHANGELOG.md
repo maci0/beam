@@ -58,6 +58,9 @@ notice:
   actor-placement logging saw the owner only for remotely hosted actors.
 - `ray --help` prints to stdout and exits 0; bad usage still goes to stderr and
   exits 2. Help and version are documented as exit code 0 in the usage text.
+- The `Dockerfile` takes uv from its digest-pinned image for the install step
+  only, so uv no longer ships in the built image, and it carries OCI
+  title/source/licence labels.
 
 ### Fixed
 
