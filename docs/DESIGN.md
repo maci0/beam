@@ -116,6 +116,10 @@ small payloads), so routing everything through the head hub is fine.
 4. the worker unpickles the class, instantiates it, then serves method calls one
    at a time (Ray actors are single-threaded; different actors run in parallel).
 
+The head also records which bundle each actor occupies, so a bundle runs at most
+one actor at a time. Placement is fail-fast, not queued: a busy or out-of-range
+bundle, or a group with no free bundle, fails the create instead of waiting.
+
 `handle.method.remote(args)` returns an `ObjectRef` immediately. The call is
 dispatched async; the worker posts the pickled result back to its daemon's
 object store keyed by the object id. `ray.get` blocks until the result is there,

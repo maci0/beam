@@ -32,6 +32,55 @@ def test_place_pg_bad_bundle():
     assert node is None and err
 
 
+def test_place_pg_bundle_index_minus_one_is_any_bundle():
+    """ray documents placement_group_bundle_index=-1 as "any available bundle"
+    (it is also the shim's own default); it must place, not error."""
+    d = head()
+    d.pgs["p"] = [{"node": "n1", "gpu": 2}, {"node": "n1", "gpu": 3}]
+    assert d._place_actor({"pg": "p", "bundle": -1}) == ("n1", [2], None)
+
+
+def test_place_pg_bundle_index_other_negative_errors():
+    d = head()
+    d.pgs["p"] = [{"node": "n1", "gpu": 0}]
+    node, _, err = d._place_actor({"pg": "p", "bundle": -2})
+    assert node is None and "out of range" in err
+
+
+def test_place_pg_minus_one_on_empty_group_errors():
+    d = head()
+    d.pgs["p"] = []
+    node, _, err = d._place_actor({"pg": "p", "bundle": -1})
+    assert node is None and "no free bundle" in err
+
+
+def test_place_pg_minus_one_skips_occupied_bundle():
+    """-1 means "any *available* bundle": it must not land on a busy one."""
+    d = head()
+    d.pgs["p"] = [{"node": "n1", "gpu": 2}, {"node": "n1", "gpu": 3}]
+    d._bundle_owner["p/0"] = "n1-aOld"
+    m = {"pg": "p", "bundle": -1}
+    assert d._place_actor(m) == ("n1", [3], None)
+    assert m["bundle"] == 1
+
+
+def test_place_pg_explicit_busy_bundle_errors():
+    d = head()
+    d.pgs["p"] = [{"node": "n1", "gpu": 2}, {"node": "n1", "gpu": 3}]
+    d._bundle_owner["p/1"] = "n1-aOld"
+    node, _, err = d._place_actor({"pg": "p", "bundle": 1})
+    assert node is None and "busy" in err
+
+
+def test_release_bundle_frees_slot():
+    d = head()
+    d._bundle_owner = {"p/0": "a1", "q/0": "a1", "p/1": "a2"}
+    d._release_bundle("a1")
+    assert d._bundle_owner == {"p/1": "a2"}
+    d._release_bundle("nobody")  # idempotent
+    assert d._bundle_owner == {"p/1": "a2"}
+
+
 def test_place_unknown_pg():
     node, _, err = head()._place_actor({"pg": "nope", "bundle": 0})
     assert node is None and "unknown placement group" in err

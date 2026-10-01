@@ -356,6 +356,19 @@ def test_on_create_pg_worker_forwards_and_tracks():
     assert peer.created_pgs == ["n1-pg9"]  # tracked for release on the worker too
 
 
+def test_on_remove_pg_frees_bundles():
+    """remove_pg must release bundle occupancy, else the group keeps its
+    bundles marked busy after a recreation."""
+    d = head()
+    r, _ = run(d.on_create_pg(FakePeer(), {"t": "create_pg", "specs": [{"GPU": 1}]}, b""))
+    pg_id = r["pg"]
+    d._bundle_owner["%s/0" % pg_id] = "n1-aOld"
+    d._bundle_owner["other-pg/0"] = "n1-aOther"
+    r, _ = run(d.on_remove_pg(FakePeer(), {"t": "remove_pg", "pg": pg_id}, b""))
+    assert r["t"] == "remove_pg_ok"
+    assert d._bundle_owner == {"other-pg/0": "n1-aOther"}
+
+
 def test_on_remove_pg_head():
     d = head()
     d.pgs["p"] = [{"node": "n1", "gpu": -1}]

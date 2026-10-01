@@ -414,6 +414,10 @@ class Daemon:
         self.nodes: dict[str, dict[str, Any]] = {}
         self.pgs: dict[str, list[dict[str, Any]]] = {}
         self.actor_loc: dict[str, str] = {}
+        # bundle_key -> actor_id occupying that placement-group bundle, so a
+        # second actor cannot be placed onto a bundle that is already running.
+        # Cleared in lockstep with actor_loc.
+        self._bundle_owner: dict[str, str] = {}
         if is_head:
             self.nodes[node_id] = {"info": dict(self.self_info), "peer": None}
 
@@ -590,6 +594,7 @@ class Daemon:
         # cleanly ("unknown actor") instead of hanging on a dead connection.
         for aid in [a for a, n in self.actor_loc.items() if n == node]:
             del self.actor_loc[aid]
+            self._release_bundle(aid)
 
     def _drop_actor(self, actor_id: str) -> None:
         """Reclaim an actor whose worker subprocess died (crash, not just kill):
@@ -601,6 +606,13 @@ class Daemon:
                 if 0 <= g < len(self.gpu_used):
                     self.gpu_used[g] = False
         self.actor_loc.pop(actor_id, None)
+        self._release_bundle(actor_id)
+
+    def _release_bundle(self, actor_id: str) -> None:
+        """Free the placement-group bundle held by actor_id, if any."""
+        for key, owner in list(self._bundle_owner.items()):
+            if owner == actor_id:
+                del self._bundle_owner[key]
 
     def _used_on_node(self, node: str) -> int:
         used = 0
@@ -697,6 +709,9 @@ class Daemon:
             return await self._forward_head(m)
         pg_id: Any = m.get("pg")
         self.pgs.pop(pg_id, None)
+        # dropping the group frees its bundles for reuse
+        for key in [k for k in self._bundle_owner if k.startswith("%s/" % pg_id)]:
+            del self._bundle_owner[key]
         return {"t": "remove_pg_ok"}, b""
 
     async def on_pg_table(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
@@ -742,6 +757,9 @@ class Daemon:
             assert node is not None and gpus is not None
             actor_id = self._next_id("a")
             self.actor_loc[actor_id] = node
+            pg_id = m.get("pg")
+            if pg_id:
+                self._bundle_owner["%s/%d" % (pg_id, m["bundle"])] = actor_id
             if peer is not None:
                 peer.created_actors.append(actor_id)
             req = {"t": "create_actor", "actor": actor_id, "gpus": gpus}
@@ -920,6 +938,7 @@ class Daemon:
             if p is None:
                 # owner unreachable: drop stale routing (cannot retry via RPC)
                 self.actor_loc.pop(actor_id, None)
+                self._release_bundle(actor_id)
                 return
             try:
                 await asyncio.wait_for(
@@ -928,6 +947,7 @@ class Daemon:
             except Exception:
                 return  # keep actor_loc for retry
             self.actor_loc.pop(actor_id, None)
+            self._release_bundle(actor_id)
         except Exception:
             pass
 
@@ -1019,14 +1039,41 @@ class Daemon:
                 self._free_orphan_pgs_if_idle()
 
     def _place_actor(self, m: dict) -> tuple[str | None, list[int] | None, str | None]:
+        """Resolve node + GPU indices for a create. For a pg actor this rewrites
+        m["bundle"] from -1 to the free bundle it picked, so the caller can
+        record which bundle the actor occupies."""
         pg_id = m.get("pg")
         if pg_id:
             pg = self.pgs.get(pg_id)
             if pg is None:
                 return None, None, "unknown placement group %s" % pg_id
-            bundle = _gpu_count(m.get("bundle", 0), default=-1)
-            if bundle < 0 or bundle >= len(pg):
+            # A bundle index may be negative (-1 == "any bundle"), so it
+            # cannot go through _gpu_count, which only accepts non-negative
+            # counts. -2 is the sentinel for a value that is not an int at all
+            # (str/float/None/list, and bool, which is an int subclass but
+            # never a real index): it falls out as out-of-range below instead
+            # of raising a TypeError mid-handler or being placed on the -1 path.
+            raw_bundle = m.get("bundle", 0)
+            bundle = (
+                raw_bundle
+                if isinstance(raw_bundle, int) and not isinstance(raw_bundle, bool)
+                else -2
+            )
+            # ray's PlacementGroupSchedulingStrategy defaults
+            # placement_group_bundle_index to -1 == "any available bundle";
+            # other negative values stay out of range.
+            if bundle == -1:
+                free = [i for i in range(len(pg)) if "%s/%d" % (pg_id, i) not in self._bundle_owner]
+                if not free:
+                    return None, None, "placement group %s has no free bundle" % pg_id
+                bundle = free[0]
+            elif bundle < 0 or bundle >= len(pg):
                 return None, None, "bundle index %s out of range" % (m.get("bundle", 0),)
+            elif "%s/%d" % (pg_id, bundle) in self._bundle_owner:
+                return None, None, "bundle %d of placement group %s is busy" % (bundle, pg_id)
+            # resolved index: the caller claims the bundle once the actor is
+            # registered, and releases it wherever actor_loc is dropped.
+            m["bundle"] = bundle
             b = pg[bundle]
             return b["node"], ([b["gpu"]] if b["gpu"] >= 0 else []), None
         # ngpu is the quantity the client asks for. Anything that is not a
@@ -1226,6 +1273,7 @@ class Daemon:
         if not self.is_head:
             return await self._forward_head(m)
         self.actor_loc.pop(m["actor"], None)
+        self._release_bundle(m["actor"])
         return {"t": "actor_gone_ok"}, b""
 
     async def on_call(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
@@ -1277,6 +1325,7 @@ class Daemon:
                 # there yet / already gone): drop routing, do not loop.
                 if p is None or p is peer:
                     self.actor_loc.pop(actor_id, None)
+                    self._release_bundle(actor_id)
                     return {"t": "kill_ok"}, b""
                 # build a clean message: m may be a synthetic dict (e.g. from
                 # release_client) that lacks a well-formed type field.
@@ -1291,8 +1340,10 @@ class Daemon:
                     msg = str(e) or "kill timed out or failed"
                     return {"err": msg}, b""
                 self.actor_loc.pop(actor_id, None)
+                self._release_bundle(actor_id)
                 return {"t": "kill_ok"}, b""
             self.actor_loc.pop(actor_id, None)
+            self._release_bundle(actor_id)
 
         if actor_id not in self.actors:
             # Mid-create: hosting but not yet in self.actors. Reap here; never

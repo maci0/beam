@@ -358,6 +358,45 @@ def test_start_bad_num_gpus_value(capsys):
     assert "--num-gpus expects an integer" in capsys.readouterr().err
 
 
+def test_start_bad_beam_num_gpus_env(capsys, monkeypatch):
+    """BEAM_NUM_GPUS is the env form of --num-gpus: a typo must fail with a
+    message, not a ValueError traceout from detect_gpus."""
+    monkeypatch.setenv("BEAM_NUM_GPUS", "abc")
+    assert _cli._start(["--head"]) == 2
+    assert "BEAM_NUM_GPUS must be an integer" in capsys.readouterr().err
+
+
+def test_start_negative_beam_num_gpus_env(capsys, monkeypatch):
+    monkeypatch.setenv("BEAM_NUM_GPUS", "-2")
+    assert _cli._start(["--head"]) == 2
+    assert "BEAM_NUM_GPUS must be >= 0" in capsys.readouterr().err
+
+
+def test_start_beam_num_gpus_env_applies(monkeypatch):
+    captured = {}
+
+    def fake_run(coro):
+        coro.close()
+        return 0
+
+    def fake_run_daemon(head, node_id, ip, gpus, port, address):
+        captured["gpus"] = gpus
+
+        async def _c():
+            return 0
+
+        return _c()
+
+    monkeypatch.setenv("BEAM_NUM_GPUS", "3")
+    monkeypatch.setattr(_cli, "maybe_bootstrap", lambda: None)
+    monkeypatch.setattr(_cli, "_live_daemon_pid", lambda: None)
+    monkeypatch.setattr(_cli.asyncio, "run", fake_run)
+    monkeypatch.setattr(_cli, "_run_daemon", fake_run_daemon)
+    monkeypatch.setattr(_cli, "_local_ip", lambda: "1.1.1.1")
+    assert _cli._start(["--head"]) == 0
+    assert captured["gpus"] == 3
+
+
 def test_start_bad_address_port(capsys):
     assert _cli._start(["--address", "host:notnum"]) == 2
     assert "port must be numeric" in capsys.readouterr().err

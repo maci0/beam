@@ -236,6 +236,18 @@ def _start(args: list[str]) -> int:
     if num_gpus is not None and num_gpus < 0:
         sys.stderr.write("beam start: --num-gpus must be >= 0, got %d\n" % num_gpus)
         return 2
+    # BEAM_NUM_GPUS is the same setting as --num-gpus; validate it here so a typo
+    # fails with a message instead of a ValueError traceout (or a negative GPU count).
+    env_gpus = os.environ.get("BEAM_NUM_GPUS")
+    if num_gpus is None and env_gpus is not None:
+        try:
+            num_gpus = int(env_gpus)
+        except ValueError:
+            sys.stderr.write("beam: BEAM_NUM_GPUS must be an integer, got %r\n" % env_gpus)
+            return 2
+        if num_gpus < 0:
+            sys.stderr.write("beam: BEAM_NUM_GPUS must be >= 0, got %d\n" % num_gpus)
+            return 2
 
     # Refuse an unusable socket path, then a live daemon's socket/runtime dir.
     # Checked here so a deep BEAM_RUNTIME_DIR is a named error instead of a

@@ -85,6 +85,13 @@ ray is unavailable and refuse the backend. They are not optional.
 beam places bundles synchronously at creation, so `ray.get(pg.ready())` returns
 immediately.
 
+A bundle runs at most one actor. `placement_group_bundle_index` selects it
+directly; the ray default of `-1` (what `PlacementGroupSchedulingStrategy` uses
+when you pass no index) picks any free bundle. beam does not queue: asking for a
+busy bundle, an out-of-range bundle, or a group with no free bundle raises a
+`RuntimeError` naming the group rather than waiting for one to free up.
+`remove_placement_group` releases the whole group's bundles.
+
 ## Stubs (present so imports/annotations resolve, not functional)
 
 | symbol                          | behavior                                         |
