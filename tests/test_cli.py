@@ -675,6 +675,25 @@ def test_run_daemon_worker_unreachable(tmp_path, monkeypatch, capsys):
     assert "head not reachable" in capsys.readouterr().err
 
 
+def test_run_daemon_worker_join_refused(tmp_path, monkeypatch, capsys):
+    """A head that answers and refuses must fail like an unreachable one.
+
+    on_hello on a non-head daemon answers {"err": "not the head node"}, which
+    Peer.call raises as RuntimeError; that is not an OSError, so without the arm
+    it escapes as a traceout and the claimed daemon.json / daemon.sock are left
+    behind for the next `ray start` to trip over.
+    """
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _patch_daemon(monkeypatch, join_exc=RuntimeError("not the head node"))
+    import asyncio as aio
+
+    rc = aio.run(_cli._run_daemon(False, "w1", "5.6.7.8", 2, 6379, "head:6379"))
+    assert rc == 1
+    assert "refused the join" in capsys.readouterr().err
+    assert not os.path.exists(os.path.join(str(tmp_path), "daemon.json"))
+    assert not os.path.exists(os.path.join(str(tmp_path), "daemon.sock"))
+
+
 # ---- _status ----------------------------------------------------------------
 
 

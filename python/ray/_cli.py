@@ -345,6 +345,18 @@ async def _run_daemon(
                 "beam worker: head not reachable at %s (%s). Check it is up and the "
                 "port is open between nodes.\n" % (address, e)
             )
+        except RuntimeError as e:
+            # The head answered and refused: on_hello rejects a join aimed at a
+            # daemon that is not the head with {"err": "not the head node"},
+            # which Peer.call raises as a RuntimeError. Without this arm the
+            # refusal escapes as a traceout and _fail never runs, so the claimed
+            # daemon.json and the bound daemon.sock stay behind and the next
+            # `ray start` refuses with "daemon already running" until an
+            # operator deletes them by hand.
+            return _fail(
+                "beam worker: head at %s refused the join: %s\n"
+                "--address must name the head (the node started with --head).\n" % (address, e)
+            )
         rt["addr"] = address
         print("beam worker joined %s (%d GPUs)" % (address, gpus))
 
