@@ -16,7 +16,7 @@ from ray import _proto
 from ray.exceptions import GetTimeoutError
 from ray.runtime_env import RuntimeEnv
 
-ObjectRef = ray.ObjectRef  # noqa: E405  (bound at import time for the seam tests)
+ObjectRef = ray.ObjectRef  # bound at import time for the seam tests
 
 
 class FakeClient:
@@ -206,6 +206,7 @@ def test_budgeted_assumes_a_budget_for_a_callable_it_cannot_introspect(monkeypat
     """A client whose request has no inspectable signature (a C callable or a
     builtin) is assumed to accept the budget: the budget is what keeps the
     caller's deadline, so dropping it silently would be the worse failure."""
+
     class Opaque:
         """A callable whose signature cannot be introspected (some C builtins)."""
 

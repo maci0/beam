@@ -17,7 +17,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 
-from . import _config, _daemon, _proto
+from . import _config, _daemon, _proto, _runtime
 
 # ---- tuning ----
 
@@ -30,14 +30,6 @@ _SIGKILL_POLL_INTERVAL = 0.05
 # 107 bytes on Linux (103 on macOS). Capped a little lower so the check below
 # also catches paths that only blow up once something appends to them.
 _SOCK_PATH_MAX = 100
-
-
-def _runtime_dir() -> str:
-    return _config.runtime_dir()
-
-
-def _runtime_path() -> str:
-    return _config.runtime_json_path()
 
 
 def _check_sock_path(sock: str) -> None:
@@ -271,8 +263,8 @@ def _start(args: list[str]) -> int:
     # Refuse an unusable socket path, then a live daemon's socket/runtime dir.
     # Checked here so a deep BEAM_RUNTIME_DIR is a named error instead of a
     # bare OSError("AF_UNIX path too long") from deep inside connect().
-    _check_sock_path(os.path.join(_runtime_dir(), "daemon.sock"))
-    live = _live_daemon_pid()
+    _check_sock_path(_config.runtime_sock_path())
+    live = _runtime.live_daemon_pid()
     if live is not None:
         sys.stderr.write(
             "beam start: daemon already running (pid %d). Run 'ray stop' first.\n" % live
@@ -293,18 +285,6 @@ def _start(args: list[str]) -> int:
     return asyncio.run(_run_daemon(head, node_id, ip, gpus, port, address))
 
 
-def _write_runtime_atomic(rt: dict) -> None:
-    """Write daemon.json via temp+replace so readers never see a partial file."""
-    path = _runtime_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp.%d" % os.getpid()
-    with open(tmp, "w") as f:
-        json.dump(rt, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
 async def _run_daemon(
     head: bool,
     node_id: str,
@@ -318,9 +298,9 @@ async def _run_daemon(
 
     # Exclusive claim before unlinking the sock, so two concurrent starts cannot
     # both pass the live check and steal each other's socket path.
-    os.makedirs(_runtime_dir(), exist_ok=True)
+    os.makedirs(_config.runtime_dir(), exist_ok=True)
     rt: dict = {"sock": sock, "node": node_id, "head": head, "pid": os.getpid()}
-    claim = _claim_runtime(rt)
+    claim = _runtime.claim(rt)
     if claim is not None:
         sys.stderr.write(claim)
         return 1
@@ -329,7 +309,7 @@ async def _run_daemon(
 
     def _fail(msg: str) -> int:
         sys.stderr.write(msg)
-        for path in (sock, _runtime_path()):
+        for path in (sock, _config.runtime_json_path()):
             try:
                 os.remove(path)  # don't leave a stale socket / pidfile behind
             except OSError:
@@ -368,7 +348,7 @@ async def _run_daemon(
         rt["addr"] = address
         print("beam worker joined %s (%d GPUs)" % (address, gpus))
 
-    _write_runtime_atomic(rt)
+    _runtime.write(rt)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -379,15 +359,12 @@ async def _run_daemon(
     d.shutdown()  # reap actor worker subprocesses instead of orphaning them
     # Unlink sock only while our claim still names this pid (keeps concurrent
     # restarts from rebinding daemon.sock and then having it deleted). Remove
-    # the claim last so _live_daemon_pid stays true for the whole teardown.
-    path = _runtime_path()
-    try:
-        with open(path) as f:
-            rt2 = json.load(f)
-        if int(rt2.get("pid") or 0) != os.getpid():
-            return 0  # another daemon owns the claim; leave sock alone
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError, KeyError):
-        return 0
+    # the claim last so _runtime.live_daemon_pid stays true for the whole
+    # teardown.
+    path = _config.runtime_json_path()
+    rt2 = _runtime.read()
+    if not rt2 or _pid_of(rt2) != os.getpid():
+        return 0  # unreadable, or another daemon owns the claim; leave sock alone
     try:
         os.remove(sock)
     except OSError:  # pragma: no cover
@@ -399,143 +376,9 @@ async def _run_daemon(
     return 0
 
 
-def _read_runtime() -> dict:
-    with open(_runtime_path()) as f:
-        return json.load(f)
-
-
-def _link_restore(seized: str, path: str) -> bool:
-    """Restore seized claim to path only if path is free (never clobber).
-
-    Returns True if restored, False if path is already owned (seized dropped)
-    or restore failed. On non-FileExistsError link failures, leave seized on
-    disk so the last copy of a live claim is not destroyed.
-    """
-    try:
-        os.link(seized, path)
-        try:
-            os.unlink(seized)
-        except OSError:
-            pass
-        return True
-    except FileExistsError:
-        # path already has a claim: drop our seized copy only
-        try:
-            os.unlink(seized)
-        except OSError:
-            pass
-        return False
-    except OSError:
-        # path still free but link failed (EPERM/ENOSPC/...): keep seized
-        return False
-
-
-def _claim_runtime(rt: dict) -> str | None:
-    """Atomically publish a complete daemon.json for this process.
-
-    Writes the full document to a temp file first, then links it into place so
-    another start never sees an empty/partial claim and steals the runtime.
-    Stale pidfiles are rename-seized (not remove-then-link) to avoid a window
-    where a concurrent claim is deleted out from under a live daemon.
-    Returns an error message if another live daemon owns the runtime, else None.
-    """
-    path = _runtime_path()
-    tmp = path + ".tmp.%d" % os.getpid()
-    with open(tmp, "w") as f:
-        json.dump(rt, f)
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        for _ in range(2):
-            try:
-                os.link(tmp, path)  # fails if path already exists
-                return None
-            except FileExistsError:
-                live = _live_daemon_pid()
-                if live is not None:
-                    return "beam: daemon already running (pid %d). Run 'ray stop' first.\n" % live
-                # Seize the existing path atomically, confirm it is still dead
-                # (or not an in-progress stop hold), then discard and retry.
-                seized = path + ".stale.%d" % os.getpid()
-                try:
-                    os.rename(path, seized)
-                except OSError:
-                    continue  # raced with another claim/stop; retry link
-                still_live = False
-                old_pid: int | None = None
-                try:
-                    with open(seized) as f:
-                        old = json.load(f)
-                    old_pid = int(old.get("pid") or 0)
-                    # Active ray stop holds the path with the stop process pid.
-                    if old.get("stopping") and old_pid:
-                        try:
-                            os.kill(old_pid, 0)
-                            still_live = True
-                        except ProcessLookupError:
-                            still_live = False  # abandoned stop; reclaim
-                        except OSError:
-                            still_live = True
-                    elif old_pid:
-                        try:
-                            os.kill(old_pid, 0)
-                            still_live = True
-                        except ProcessLookupError:
-                            still_live = False
-                        except OSError:
-                            still_live = True  # EPERM: treat as live
-                except (
-                    OSError,
-                    ValueError,
-                    TypeError,
-                    json.JSONDecodeError,
-                    AttributeError,
-                    KeyError,
-                ):
-                    still_live = False
-                if still_live:
-                    _link_restore(seized, path)
-                    return "beam: daemon already running (pid %s). Run 'ray stop' first.\n" % (
-                        old_pid if old_pid else "?"
-                    )
-                try:
-                    os.remove(seized)
-                except OSError:
-                    pass
-                continue
-        return "beam: cannot claim runtime dir %s\n" % path
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
-def _live_daemon_pid() -> int | None:
-    """Return the pid of a still-running local daemon, or None if none/stale."""
-    try:
-        rt = _read_runtime()
-        pid = int(rt.get("pid") or 0)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError, KeyError):
-        return None
-    if not pid:
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None
-    except OSError:
-        # EPERM etc: process exists but is not signalable; treat as live so we
-        # do not unlink its socket out from under it.
-        return pid
-    return pid
-
-
 def _status() -> int:
-    try:
-        rt = _read_runtime()
-        sock_path = rt["sock"]
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError, KeyError):
+    sock_path = _runtime.read().get("sock")
+    if not isinstance(sock_path, str) or not sock_path:
         sys.stderr.write("beam status: no running daemon found\n")
         return 1
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -592,14 +435,24 @@ def _status() -> int:
     return 0
 
 
-def _stop() -> int:
+def _pid_of(doc: dict) -> int:
+    """The `pid` field of a runtime document, or 0 when missing or not an int.
 
+    A pid that cannot be parsed is not a process: callers treat 0 as "there is
+    nothing to signal, but the claim's files are still cleaned".
+    """
     try:
-        rt = _read_runtime()
-        pid = int(rt.get("pid") or 0)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError, KeyError):
+        return int(doc.get("pid") or 0)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _stop() -> int:
+    rt = _runtime.read()
+    if not rt:
         sys.stderr.write("beam stop: no running daemon found\n")
         return 1
+    pid = _pid_of(rt)  # 0 for a malformed pid: nothing to signal, files still cleaned
     # Another stop is holding the runtime: never SIGTERM that stop process.
     if rt.get("stopping"):
         stop_pid = pid
@@ -625,21 +478,10 @@ def _stop() -> int:
                     return 1
                 # Peer stop gone: if claim cleaned, done; if abandoned hold
                 # remains, fall through to rename-seize cleanup.
-                try:
-                    rt2 = _read_runtime()
-                except (
-                    OSError,
-                    ValueError,
-                    TypeError,
-                    json.JSONDecodeError,
-                    AttributeError,
-                    KeyError,
-                ):
-                    print("beam stop: another stop finished")
-                    return 0
-                if not rt2.get("stopping"):
+                rt2 = _runtime.read()
+                if not rt2 or not rt2.get("stopping"):
                     # Peer stop finished; a new daemon may own the claim.
-                    live = _live_daemon_pid()
+                    live = _runtime.live_daemon_pid()
                     if live:
                         sys.stderr.write(
                             "beam stop: another stop finished but daemon pid %s "
@@ -649,7 +491,7 @@ def _stop() -> int:
                     print("beam stop: another stop finished")
                     return 0
                 # still a stopping hold; only clean if that stop pid is dead
-                hold_pid = int(rt2.get("pid") or 0)
+                hold_pid = _pid_of(rt2)
                 if hold_pid and hold_pid != stop_pid:
                     # different stop/daemon hold: do not seize their claim
                     try:
@@ -671,41 +513,28 @@ def _stop() -> int:
                 # fall through to abandoned seize-clean
         # abandoned stop hold: only seize if the current doc is still a dead
         # stopping hold (never rename-seize a live stopclean/daemon claim).
-        path = _runtime_path()
-        try:
-            cur = _read_runtime()
-            cur_pid = int(cur.get("pid") or 0)
-            if not cur.get("stopping"):
-                live = _live_daemon_pid()
-                if live:
-                    sys.stderr.write(
-                        "beam stop: daemon pid %s still running; re-run ray stop\n" % live
-                    )
-                    return 1
-                print("beam stop: another stop finished")
-                return 0
-            if cur_pid:
-                try:
-                    os.kill(cur_pid, 0)
-                except ProcessLookupError:
-                    pass  # dead hold; safe to seize
-                except OSError:
-                    sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % cur_pid)
-                    return 1
-                else:
-                    sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % cur_pid)
-                    return 1
-            sock_path = cur.get("sock") or sock_path
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-            AttributeError,
-            KeyError,
-        ):
+        path = _config.runtime_json_path()
+        cur = _runtime.read()
+        if not cur or not cur.get("stopping"):
+            live = _runtime.live_daemon_pid()
+            if live:
+                sys.stderr.write("beam stop: daemon pid %s still running; re-run ray stop\n" % live)
+                return 1
             print("beam stop: another stop finished")
             return 0
+        cur_pid = _pid_of(cur)  # 0: no usable hold pid, so nothing live to protect
+        if cur_pid:
+            try:
+                os.kill(cur_pid, 0)
+            except ProcessLookupError:
+                pass  # dead hold; safe to seize
+            except OSError:
+                sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % cur_pid)
+                return 1
+            else:
+                sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % cur_pid)
+                return 1
+        sock_path = cur.get("sock") or sock_path
         seized = path + ".stopabandoned.%d" % os.getpid()
         try:
             os.rename(path, seized)
@@ -719,25 +548,11 @@ def _stop() -> int:
             except OSError:
                 pass
 
-        doc: dict = {}
-        doc_ok = False
-        try:
-            with open(seized) as f:
-                doc = json.load(f)
-            doc_ok = isinstance(doc, dict)
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-            AttributeError,
-            KeyError,
-        ):
-            doc = {}
-        if doc_ok and not doc.get("stopping"):
+        doc = _runtime.read(seized)
+        if not doc or not doc.get("stopping"):
             # not an abandoned hold: restore if free; never report success if live
-            _link_restore(seized, path)
-            live = _live_daemon_pid()
+            _runtime.link_restore(seized, path)
+            live = _runtime.live_daemon_pid()
             if live:
                 sys.stderr.write(
                     "beam stop: runtime owned by live daemon pid %s; re-run ray stop\n" % live
@@ -745,22 +560,21 @@ def _stop() -> int:
                 return 1
             print("beam stop: another stop finished")
             return 0
-        if doc_ok:
-            hold_pid = int(doc.get("pid") or 0)
-            if hold_pid:
-                try:
-                    os.kill(hold_pid, 0)
-                except ProcessLookupError:
-                    pass  # confirmed abandoned
-                except OSError:
-                    _link_restore(seized, path)
-                    sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % hold_pid)
-                    return 1
-                else:
-                    _link_restore(seized, path)
-                    sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % hold_pid)
-                    return 1
-            sock_path = doc.get("sock") or sock_path
+        hold_pid = _pid_of(doc)
+        if hold_pid:
+            try:
+                os.kill(hold_pid, 0)
+            except ProcessLookupError:
+                pass  # confirmed abandoned
+            except OSError:
+                _runtime.link_restore(seized, path)
+                sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % hold_pid)
+                return 1
+            else:
+                _runtime.link_restore(seized, path)
+                sys.stderr.write("beam stop: another stop in progress (pid %s)\n" % hold_pid)
+                return 1
+        sock_path = doc.get("sock") or sock_path
         # Install a *live* stop hold (this process's pid) before unlinking the
         # sock so concurrent ray start sees a live claim and refuses.
         hold = path + ".stopclean.%d" % os.getpid()
@@ -786,7 +600,7 @@ def _stop() -> int:
             except OSError:
                 pass
             _drop_seized()
-            live = _live_daemon_pid()
+            live = _runtime.live_daemon_pid()
             if live:
                 sys.stderr.write("beam stop: runtime owned by live process pid %s\n" % live)
                 return 1
@@ -807,22 +621,12 @@ def _stop() -> int:
                 except OSError:
                     pass
         # Confirm we still own the live hold immediately before sock unlink.
-        try:
-            with open(path) as f:
-                cur = json.load(f)
-            if int(cur.get("pid") or 0) != os.getpid() or not cur.get("stopping"):
-                # Do not unlink path we do not own; only drop seized.
-                _drop_seized()
-                print("beam stop: another stop finished")
-                return 0
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-            AttributeError,
-            KeyError,
-        ):
+        cur = _runtime.read()
+        # A hold we cannot parse is not a hold we own: never unlink a path we
+        # cannot prove is ours.
+        owned = _pid_of(cur) == os.getpid() and bool(cur.get("stopping"))
+        if not owned:
+            # Do not unlink path we do not own; only drop seized.
             _drop_seized()
             print("beam stop: another stop finished")
             return 0
@@ -874,38 +678,23 @@ def _stop() -> int:
     # Atomically seize daemon.json so a concurrent restart cannot lose its claim.
     # Re-read first: only rename when the claim still names the target pid (a
     # new daemon may have claimed the path after the old process died).
-    path = _runtime_path()
-    try:
-        cur = _read_runtime()
-        cur_pid = int(cur.get("pid") or 0)
-        if cur_pid != pid:
+    path = _config.runtime_json_path()
+    cur = _runtime.read()
+    cur_pid = _pid_of(cur)
+    if cur_pid != pid:
+        print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
+        return 0
+    # Live stop hold for another process: do not seize it.
+    if cur.get("stopping") and cur_pid and cur_pid != os.getpid():
+        try:
+            os.kill(cur_pid, 0)
+        except OSError:
+            # probe says the holder is gone; the seize below still re-checks the
+            # renamed document before it touches anything
+            pass
+        else:
             print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
             return 0
-        # Live stop hold for another process: do not seize it.
-        if cur.get("stopping") and cur_pid and cur_pid != os.getpid():
-            try:
-                os.kill(cur_pid, 0)
-                print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
-                return 0
-            except ProcessLookupError:
-                pass  # abandoned hold with matching stopped target; seize below
-            except OSError:
-                print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
-                return 0
-    except (
-        OSError,
-        ValueError,
-        TypeError,
-        json.JSONDecodeError,
-        AttributeError,
-        KeyError,
-    ):
-        print(
-            "beam stop: stopped pid %s" % pid
-            if alive
-            else "beam stop: no live daemon (cleaned stale files)"
-        )
-        return 0
     doomed = path + ".stopping.%d" % os.getpid()
     try:
         os.rename(path, doomed)
@@ -916,19 +705,15 @@ def _stop() -> int:
             else "beam stop: no live daemon (cleaned stale files)"
         )
         return 0
-    try:
-        with open(doomed) as f:
-            rt2 = json.load(f)
-        if int(rt2.get("pid") or 0) != pid:
-            # give it back only if path is free; never rename-over a new claim
-            _link_restore(doomed, path)
-            print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
-            return 0
-        sock_path = rt2.get("sock") or rt.get("sock")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError, KeyError):
-        sock_path = rt.get("sock")
+    rt2 = _runtime.read(doomed)
+    if _pid_of(rt2) != pid:
+        # give it back only if path is free; never rename-over a new claim
+        _runtime.link_restore(doomed, path)
+        print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
+        return 0
+    sock_path = rt2.get("sock") or rt.get("sock")
     # Hold the runtime path with *this* stop process's pid so concurrent
-    # `ray start` sees a live claim via _live_daemon_pid / stopping marker.
+    # `ray start` sees a live claim via _runtime.live_daemon_pid / the marker.
     hold = path + ".stophold.%d" % os.getpid()
     hold_ok = False
     try:
@@ -981,26 +766,13 @@ def _stop() -> int:
             except OSError:
                 pass
     # Confirm we still own the claim immediately before unlinking the sock.
-    try:
-        with open(path) as f:
-            cur = json.load(f)
-        if int(cur.get("pid") or 0) != os.getpid() or not cur.get("stopping"):
-            try:
-                os.remove(doomed)
-            except OSError:
-                pass
-            print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
-            return 0
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError, KeyError):
+    cur = _runtime.read()
+    if _pid_of(cur) != os.getpid() or not cur.get("stopping"):
         try:
             os.remove(doomed)
         except OSError:
             pass
-        print(
-            "beam stop: stopped pid %s" % pid
-            if alive
-            else "beam stop: no live daemon (cleaned stale files)"
-        )
+        print("beam stop: stopped pid %s (runtime now owned by another daemon)" % pid)
         return 0
     for p in (sock_path, doomed, path):
         try:

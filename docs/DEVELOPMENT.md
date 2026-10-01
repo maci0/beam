@@ -9,6 +9,7 @@ python/ray/
   _proto.py              frame encode/decode + cloudpickle helpers (sync side)
   _daemon.py             the asyncio daemon: membership, placement, actor hub, routing
   _cli.py                `ray start/status/stop/bootstrap` (start runs the daemon)
+  _runtime.py            the daemon.json claim: read/write/claim, pid liveness, seize+restore
   __main__.py            `python -m ray` → _cli.main
   _worker.py             actor subprocess: instantiate class, serve method calls
   util/
@@ -39,7 +40,7 @@ tests/                   pytest + hypothesis, 100% coverage of python/ray
   test_daemon_handlers.py  the async on_* handlers, driven via a fake Peer
   test_shim.py           the ray shim's request translation
   test_cli.py            start/status/stop arg parsing + runtime files
-  test_config.py         env-var loaders and their validation
+  test_config.py         env-var loaders, and the daemon.json readers built on them
   test_client.py / test_util.py / test_runtime.py / test_misc.py / test_scanner.py
   test_replay.py         the BEAM_SEED replay profile in conftest.py
 

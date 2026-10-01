@@ -34,8 +34,10 @@ __all__ = [
     "accelerator_ids",
     "bind_address",
     "gpu_ids",
+    "local_node_id",
     "node_ip",
     "num_gpus",
+    "read_runtime_doc",
     "route_probe_ip",
     "runtime_dir",
     "runtime_json_path",
@@ -59,6 +61,12 @@ _ANY = "0.0.0.0"
 
 class ConfigError(Exception):
     """An environment variable is set to a value beam cannot use."""
+
+
+def _doc_str(doc: dict, key: str) -> str | None:
+    """A non-empty string field of a runtime document, else None."""
+    val = doc.get(key)
+    return val if isinstance(val, str) and val else None
 
 
 def _env(name: str) -> str | None:
@@ -166,15 +174,34 @@ def runtime_sock() -> str | None:
     FileNotFoundError or a KeyError from `["sock"]`.
     """
     sock = _env("BEAM_SOCK")
-    if sock:
-        return sock
+    return sock if sock else _doc_str(read_runtime_doc(), "sock")
+
+
+def read_runtime_doc(path: str | None = None) -> dict:
+    """A runtime document, or {} when it is missing or unreadable.
+
+    `path` defaults to the live daemon.json. Every reader of that document (the
+    shim's socket and node-id lookups, the CLI's status/stop/claim paths, and the
+    seized or held copies they rename it to) goes through here, so the layout of
+    the document and the "unreadable means empty" rule are defined once and one
+    parse cannot hand a socket to one caller and a KeyError to another.
+    """
     try:
-        with open(runtime_json_path()) as f:
+        with open(path or runtime_json_path()) as f:
             doc = json.load(f)
     except (OSError, ValueError):
-        return None
-    sock = doc.get("sock") if isinstance(doc, dict) else None
-    return sock if isinstance(sock, str) and sock else None
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def local_node_id(fallback: str = "driver") -> str:
+    """Node id the local daemon published, else `fallback`.
+
+    Read from the same runtime document as runtime_sock(), so a caller that
+    found the socket also finds a node id, and one that found neither does not
+    have to know the document's layout to say so.
+    """
+    return _doc_str(read_runtime_doc(), "node") or fallback
 
 
 # ---- actor worker handoff ----

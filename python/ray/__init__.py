@@ -390,13 +390,7 @@ def nodes() -> list[dict]:
 
 
 def _local_node_id() -> str:
-    import json
-
-    try:
-        with open(os.path.join(_config.runtime_dir(), "daemon.json")) as f:
-            return json.load(f)["node"]
-    except OSError:
-        return "driver"
+    return _config.local_node_id()
 
 
 def _get_ip() -> str:

@@ -56,7 +56,8 @@ Three kinds of process, all Python:
   The head daemon is the routing hub and the authority on membership and
   placement. Worker daemons dial the head once and keep that connection; the head
   pushes actor create/call/kill requests down it. Files: `ray/_daemon.py`,
-  `ray/_cli.py`.
+  `ray/_cli.py`, and `ray/_runtime.py` (the `daemon.json` claim that `start`
+  takes, `status` reads, and `stop` seizes).
 
 - **The actor worker** (`ray._worker`): one subprocess per actor, spawned by a
   daemon with the actor's `CUDA_VISIBLE_DEVICES`. It unpickles the class vLLM
