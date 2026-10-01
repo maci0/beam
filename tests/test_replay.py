@@ -31,6 +31,9 @@ def _run(tmp_path, seed=None):
     e = dict(os.environ)
     e.pop("BEAM_SEED", None)
     e.pop("HYPOTHESIS_SEED", None)
+    # Exercise the local default; Hypothesis selects its own CI profile under CI.
+    e.pop("CI", None)
+    e.pop("GITHUB_ACTIONS", None)
     if seed:
         e["BEAM_SEED"] = seed
     e["PYTHONHASHSEED"] = "0"

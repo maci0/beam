@@ -9,7 +9,7 @@ All notable changes to beam are recorded here, in the format of
 
 beam publishes two version numbers and they mean different things:
 
-- The **tag** (`v0.3.0`, this file's headings) is beam's release line. It is the
+- The **tag** (`v0.3.1`, this file's headings) is beam's release line. It is the
   only version that says anything about beam's own compatibility, and it is the
   version `SECURITY.md` calls "the current release".
 - The **distribution version** (`ray 2.43.0`, in `python/pyproject.toml` and
@@ -22,6 +22,12 @@ Both numbers are checked against each other and against the tag by
 `scripts/check_release.py`, which `make check` and the release workflow run.
 
 ## [Unreleased]
+
+## [0.3.1] - 2026-10-01
+
+### Fixed
+
+- The replay fixture isolates Hypothesis's local default from the runner's CI profile. CI pins its test interpreter so the Python 3.9 syntax probe cannot change which interpreter runs the current test tools.
 
 ## [0.3.0] - 2026-10-01
 
@@ -151,7 +157,8 @@ No change to the `ray` API surface.
   and an actor-call hub. Bind-mount into the stock vLLM image; tensor traffic
   stays on NCCL/RCCL. Fully typed, 100% test coverage, validated cross-node.
 
-[Unreleased]: https://github.com/maci0/beam/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/maci0/beam/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/maci0/beam/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/maci0/beam/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/maci0/beam/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/maci0/beam/compare/v0.1.2...v0.1.3
