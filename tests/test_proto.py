@@ -13,8 +13,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-from ray import _proto  # noqa: E402
-from ray._daemon import encode_frame  # noqa: E402
+from ray import _proto
+from ray._daemon import encode_frame
 
 
 class BytesSock:

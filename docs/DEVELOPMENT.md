@@ -64,7 +64,7 @@ on its own lists them. The only prerequisites are [`uv`](https://docs.astral.sh/
 and `shellcheck`; no venv setup, no global installs, no GPU.
 
 ```
-make check        # everything CI checks: lint, types, shell, unit+fuzz, import, e2e
+make check        # everything CI checks: lint, types, shell, yaml, unit+fuzz, import, e2e
 make test         # unit + fuzz suite only (~10s, no GPUs)
 make test-one T=tests/test_cli.py::test_start_needs_head_or_address
 make e2e          # the four local control-plane harnesses
@@ -110,12 +110,28 @@ make lint    # uvx ruff check python examples scripts tests
              # uvx black --check python examples scripts tests
 make types   # uvx --with cloudpickle mypy --config-file pyproject.toml python/ray
 make shell   # shellcheck -x test/*.sh test/dgx/*.sh
+make yaml    # yamllint -c .yamllint.yml .github/workflows/*.yml
 make format  # black, in place
 ```
 
-ruff/black use line-length 100. The library (`python/ray`) is **fully typed**:
-mypy runs strict (`disallow_untyped_defs`, `disallow_incomplete_defs`) and is
-clean; keep it that way when adding code.
+ruff/black use line-length 100, and ruff's E501 is on, so a line that black
+cannot split (a long string, say) still fails the lint job. The library
+(`python/ray`) is **fully typed**: mypy runs with `disallow_untyped_defs`,
+`disallow_incomplete_defs`, `disallow_untyped_calls`,
+`disallow_untyped_decorators`, `strict_equality`, `extra_checks` and
+`warn_no_return`, and is clean; keep it that way when adding code. The strict
+flags still off (`warn_return_any`, `warn_unreachable`,
+`disallow_any_generics`, `no_implicit_reexport`) each have open findings; turn
+one on as its findings are cleared, rather than all at once.
+
+Two suppression notes, both enforced by ruff (`RUF100` fails on a `noqa` that
+no longer suppresses anything):
+
+- the re-export modules (`python/ray/__init__.py`, `types.py`, `actor.py`,
+  `util/__init__.py`, `cloudpickle.py`) need no `noqa` at all: they are covered
+  by the per-file-ignores below, and a `noqa` there would be dead weight;
+- `sys.path.insert(...)` before an import is **not** an E402, so the tests need
+  no `noqa: E402` there either. Do not add one back.
 
 ## Keeping the shim in sync with vLLM
 

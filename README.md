@@ -10,7 +10,7 @@
   <a href="https://github.com/maci0/beam/actions/workflows/ci.yml"><img src="https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="coverage">
   <img src="https://img.shields.io/badge/tests-518-brightgreen" alt="tests">
-  <img src="https://img.shields.io/badge/mypy-strict-blue" alt="mypy strict">
+  <img src="https://img.shields.io/badge/mypy-typed%20%2B%20strict-blue" alt="mypy typed and strict">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="python 3.9+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license AGPL-3.0"></a>
 </p>

@@ -10,7 +10,7 @@ from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import scan_vllm_ray as sc  # noqa: E402
+import scan_vllm_ray as sc
 
 
 def visit(src):

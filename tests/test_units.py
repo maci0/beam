@@ -10,7 +10,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-from ray._daemon import ActorProc, Daemon, Peer, detect_gpus, new_node_id, owner_of  # noqa: E402
+from ray._daemon import ActorProc, Daemon, Peer, detect_gpus, new_node_id, owner_of
 
 
 def head(ngpu=4):

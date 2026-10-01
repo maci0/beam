@@ -11,7 +11,7 @@ no venv to create, no global installs, no GPU, no torch. Every command below
 resolves its own dependencies into a cached environment.
 
     make          # list the targets
-    make check    # everything CI runs: lint, types, shellcheck, tests, import, e2e
+    make check    # everything CI runs: lint, types, shellcheck, yamllint, tests, import, e2e
 
 ## The edit-test loop
 

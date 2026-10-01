@@ -1,0 +1,14 @@
+# Workflow lint. The repo's own line convention is 100 (ruff/black), so
+# yamllint's 80 default is raised to match rather than fought.
+# `truthy` is off: `on:` is the GitHub Actions key and quoting it as "on"
+# is not portable across workflow tools.
+extends: default
+
+rules:
+  line-length:
+    max: 100
+  truthy:
+    check-keys: false
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1

@@ -14,7 +14,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-from ray import _daemon, _proto, _worker  # noqa: E402
+from ray import _daemon, _proto, _worker
 
 
 class _PairedSock:

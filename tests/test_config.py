@@ -15,7 +15,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-from ray import _config  # noqa: E402
+from ray import _config
 
 _ALL = (
     "BEAM_NUM_GPUS",

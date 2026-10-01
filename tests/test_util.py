@@ -10,13 +10,13 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-import ray  # noqa: E402
-import ray._private.state as _private_state  # noqa: E402
-import ray.util.placement_group  # noqa: E402,F401  (ensure the submodule is loaded)
-import ray.util.state as util_state  # noqa: E402
-from ray import util  # noqa: E402
-from ray.util import metrics, scheduling_strategies  # noqa: E402
-from ray.util.placement_group import PlacementGroup, _PGId  # noqa: E402
+import ray
+import ray._private.state as _private_state
+import ray.util.placement_group  # ensure the submodule is loaded
+import ray.util.state as util_state
+from ray import util
+from ray.util import metrics, scheduling_strategies
+from ray.util.placement_group import PlacementGroup, _PGId
 
 # `ray.util.placement_group` the *attribute* is the re-exported function (it
 # shadows the submodule on the package namespace, matching real ray). Reach the

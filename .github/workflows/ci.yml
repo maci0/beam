@@ -18,6 +18,9 @@ jobs:
       - name: shellcheck
         run: make shell
 
+      - name: yamllint
+        run: make yaml
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -37,8 +40,9 @@ jobs:
         run: make e2e
 
   vllm-surface:
-    # Informational: checks the shim still covers vLLM main. Allowed to fail so a
-    # vLLM-side change doesn't block the build; tighten to a gate by pinning a tag.
+    # Informational: checks the shim still covers vLLM main. Allowed to fail
+    # so a vLLM-side change doesn't block the build; tighten to a gate by
+    # pinning a tag.
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -47,4 +51,6 @@ jobs:
       - name: Clone vLLM
         run: git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
       - name: Scan ray API usage vs the shim
-        run: uv run --with cloudpickle python scripts/scan_vllm_ray.py --src /tmp/vllm
+        run: >-
+          uv run --with cloudpickle python scripts/scan_vllm_ray.py
+          --src /tmp/vllm

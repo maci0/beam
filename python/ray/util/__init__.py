@@ -4,8 +4,8 @@ from __future__ import annotations  # keep `X | None` valid on py3.9
 
 from typing import Any
 
-from . import scheduling_strategies  # noqa: F401
-from .placement_group import (  # noqa: F401
+from . import scheduling_strategies
+from .placement_group import (
     PlacementGroup,
     get_current_placement_group,
     placement_group,

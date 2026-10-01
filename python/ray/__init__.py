@@ -14,10 +14,10 @@ from typing import Any
 from . import (
     _config,
     _proto,
-    util,  # noqa: F401  (exposes ray.util.*)
+    util,
 )
 from ._client import DaemonClient
-from .util import (  # noqa: F401
+from .util import (
     PlacementGroup,
     get_current_placement_group,
     placement_group,
@@ -89,7 +89,7 @@ def _remaining(deadline: float | None) -> float | None:
 
 
 class ObjectRef:
-    __slots__ = ("id", "_value", "_has_value")
+    __slots__ = ("_has_value", "_value", "id")
 
     def __init__(self, obj_id: str, value: Any = None, has_value: bool = False) -> None:
         self.id = obj_id

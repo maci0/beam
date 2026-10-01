@@ -11,10 +11,10 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-import ray  # noqa: E402
-from ray import _proto  # noqa: E402
-from ray.exceptions import GetTimeoutError  # noqa: E402
-from ray.runtime_env import RuntimeEnv  # noqa: E402
+import ray
+from ray import _proto
+from ray.exceptions import GetTimeoutError
+from ray.runtime_env import RuntimeEnv
 
 
 class FakeClient:

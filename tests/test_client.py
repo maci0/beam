@@ -11,9 +11,9 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-import ray._client  # noqa: E402,F401  (ensure the submodule is loaded)
-from ray import _proto  # noqa: E402
-from ray._client import DaemonClient, DaemonNotRunning, _runtime_sock  # noqa: E402
+import ray._client  # noqa: F401  (ensure the submodule is loaded)
+from ray import _proto
+from ray._client import DaemonClient, DaemonNotRunning, _runtime_sock
 
 # `ray._client` the attribute is the module-level `_client = None` global, which
 # shadows the submodule on the package. Reach the real module via sys.modules.
