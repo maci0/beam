@@ -7,6 +7,10 @@
 /.rocm-run/
 /.dow-run/
 /.3dbg/
+# make repro scratch copies, and the tarball make bundle writes
+/.repro-a/
+/.repro-b/
+/beam-bindmount.tar.gz
 __pycache__/
 *.pyc
 .venv/

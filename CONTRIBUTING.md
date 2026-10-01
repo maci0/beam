@@ -48,8 +48,12 @@ when vLLM changes which `ray.*` symbols it imports.
    shell code passes `make shell`.
 3. If a change alters a protocol message, update `docs/PROTOCOL.md` and
    `docs/API.md` in the same commit.
-4. Nothing generated is committed by hand: the wheel/sdist come from
-   `cd python && uv build`, the bind-mount bundle from the release workflow.
+4. Nothing generated is committed by hand: `make build` makes the wheel/sdist
+   (`cd python && uv build`), `make bundle` makes the bind-mount tarball, both
+   with the same flags the release workflow uses. `make repro` builds each of
+   them twice from perturbed copies and fails unless the bytes match; CI's
+   `artifacts` job runs it, so a timestamp or a path leaking into an artifact
+   is a red build, not a surprise.
 5. If the change alters what a caller observes (an exported symbol, a CLI
    exit code, a wire field), add it to the `Unreleased` section of
    CHANGELOG.md grouped Added / Changed / Fixed / Breaking. Anything that

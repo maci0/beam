@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          # the toolchain the Makefile pins are verified against; see Makefile
+          version: "0.12.14"
       - name: ruff + black
         run: make lint
       - name: mypy
@@ -31,9 +34,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.12.14"
 
       - name: Syntax check
         run: python3 -m py_compile python/ray/*.py python/ray/**/*.py
+
+      - name: Support floor (python 3.9, the declared requires-python)
+        # README, pyproject and docs all claim 3.9+; only 3.9 is where that is
+        # actually load-bearing (PEP604 unions, dict[str, ...] at runtime)
+        run: |
+          PYTHONPYCACHEPREFIX=$RUNNER_TEMP/pyc39 \
+            uv run --no-project --python 3.9 python -m compileall -q \
+            python/ray scripts examples
 
       - name: Unit + fuzz tests (100% coverage gate)
         run: make test
@@ -44,6 +57,19 @@ jobs:
       - name: Control-plane harnesses (e2e)
         run: make e2e
 
+  artifacts:
+    # The wheel, the sdist and the bind-mount bundle must be a function of the
+    # source: built twice from perturbed copies, byte-for-byte equal. Without
+    # this, "reproducible" is a claim nobody checked.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.12.14"
+      - name: Build twice and compare
+        run: make repro
+
   vllm-surface:
     # Informational: checks the shim still covers vLLM main. Allowed to fail
     # so a vLLM-side change doesn't block the build; tighten to a gate by
@@ -53,6 +79,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.12.14"
       - name: Clone vLLM
         run: git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
       - name: Scan ray API usage vs the shim

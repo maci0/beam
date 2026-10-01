@@ -147,7 +147,7 @@ def test_place_never_raises_on_any_ngpu(value):
     d = head()
     try:
         d._place_actor({"ngpu": value})
-    except Exception as e:  # noqa: BLE001 - the point is that nothing escapes
+    except Exception as e:  # nothing may escape here: any raise is the failure
         raise AssertionError("ngpu=%r raised %r" % (value, e)) from None
 
 

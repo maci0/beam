@@ -107,16 +107,20 @@ Configured in the repo-root `pyproject.toml`; CI's `lint` job runs all of these
 run the same commands:
 
 ```
-make lint    # uvx ruff check python examples scripts tests
-             # uvx black --check python examples scripts tests
-make types   # uvx --with cloudpickle mypy --config-file pyproject.toml python/ray
+make lint    # uvx ruff@0.16.9 check python examples scripts tests
+             # uvx black@26.5.1 --check python examples scripts tests
+make types   # uvx --with cloudpickle mypy@2.3.1 --config-file pyproject.toml python/ray
 make shell   # shellcheck -x test/*.sh test/dgx/*.sh
 make yaml    # yamllint -c .yamllint.yml .github/workflows/*.yml
 make format  # black, in place
 ```
 
 ruff/black use line-length 100, and ruff's E501 is on, so a line that black
-cannot split (a long string, say) still fails the lint job. The library
+cannot split (a long string, say) still fails the lint job. ruff, black, mypy
+and yamllint are **version-pinned** in the `Makefile` and CI pins uv itself, so
+a new release of any of them cannot change the verdict on a commit that did not
+touch a lintable file; bump the pin deliberately, in the same commit as the
+reformat it forces. The library
 (`python/ray`) is **fully typed**: mypy runs with `disallow_untyped_defs`,
 `disallow_incomplete_defs`, `disallow_untyped_calls`,
 `disallow_untyped_decorators`, `strict_equality`, `extra_checks` and
