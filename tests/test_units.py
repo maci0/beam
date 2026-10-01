@@ -13,7 +13,15 @@ from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 from ray import _daemon
-from ray._daemon import ActorProc, Daemon, Peer, detect_gpus, new_node_id, owner_of
+from ray._daemon import (
+    _MAX_GPU_COUNT,
+    ActorProc,
+    Daemon,
+    Peer,
+    detect_gpus,
+    new_node_id,
+    owner_of,
+)
 
 
 def head(ngpu=4):
@@ -104,6 +112,34 @@ def test_place_exhaustion():
     d.gpu_used[0] = True
     node, _, err = d._place_actor({"ngpu": 1})
     assert node is None and "no free GPU" in err
+
+
+# ---- the GPU-count cap is a closed interval --------------------------------
+# Both helpers accept values in [0, _MAX_GPU_COUNT] and reject everything
+# outside. Only the rejection side was pinned, so the accepted side could drift
+# silently: `_gpu_count` feeds `range(ngpu)` in on_create_pg's free-index build,
+# and `hello` stores the value verbatim, so a peer claiming the cap makes one
+# one-GPU placement group materialize a million-element list (seconds and tens
+# of MB on the head) and makes `status` advertise a million GPUs to the driver.
+# These pin both edges so a cap change is a deliberate edit here, not a surprise.
+@pytest.mark.parametrize("ok", [0, 1, 8, _MAX_GPU_COUNT - 1, _MAX_GPU_COUNT])
+def test_gpu_count_accepts_up_to_the_cap(ok):
+    assert _daemon._gpu_count(ok) == ok
+
+
+@pytest.mark.parametrize("over", [_MAX_GPU_COUNT + 1, 10**9, 2**40])
+def test_gpu_count_rejects_above_the_cap(over):
+    assert _daemon._gpu_count(over) == 0  # falls back, does not keep the peer out
+
+
+@pytest.mark.parametrize("ok", [0, 0.5, 1, _MAX_GPU_COUNT, float(_MAX_GPU_COUNT)])
+def test_gpu_request_accepts_up_to_the_cap(ok):
+    assert _daemon._gpu_request(ok) == float(ok)
+
+
+@pytest.mark.parametrize("over", [_MAX_GPU_COUNT + 1, float(_MAX_GPU_COUNT) + 0.5, 1e9])
+def test_gpu_request_rejects_above_the_cap(over):
+    assert _daemon._gpu_request(over) is None
 
 
 # ---- malformed quantities on the wire --------------------------------------
