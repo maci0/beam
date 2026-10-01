@@ -55,6 +55,7 @@ test/                    end-to-end harnesses (shell)
 docs/                    DESIGN + ARCHITECTURE/PROTOCOL/API/OPERATIONS/DEVELOPMENT
                           + THREAT_MODEL (attack surface, boundaries, controls) + logo.svg
 SECURITY.md              deployment checklist, supported versions, disclosure policy
+CHANGELOG.md             what changed per release; docs/RELEASING.md how a tag is cut
 ```
 
 ## Running the tests

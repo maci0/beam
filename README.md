@@ -36,6 +36,8 @@ as with real Ray, so beam stays small. Pure Python, no build step, one dependenc
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md): attack surface, trust boundaries, threats, and the controls that exist
 - [SECURITY.md](SECURITY.md): what to check before deploying, supported versions, reporting a vulnerability
 - [test/dgx/README.md](test/dgx/README.md): the two-node DGX Spark harness
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release, and what breaks on upgrade
+- [docs/RELEASING.md](docs/RELEASING.md): versioning, tags, and how a release is cut
 
 ## Deploy into the stock vllm-openai image (no rebuild)
 

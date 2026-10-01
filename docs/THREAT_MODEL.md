@@ -302,5 +302,8 @@ not previously have.
   peer issued a `kill`, because no peer is identified.
 - **Disclosure path**: `SECURITY.md` (added 2026-09-30) names the reporting
   channel. No response SLA is claimed, and none should be invented.
-- **Version support**: beam tracks a single line (`python/pyproject.toml`
-  `version = "2.43.0"`); `SECURITY.md` states that every release is supported.
+- **Version support**: beam tracks a single line, the newest release tag;
+  `SECURITY.md` states it and that fixes are not backported to older tags. The
+  version in `python/pyproject.toml` is pinned to the Ray release whose
+  executor API this shim implements and is deliberately not the beam release
+  number: quote the tag in a disclosure. See docs/RELEASING.md.

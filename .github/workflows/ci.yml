@@ -21,6 +21,11 @@ jobs:
       - name: yamllint
         run: make yaml
 
+      # The manifest version, ray.__version__ and the versions the docs quote
+      # are one number; the tag and CHANGELOG.md say which release it is.
+      - name: Release contract
+        run: make release-check
+
   test:
     runs-on: ubuntu-latest
     steps:

@@ -22,7 +22,7 @@ export BEAM_WORKER_CMD="$VENVPY -m ray._worker"
 cleanup() { kill "${HEAD_PID:-}" 2>/dev/null || true; rm -rf "$RT"; }
 trap cleanup EXIT
 
-"$VENVPY" -m ray start --head &
+"$VENVPY" -m ray start --head --port "$(beam_free_port)" &
 HEAD_PID=$!
 for _ in $(seq 1 50); do [ -S "$RT/daemon.sock" ] && break; sleep 0.1; done
 

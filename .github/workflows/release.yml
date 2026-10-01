@@ -14,8 +14,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
 
+      # A tag with no dated CHANGELOG section, or a version the manifest and
+      # ray.__version__ disagree on, fails here instead of after the artifact is
+      # public. --notes writes this tag's section for the release body, so the
+      # published notes are the changelog, not a commit list.
+      - name: Check the release contract
+        run: python3 scripts/check_release.py --tag "$GITHUB_REF_NAME" --notes notes.md
+
       - name: Build wheel + sdist
         run: cd python && uv build --out-dir dist
+
+      # The artifact filename carries the distribution version, not the tag, so
+      # assert the wheel and sdist that will be published are the ones the
+      # manifest declares, not a stale pair left by an earlier build.
+      - name: Verify the built artifacts
+        run: python3 scripts/check_release.py --tag "$GITHUB_REF_NAME" --dist python/dist
 
       - name: Bundle the bind-mount payload
         # the shim + examples are all a container needs; exclude build output
@@ -27,8 +40,16 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          body_path: notes.md
           files: |
             python/dist/*.whl
             python/dist/*.tar.gz
             beam-bindmount-*.tar.gz
+
+      # Post-publish smoke test: install the wheel exactly as a user would and
+      # import it. Catches a wheel that built but does not import; the release is
+      # already public at this point, so treat a failure here as a yank signal.
+      - name: Install and import the published wheel
+        run: >-
+          uv run --no-project --with ./python/dist/ray-*.whl
+          python examples/import_check.py

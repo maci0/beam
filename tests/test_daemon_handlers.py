@@ -525,9 +525,7 @@ def test_on_get_without_a_budget_waits_for_the_slot_to_fill():
     d.objects["n1-o1"] = slot
 
     async def scenario():
-        get_task = asyncio.ensure_future(
-            d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1"}, b"")
-        )
+        get_task = asyncio.ensure_future(d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1"}, b""))
         await asyncio.sleep(0.01)  # handler is parked on the unset event
         assert not get_task.done()
         slot.data = b"late"

@@ -50,6 +50,11 @@ when vLLM changes which `ray.*` symbols it imports.
    `docs/API.md` in the same commit.
 4. Nothing generated is committed by hand: the wheel/sdist come from
    `cd python && uv build`, the bind-mount bundle from the release workflow.
+5. If the change alters what a caller observes (an exported symbol, a CLI
+   exit code, a wire field), add it to the `Unreleased` section of
+   CHANGELOG.md grouped Added / Changed / Fixed / Breaking. Anything that
+   changes behavior rather than fixing it is at least a minor bump; see
+   docs/RELEASING.md.
 
 ## Where things live
 
@@ -60,6 +65,8 @@ when vLLM changes which `ray.*` symbols it imports.
 | `test/` | shell harnesses (`make e2e`, plus multi-node and GPU ones) |
 | `examples/` | driver demo, edge cases, import smoke test |
 | `docs/` | design, architecture, protocol, API, operations, development |
+| `CHANGELOG.md` | what changed per release, grouped by impact |
+| `docs/RELEASING.md` | versioning, tags, and how a release is cut |
 | `Makefile` | the task runner; every target wraps a CI command |
 
 Multi-node and GPU harnesses need real machines and are documented in

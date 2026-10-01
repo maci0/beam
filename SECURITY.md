@@ -22,13 +22,19 @@ Concretely, before deploying:
 
 ## Supported versions
 
-There is one supported line: the current release on `main`
-(`python/pyproject.toml`). Fixes are not backported to older tags.
+There is one supported line: the newest release tag. Fixes are not backported
+to older tags.
 
 | Version | Supported |
 |---------|-----------|
-| current release | yes |
+| newest tag | yes |
 | older tags | no |
+| `main` between tags | no (unreleased; report bugs here anyway) |
+
+Quote the tag in a report, not the installed package version: the package is
+named `ray` and its version is pinned to the Ray release whose executor API
+beam implements, so it does not identify the beam release. See
+[docs/RELEASING.md](docs/RELEASING.md).
 
 ## Reporting a vulnerability
 

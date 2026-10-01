@@ -9,6 +9,14 @@
 # anywhere, so harnesses keep the daemon runtime dir short: it holds only
 # daemon.sock and daemon.json (a few hundred bytes), so tmpfs is fine. The venv
 # stays in the repo, where there is disk space.
+beam_free_port() {  # prints a currently-free TCP port for a head to listen on
+  python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()'
+}
+
 beam_runtime_dir() {  # $1 = tag; prints a fresh short dir, safe to delete
   local dir="${TMPDIR:-/tmp}/beam-$1-$$"
   rm -rf "$dir"; mkdir -p "$dir"

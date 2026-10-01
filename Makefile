@@ -8,7 +8,7 @@ PYTEST = $(UV) run $(PYTEST_DEPS) pytest
 LINT_PATHS = python examples scripts tests
 
 .DEFAULT_GOAL := help
-.PHONY: help test test-one e2e lint format types shell yaml import check
+.PHONY: help test test-one e2e lint format types shell yaml import release-check check
 
 help:  ## list targets
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -41,7 +41,10 @@ shell:  ## shellcheck the harnesses
 yaml:  ## yamllint the CI workflows
 	$(UVX) yamllint -c .yamllint.yml .github/workflows/ci.yml .github/workflows/release.yml
 
+release-check:  ## version numbers, docs and CHANGELOG agree (add TAG=v0.3.0 to check a cut)
+	python3 scripts/check_release.py $(if $(TAG),--tag $(TAG),)
+
 import:  ## import-only smoke test of the whole shim surface
 	PYTHONPATH=python $(UV) run --with cloudpickle python examples/import_check.py
 
-check: lint types shell yaml test import e2e  ## everything CI runs
+check: lint types shell yaml test import release-check e2e  ## everything CI runs

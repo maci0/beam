@@ -63,8 +63,8 @@ Payload column: ✓ means the frame carries a cloudpickled payload.
 | `method`        | daemon → actor worker  | `method`              | n/a                      | ✓ both  |
 | `kill`          | client → head → owner  | `actor`               | n/a                      |         |
 | `put`           | client → local daemon  | n/a                     | `obj`                  | ✓ (in)  |
-| `get`           | client → head → owner  | `obj`                 | n/a                      | ✓ (out) |
-| `stat`          | client → head → owner  | `obj`                 | `ready` (bool)         |         |
+| `get`           | client → head → owner  | `obj` `timeout` (opt) | n/a                      | ✓ (out) |
+| `stat`          | client → head → owner  | `obj` `timeout` (opt) | `ready` (bool)         |         |
 
 Notes:
 
@@ -78,6 +78,17 @@ Notes:
   receives it as `BEAM_GPU_IDS` and reports it from `ray.get_gpu_ids()`.
 - **`stat`** never sets `err` for a not-ready object; it returns `ready: false`.
   This is deliberate: `ray.wait` polls `stat` and must not raise on not-ready.
+- **`node`** on `create_actor_ok` is the owning node on every path. Up to v0.2.0
+  it was set only when the head pushed the create to a remote daemon, so a
+  locally hosted actor answered without an owner and the caller had nothing to
+  report from `get_runtime_context()`.
+- **`timeout`** (optional, seconds, on `get` and `stat`) is the caller's
+  *remaining* budget, not a fixed timeout: the shim computes one deadline per
+  call and sends the time left on each round-trip, so it shrinks as the wait
+  proceeds. Absent means "no deadline" - `get` waits for the value, `stat`
+  reports readiness. A daemon forwards the field on the hop (`_forward_head`
+  passes the message through) and bounds that hop by the same budget,
+  answering `stat` not-ready when it expires.
 
 ## Routing
 
@@ -108,3 +119,25 @@ The head is the hub. For a request about a remote actor or object:
   head.
 
 Object ids look like `n1a2b3c4-o57`; the owner is everything before `-o`.
+
+## Mixed-version clusters
+
+Every node in a cluster runs the same beam release, and the release workflow
+publishes the wheel, the sdist, and the bind-mount bundle under one tag, so a
+deployment is one version by construction. If nodes are nevertheless mixed, the
+framing stays compatible in both directions:
+
+- A **new client against an old daemon** works. The optional `timeout` field on
+  `get`/`stat` is an extra header key, and an older daemon ignores keys it does
+  not read. It answers `stat` unbudgeted, so the client's own deadline is what
+  bounds the wait; `get` ends when the daemon's own budget expires.
+- An **old client against a new daemon** works too: `timeout` is optional, and
+  absent means "no deadline", which is what an old client meant.
+- Both new is the only combination that gets the hop-bounded `stat`, so a
+  dropped worker node ends a `wait` at the caller's timeout instead of after the
+  daemon's internal RPC deadline.
+
+What improves with version is *honoring* a deadline, not *reading* one.
+`create_actor_ok` gained `node` on the local-host path, which is additive: a
+caller that reads it when present and ignores it when absent is correct against
+both.
