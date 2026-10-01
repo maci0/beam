@@ -17,7 +17,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 
-from . import _config, _daemon
+from . import _config, _daemon, _proto
 
 # ---- tuning ----
 
@@ -176,6 +176,12 @@ class _UsageError(Exception):
     """A bad or missing flag value; `_start` prints it and exits 2."""
 
 
+def _port_ok(port: int) -> bool:
+    """A TCP port number is a 16-bit field, so only 0-65535 can be bound or
+    connected to (sockaddr_in.sin_port is uint16)."""
+    return 0 <= port <= 65535
+
+
 def _start(args: list[str]) -> int:
     head = False
     port = 6379
@@ -238,6 +244,14 @@ def _start(args: list[str]) -> int:
         if ap and not ap.isdigit():
             sys.stderr.write("beam start: --address port must be numeric, got %r\n" % ap)
             return 2
+        if ap and not _port_ok(int(ap)):
+            sys.stderr.write("beam start: --address port must be 0-65535, got %s\n" % ap)
+            return 2
+    if not _port_ok(port):
+        # A TCP port is a 16-bit field: bind() raises OverflowError on anything
+        # wider, which would reach the operator as a bare traceback.
+        sys.stderr.write("beam start: --port must be 0-65535, got %d\n" % port)
+        return 2
     if num_gpus is not None and num_gpus < 0:
         sys.stderr.write("beam start: --num-gpus must be >= 0, got %d\n" % num_gpus)
         return 2
@@ -532,10 +546,12 @@ def _status() -> int:
             sys.stderr.write("beam status: cannot reach daemon: %s\n" % e)
             return 1
         try:
-            hdr = json.dumps({"t": "status"}).encode()
-            s.sendall(struct.pack(">I", len(hdr)) + hdr)
-            (n,) = struct.unpack(">I", _recv(s, 4))
-            resp = json.loads(_recv(s, n))
+            # Same framing as _proto.write_frame/read_frame, which the daemon
+            # speaks: a header-only frame with no payload ("plen" absent reads
+            # back as 0), decoded by the shared reader so the two copies of the
+            # framing cannot drift apart.
+            _proto.write_frame(s, {"t": "status"})
+            resp, _body = _proto.read_frame(s)
         except (OSError, ConnectionError, json.JSONDecodeError, struct.error) as e:
             sys.stderr.write("beam status: cannot reach daemon: %s\n" % e)
             return 1
@@ -544,6 +560,8 @@ def _status() -> int:
             s.close()
         except Exception:
             pass
+    # _proto.read_frame already rejected a reply whose header is not a JSON
+    # object, so `resp` is a dict here.
     if resp.get("err"):
         sys.stderr.write("beam status: %s\n" % resp["err"])
         return 1
@@ -572,16 +590,6 @@ def _status() -> int:
         sys.stderr.write("beam status: %d node(s) DOWN\n" % down)
         return 1  # so `ray status && ...` health checks fail on a dropped node
     return 0
-
-
-def _recv(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("short read")
-        buf.extend(chunk)
-    return bytes(buf)
 
 
 def _stop() -> int:

@@ -202,6 +202,43 @@ def test_budgeted_falls_back_for_a_client_without_a_budget(monkeypatch):
     assert ray.get(ray.ObjectRef("a"), timeout=1.0) == 1
 
 
+def test_budgeted_assumes_a_budget_for_a_callable_it_cannot_introspect(monkeypatch):
+    """A client whose request has no inspectable signature (a C callable or a
+    builtin) is assumed to accept the budget: the budget is what keeps the
+    caller's deadline, so dropping it silently would be the worse failure."""
+    class Opaque:
+        """A callable whose signature cannot be introspected (some C builtins)."""
+
+        def __call__(self, *a, **k):
+            return None
+
+        @property
+        def __signature__(self):
+            raise ValueError("no signature available")
+
+    assert ray._takes_timeout(Opaque()) is True
+    assert ray._takes_timeout(lambda *a, **kw: None) is True  # **kwargs accepts it
+
+
+def test_budgeted_does_not_retry_a_call_that_raised_type_error(monkeypatch):
+    """A TypeError from inside the client's own body must surface, not be read
+    as "this client takes no timeout" and retried unbudgeted."""
+
+    class BrokenClient:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, header, payload=b"", timeout=None):
+            self.calls.append(timeout)
+            raise TypeError("Cannot load '_pickle.UnpicklingError'")
+
+    client = BrokenClient()
+    monkeypatch.setattr(ray, "_need", lambda: client)
+    with pytest.raises(TypeError, match="UnpicklingError"):
+        ray.get(ray.ObjectRef("a"), timeout=1.0)
+    assert client.calls == [pytest.approx(1.0, abs=0.5)]
+
+
 # ---- deadlines run on the monotonic clock ----
 class SteppingClock:
     """Stands in for the `time` module with a wall clock that jumps forward or

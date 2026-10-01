@@ -6,9 +6,11 @@ Only the surface vLLM imports is implemented. See docs/DESIGN.md for the contrac
 
 from __future__ import annotations  # keep PEP604 annotations valid on py3.9
 
+import inspect
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from functools import cache
 from typing import Any
 
 from . import (
@@ -202,6 +204,23 @@ def wait(
         _sleep(_WAIT_POLL_INTERVAL if left is None else min(_WAIT_POLL_INTERVAL, left))
 
 
+@cache
+def _takes_timeout(fn: Callable[..., Any]) -> bool:
+    """Whether `fn` accepts a `timeout` keyword, asked from its signature.
+
+    Decided here, not by catching TypeError around the call: a TypeError raised
+    inside the client's own body would be read as "no such parameter" and the
+    request silently retried *without* the deadline budget.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # C callables have no introspectable signature
+        return True
+    if "timeout" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _budgeted(client: Any, header: dict[str, Any], left: float | None) -> tuple[dict, bytes]:
     """One round-trip, bounded by the caller's remaining deadline budget.
 
@@ -211,10 +230,9 @@ def _budgeted(client: Any, header: dict[str, Any], left: float | None) -> tuple[
     otherwise hold the caller well past the budget it was promised. Clients
     without a timeout parameter (test doubles) are simply called unbudgeted.
     """
-    try:
+    if _takes_timeout(client.request):
         return client.request(header, timeout=left)
-    except TypeError:  # client.request takes no budget
-        return client.request(header)
+    return client.request(header)
 
 
 def _stat(client: Any, ref: ObjectRef, left: float | None) -> tuple[dict, bytes]:

@@ -24,7 +24,7 @@ import subprocess
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from . import _config
+from . import _config, _proto
 
 # ---- tuning / determinism seams ----
 #
@@ -177,7 +177,7 @@ def encode_frame(header: dict, payload: bytes = b"") -> bytes:
     return struct.pack(">I", len(h)) + h + payload
 
 
-_MAX_FRAME = 512 * 1024 * 1024  # corrupt-length guard; see _proto._MAX_FRAME
+_MAX_FRAME = _proto._MAX_FRAME  # wire contract; single definition in _proto
 
 
 async def read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes]:
@@ -1038,11 +1038,7 @@ class Daemon:
         # free local greedy indices only if no *other* live actor/hosting holds them
         # (a concurrent create may have re-placed the same GPU after our kill freed it)
         if node == self.node_id:
-            held = {g for ap in self.actors.values() for g in ap.gpus}
-            held.update(g for _p, _w, gs in self._hosting.values() for g in gs)
-            for g in gpus:
-                if 0 <= g < len(self.gpu_used) and g not in held:
-                    self.gpu_used[g] = False
+            self._free_local_gpus(gpus)
 
     def _schedule_orphan_reap(self, actor_id: str, node: str) -> None:
         """Register an orphan and ensure a reaper task is running for it.
@@ -1425,11 +1421,7 @@ class Daemon:
                     # Always reap even if close is cancelled (CancelledError).
                     # Only free GPU indices when the process is confirmed gone.
                     if _terminate(proc):
-                        held = {g for ap2 in self.actors.values() for g in ap2.gpus}
-                        held.update(g for _p, _w, gs in self._hosting.values() for g in gs)
-                        for g in gpus:
-                            if 0 <= g < len(self.gpu_used) and g not in held:
-                                self.gpu_used[g] = False
+                        self._free_local_gpus(gpus)
                     else:
                         # Still alive: restore hosting + routing so still tracked.
                         # Flagged here and returned after the finally: a `return`
@@ -1466,11 +1458,7 @@ class Daemon:
                 # Always reap even if peer.close is cancelled mid-drain.
                 # Only free GPU indices when the process is confirmed gone.
                 if _terminate(ap.proc):
-                    held = {g for a in self.actors.values() for g in a.gpus}
-                    held.update(g for _p, _w, gs in self._hosting.values() for g in gs)
-                    for g in ap.gpus:
-                        if 0 <= g < len(self.gpu_used) and g not in held:
-                            self.gpu_used[g] = False
+                    self._free_local_gpus(ap.gpus)
                 else:
                     # Process still alive: restore tracking so we do not free
                     # GPUs/PGs under a live worker (release will orphan-reap).

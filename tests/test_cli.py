@@ -343,6 +343,18 @@ def test_start_port_missing_value_exits_2(capsys):
     assert "--port expects a value" in capsys.readouterr().err
 
 
+def test_start_out_of_range_port_exits_2(capsys):
+    """A port wider than 16 bits is a usage error, not an OverflowError from
+    bind() deep inside asyncio.run()."""
+    assert _cli._start(["--head", "--port", "99999"]) == 2
+    assert "--port must be 0-65535" in capsys.readouterr().err
+
+
+def test_start_out_of_range_address_port_exits_2(capsys):
+    assert _cli._start(["--address", "host:70000"]) == 2
+    assert "--address port must be 0-65535" in capsys.readouterr().err
+
+
 def test_start_unknown_flag(capsys):
     assert _cli._start(["--head", "--bogus"]) == 2
     assert "unknown flag" in capsys.readouterr().err
@@ -696,6 +708,28 @@ class FakeStatusSock:
         pass
 
 
+class RawStatusSock:
+    """Replays arbitrary bytes as one framed reply (body given verbatim)."""
+
+    def __init__(self, body):
+        self._buf = struct.pack(">I", len(body)) + body
+        self._pos = 0
+
+    def connect(self, addr):
+        pass
+
+    def sendall(self, data):
+        pass
+
+    def recv(self, n):
+        chunk = self._buf[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self):
+        pass
+
+
 def test_status_no_runtime(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))  # empty dir, no daemon.json
     assert _cli._status() == 1
@@ -742,24 +776,32 @@ def test_status_connect_refused(tmp_path, monkeypatch, capsys):
     assert "cannot reach daemon" in capsys.readouterr().err
 
 
-# ---- _recv ------------------------------------------------------------------
+# ---- status reply framing (shared with _proto) --------------------------------
 
 
-def test_recv_exact():
-    s = FakeStatusSock({"x": 1})
-    # first 4 bytes are the length prefix
-    n = struct.unpack(">I", _cli._recv(s, 4))[0]
-    body = _cli._recv(s, n)
-    assert json.loads(body) == {"x": 1}
+def test_status_writes_a_proto_frame(tmp_path, monkeypatch):
+    """The status request is framed by _proto, so the CLI and the daemon cannot
+    drift apart on the layout."""
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock"})
+    sent = []
+
+    class RecordingSock(FakeStatusSock):
+        def sendall(self, data):
+            sent.append(data)
+
+    monkeypatch.setattr(_cli.socket, "socket", lambda *a, **k: RecordingSock({"nodes": []}))
+    assert _cli._status() == 0
+    assert sent, "status sent nothing"
+    assert json.loads(sent[0][4:])["t"] == "status"
 
 
-def test_recv_short_read_raises():
-    class EofSock:
-        def recv(self, n):
-            return b""
-
-    with pytest.raises(ConnectionError):
-        _cli._recv(EofSock(), 4)
+def test_status_non_object_reply_is_an_error(tmp_path, monkeypatch, capsys):
+    """A well-framed reply whose header is not a JSON object is an error, not a
+    crash: the shared _proto reader rejects it before the CLI touches it."""
+    _write_runtime(tmp_path, monkeypatch, {"sock": "/x.sock"})
+    monkeypatch.setattr(_cli.socket, "socket", lambda *a, **k: RawStatusSock(b"[1, 2]"))
+    assert _cli._status() == 1
+    assert "cannot reach daemon" in capsys.readouterr().err
 
 
 # ---- _stop ------------------------------------------------------------------

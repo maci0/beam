@@ -75,7 +75,8 @@ documented default rather than being used as `""`.
 
 `--num-gpus`, `--node-ip` and `--port` are validated at parse time and take
 precedence over the matching variable (`--num-gpus` > `BEAM_NUM_GPUS` > device
-detection).
+detection). A port must be in 0-65535; anything wider exits 2 rather than failing
+inside `bind()`.
 
 **`BEAM_BIND_ADDRESS`.** The head's control port is unauthenticated, so by
 default it listens on every interface. On a host with a public and a cluster

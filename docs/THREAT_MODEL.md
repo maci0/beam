@@ -206,7 +206,7 @@ Present in the code:
 | Every daemon→daemon RPC has a deadline (`_RPC_TIMEOUT`), kill escalates SIGTERM→SIGKILL | wedged node cannot stall cleanup forever | `_daemon.py:29`, `_daemon.py:241-262`, `_daemon.py:1169-1177` |
 | Runtime-dir mutual exclusion via `link`/rename-seize, with live-pid probing | two daemons cannot steal each other's socket or pidfile | `_cli.py:314-392`, `_cli.py:395-411` |
 | `ray start` refuses to start when a live daemon owns the claim | accidental double-start clobbering | `_cli.py:157-161` |
-| CLI arg validation: unknown flags exit 2, `--port` must be numeric, `--num-gpus >= 0`, `--address` port must be numeric | CLI input validation | `_cli.py:120-168` |
+| CLI arg validation: unknown flags exit 2, `--port` must be numeric and in 0-65535, `--num-gpus >= 0`, `--address` port must be numeric and in 0-65535 | CLI input validation | `_cli.py:180-250` |
 | Placement-group bundle and `ngpu` bounds are validated before use | nonsense placement requests | `_daemon.py:557-596`, `_daemon.py:693-706`, `_daemon.py:924-949` |
 | Bounce-back detection (`p is peer`) stops routing loops and leaks `actor_loc` on dead owners | routing-loop DoS | `_daemon.py:1121-1123`, `_daemon.py:1163-1165` |
 | Orphan reaper frees GPUs after a disconnected driver | resource leak (availability, not security) | `_daemon.py:900-919`, `_daemon.py:1309-1420` |
