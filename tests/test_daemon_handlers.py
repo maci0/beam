@@ -235,8 +235,8 @@ def test_handle_routes_to_on_put():
 
 @pytest.mark.parametrize("t", [1, 1.5, None, True, {"t": "put"}, ["put"], "shutdown"])
 def test_handle_rejects_a_type_that_is_not_a_handler_name(t):
-    """A `t` that is not a message name is an error, not a call into whatever
-    `on_<t>` resolves to (on_shutdown takes no peer/message at all)."""
+    """A `t` that is not a str naming an `on_<t>` handler is an error reply,
+    not an exception out of the dispatcher."""
     d = head()
     r, p = run(d.handle(FakePeer(), {"t": t}, b""))
     assert "unknown message type" in r["err"] and p == b""
