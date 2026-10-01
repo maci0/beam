@@ -110,7 +110,7 @@ repro:  ## build the artifacts twice, perturb the inputs, and require identical 
 	rm -rf .repro-a .repro-b; \
 	mkdir -p .repro-a/python .repro-b/python; \
 	cp -r python/. .repro-a/python/; cp -r python/. .repro-b/python/; \
-	cp -r examples .repro-a/; cp -r examples .repro-b/; \
+	cp -r examples LICENSE .repro-a/; cp -r examples LICENSE .repro-b/; \
 	find .repro-a .repro-b -name __pycache__ -type d -prune -exec rm -rf {} +; \
 	find .repro-b -type f -exec touch -t 201905050505 {} +; \
 	(cd .repro-a/python && $(REPRO_ENV) $(UV) build --out-dir ../dist >/dev/null); \
