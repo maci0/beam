@@ -16,6 +16,7 @@ from . import _config, _proto
 class DaemonNotRunning(RuntimeError):
     """No local beam daemon to talk to (no runtime document in BEAM_RUNTIME_DIR)."""
 
+
 # Smallest budget applied to the socket. A caller-supplied budget measures
 # elapsed waiting, not syscall precision: Python rounds a sub-millisecond
 # settimeout down to 0, and a 0 timeout on a socket reports "timed out"
@@ -48,6 +49,14 @@ class DaemonClient:
         try:
             self._sock.connect(self.sock_path)
         except OSError as e:
+            # The connect failed, so no caller can ever reach this socket: close
+            # it here instead of dropping it to the GC, which would leak the fd
+            # for every failed ray.init() attempt (ray.init() only assigns the
+            # global _client after a successful construction).
+            try:
+                self._sock.close()
+            except OSError:
+                pass
             raise DaemonNotRunning(
                 "beam: cannot reach the local daemon on %s (%s). Is it running?"
                 % (self.sock_path, e)
@@ -69,6 +78,15 @@ class DaemonClient:
         """
         budget = self._timeout if timeout is None else timeout
         with self._lock:
+            # A protocol break (a truncated frame, a header that is not a JSON
+            # object, an fd-level reset) leaves the daemon's answer still
+            # pending on this stream: the next request would read that stale
+            # answer as its own response and hand the caller the wrong object.
+            # End the session instead so the next call fails loudly.
+            if self._sock.fileno() < 0:
+                raise ConnectionError(
+                    "beam: daemon connection on %s is closed; re-run ray.init()" % self.sock_path
+                )
             if budget is None:
                 self._sock.settimeout(None)
             else:

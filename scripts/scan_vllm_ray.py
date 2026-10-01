@@ -10,8 +10,10 @@ in sync.
 
 (cloudpickle must be importable, since the shim re-exports it as ray.cloudpickle.)
 
-Exit code is non-zero if any used symbol is missing from the shim, so it works
-as a CI gate.
+Exit code is non-zero if any used symbol is missing from the shim, if a source
+file could not be read or parsed (an unreadable file would otherwise be counted
+as "uses nothing" and the run would report the surface fully covered), or if
+reading the source tree failed outright, so it works as a CI gate.
 
 Ceiling: a static scan cannot see methods called on values *returned* by ray
 (e.g. ray.get_runtime_context().get_node_id()) or fully dynamic getattr. It
@@ -24,6 +26,12 @@ import ast
 import importlib
 import os
 import sys
+
+
+# A file the scan cannot read or parse contributes no symbols, so it must not
+# be counted as "clean": raise out of the walk and fail the gate.
+class SourceError(Exception):
+    """A source file could not be read or parsed (the scan would under-report)."""
 
 
 class RayUsageVisitor(ast.NodeVisitor):
@@ -66,6 +74,12 @@ class RayUsageVisitor(ast.NodeVisitor):
 
 
 def scan_tree(src):
+    """Collect ray usage across `src`.
+
+    Every candidate file must be readable and parseable: a file that cannot be
+    is not a file without ray usage, it is a file whose usage is unknown, so the
+    scan fails loudly (SourceError) instead of reporting a smaller surface.
+    """
     v = RayUsageVisitor()
     for root, _, files in os.walk(src):
         if "/test" in root or "/.git" in root:
@@ -76,9 +90,13 @@ def scan_tree(src):
             path = os.path.join(root, f)
             try:
                 with open(path, encoding="utf-8") as fh:
-                    tree = ast.parse(fh.read(), path)
-            except (SyntaxError, UnicodeDecodeError):
-                continue
+                    text = fh.read()
+            except (OSError, UnicodeDecodeError) as e:
+                raise SourceError("cannot read %s: %s" % (path, e)) from e
+            try:
+                tree = ast.parse(text, path)
+            except SyntaxError as e:
+                raise SourceError("cannot parse %s: %s" % (path, e)) from e
             v.visit(tree)
     return v
 
@@ -130,7 +148,12 @@ def main():
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, os.path.join(here, "python"))
 
-    usage = scan_tree(args.src)
+    try:
+        usage = scan_tree(args.src)
+    except SourceError as e:
+        # A partial scan would report a smaller surface as "fully covered":
+        # fail the gate instead of reporting a green run from unknown files.
+        sys.exit("scan incomplete: %s" % e)
 
     # required surface: dotted attrs + from-imports turned into dotted paths
     required = set(usage.attrs)

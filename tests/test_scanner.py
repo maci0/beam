@@ -5,6 +5,7 @@ import ast
 import os
 import sys
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -71,3 +72,50 @@ def test_resolve_missing():
 @given(st.lists(st.from_regex(r"[a-z_]{1,8}", fullmatch=True), min_size=1, max_size=5))
 def test_resolve_never_crashes(parts):
     sc.resolve("ray." + ".".join(parts))  # arbitrary dotted path, no exception
+
+
+# ---- scan_tree: unreadable / unparseable files must fail the gate ----
+# A temp dir of our own, not tmp_path: the walk skips any root containing
+# "/test" (vLLM's own test trees), and pytest's tmp_path always does.
+@pytest.fixture
+def src_tree():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        yield d
+
+
+def _write(root, name, body, mode=0o644):
+    p = os.path.join(root, name)
+    with open(p, "w") as f:
+        f.write(body)
+    os.chmod(p, mode)
+    return p
+
+
+def test_scan_tree_collects_usage(src_tree):
+    _write(src_tree, "a.py", "import ray\nray.get(x)\n")
+    assert "ray.get" in sc.scan_tree(src_tree).attrs
+
+
+def test_scan_tree_rejects_unparseable_file(src_tree):
+    """A syntax-error file is not a file without ray usage: skipping it makes
+    the scan report a smaller surface as fully covered."""
+    _write(src_tree, "broken.py", "def f(:\n")
+    with pytest.raises(sc.SourceError, match="cannot parse"):
+        sc.scan_tree(src_tree)
+
+
+def test_scan_tree_rejects_undecodable_file(src_tree):
+    with open(os.path.join(src_tree, "bin.py"), "wb") as f:
+        f.write(b"ray.get(1)  # \xff\xfe not utf-8\n")
+    with pytest.raises(sc.SourceError, match="cannot read"):
+        sc.scan_tree(src_tree)
+
+
+def test_scan_tree_rejects_unreadable_file(src_tree):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file permissions")
+    _write(src_tree, "secret.py", "import ray\n", mode=0o000)
+    with pytest.raises(sc.SourceError, match="cannot read"):
+        sc.scan_tree(src_tree)

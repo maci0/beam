@@ -180,18 +180,48 @@ def test_runtime_sock_malformed_doc_raises(tmp_path, monkeypatch):
 
 
 def test_client_init_reports_unreachable_daemon(monkeypatch):
-    """Connecting to a dead socket path reports it, not a bare OSError."""
+    """Connecting to a dead socket path reports it, not a bare OSError, and
+    does not leak the socket it could not connect."""
+
+    closed = []
 
     class DeadSock:
         def connect(self, path):
             raise OSError("no such file or directory")
 
         def close(self):
-            pass
+            closed.append(True)
 
     monkeypatch.setattr(_client.socket, "socket", lambda *a, **k: DeadSock())
     with pytest.raises(DaemonNotRunning, match="cannot reach the local daemon"):
         DaemonClient(sock_path="/gone.sock")
+    assert closed == [True]
+
+
+def test_request_on_closed_socket_raises_before_writing(monkeypatch):
+    """A protocol break leaves the daemon's answer pending on the stream: the
+    next request would read it as its own response (wrong ObjectRef, silent
+    data corruption). A closed socket must fail instead."""
+
+    class DeadSock:
+        def fileno(self):
+            return -1
+
+        def settimeout(self, t):
+            raise AssertionError("must not touch a dead socket")
+
+        def close(self):
+            pass
+
+    c = DaemonClient.__new__(DaemonClient)
+    c.sock_path = "<pair>"
+    c._sock = DeadSock()
+    import threading
+
+    c._lock = threading.Lock()
+    c._timeout = None
+    with pytest.raises(ConnectionError, match="closed"):
+        c.request({"t": "put"})
 
 
 def test_client_init_dials_sock_path(monkeypatch):
@@ -209,3 +239,23 @@ def test_client_init_dials_sock_path(monkeypatch):
     monkeypatch.setattr(_client.socket, "socket", lambda *a, **k: FakeSock())
     c = DaemonClient(sock_path="/my.sock")
     assert connected["path"] == "/my.sock" and c.sock_path == "/my.sock"
+
+
+def test_client_init_close_failure_does_not_mask_the_error():
+    """Cleanup on the connect-failure path must not replace the DaemonNotRunning
+    the caller acts on with an unrelated OSError."""
+
+    class UnclosableDeadSock:
+        def connect(self, path):
+            raise OSError("no such file or directory")
+
+        def close(self):
+            raise OSError("already closed")
+
+    orig = _client.socket.socket
+    _client.socket.socket = lambda *a, **k: UnclosableDeadSock()
+    try:
+        with pytest.raises(DaemonNotRunning, match="cannot reach the local daemon"):
+            DaemonClient(sock_path="/gone.sock")
+    finally:
+        _client.socket.socket = orig
