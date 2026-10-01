@@ -51,8 +51,8 @@ what that means. Fixes are not backported to older tags.
    it, if the manifest and `ray.__version__` disagree, or if a doc quotes a
    version the manifest does not declare.
 4. Commit and tag `vX.Y.Z`. Pushing the tag runs `.github/workflows/release.yml`,
-   which re-runs the check, builds, verifies the artifacts, publishes, and then
-   installs the wheel and imports it.
+   which re-runs the check and the unit tests and import smoke test, builds,
+   verifies the artifacts, publishes, and then installs the wheel and imports it.
 5. If step 4's last step fails, the artifact is public but does not import: say
    so on the release and cut a fixed tag. A published version is never
    re-tagged or re-uploaded over.
@@ -61,6 +61,8 @@ what that means. Fixes are not backported to older tags.
 
 - The tag must be `vMAJOR.MINOR.PATCH` and must have a dated changelog section,
   checked before anything is built.
+- `make test` (100% coverage gate) and `make import` pass on the tagged commit
+  before anything is built.
 - `python/pyproject.toml`, `ray.__version__`, and the versions quoted in
   `docs/API.md` and `docs/RELEASING.md` must be one number.
 - Exactly one wheel and one sdist must exist at the declared version, so a stale

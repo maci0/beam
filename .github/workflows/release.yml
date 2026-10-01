@@ -10,6 +10,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
@@ -36,6 +37,14 @@ jobs:
       # published notes are the changelog, not a commit list.
       - name: Check the release contract
         run: python3 scripts/check_release.py --tag "$GITHUB_REF_NAME" --notes notes.md
+
+      # A tag push publishes from this job, so CI's gate runs here too: a tagged
+      # commit that fails the coverage gate or no longer imports must not ship.
+      - name: Unit + fuzz tests (100% coverage gate)
+        run: make test
+
+      - name: Import surface
+        run: make import
 
       - name: Build wheel + sdist
         run: |

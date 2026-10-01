@@ -1,0 +1,22 @@
+# The image needs only python/ and examples/ (the Dockerfile's COPY lines);
+# everything else would only bloat the build context.
+.git
+.github
+.venv
+.coverage
+.hypothesis
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.scratch
+docs
+scripts
+test
+tests
+# harness and make repro scratch dirs, build output, bytecode
+.*-run
+.repro-*
+*.tar.gz
+**/dist
+**/__pycache__
+**/*.pyc
