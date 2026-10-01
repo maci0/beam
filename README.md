@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/maci0/beam/actions/workflows/ci.yml"><img src="https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="coverage">
-  <img src="https://img.shields.io/badge/tests-740-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-742-brightgreen" alt="tests">
   <img src="https://img.shields.io/badge/mypy-typed%20%2B%20strict-blue" alt="mypy typed and strict">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="python 3.9+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license AGPL-3.0"></a>
@@ -21,7 +21,7 @@ The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactl
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
 ([vLLM parallelism & scaling](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/).)
 
-**4,060 lines, 162 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
+**4,063 lines, 162 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
 (see [docs/DESIGN.md](docs/DESIGN.md#size-vs-ray)).
 
 ## Documentation
