@@ -1,4 +1,4 @@
-"""Every environment variable beam reads, in one place, validated once.
+"""Every environment variable beam reads for a deploy, in one place, validated once.
 
 Config used to be read ad hoc (`os.environ.get(...)` at each call site), so a
 mistyped value surfaced only at the moment it mattered: `BEAM_NUM_GPUS=8 ` with
@@ -11,6 +11,10 @@ Each loader takes an `override` that the caller already parsed (a CLI flag the
 caller validated) and returns it untouched; otherwise it reads and validates the
 variable. `ConfigError` messages start with "beam:" so every config failure
 reaches the operator the same way.
+
+The determinism seams (BEAM_TIMEOUT / BEAM_SLEEP / BEAM_CLOCK / BEAM_SEED) are
+not here: they are test/simulation hooks read directly by the daemon and the shim,
+and they must stay settable mid-process. See docs/DEVELOPMENT.md.
 
 Documented in README.md ("Environment") and docs/OPERATIONS.md. The internal
 worker handoff vars (BEAM_SOCK / BEAM_NODE_ID / BEAM_GPU_IDS / BEAM_ACTOR_ID)

@@ -55,11 +55,16 @@ BEAM_NUM_GPUS=1`).
 
 ## Configuration reference
 
-Every variable beam reads lives in `python/ray/_config.py`, which validates it
-where it is read. Bad values fail at `ray start` with one `beam:` line and exit
-2, instead of surfacing as a wrong cluster or a traceback later. Empty is
-treated as unset everywhere, so `-e VAR` without `=value` falls back to the
-documented default rather than being used as `""`.
+Every variable beam reads for a deploy lives in `python/ray/_config.py`, which
+validates it where it is read. A bad value fails at `ray start` with one `beam:`
+line and exit 2, instead of surfacing as a wrong cluster or a traceback later.
+Empty is treated as unset everywhere, so `-e VAR` without `=value` falls back to
+the documented default rather than being used as `""`.
+
+The determinism seams (`BEAM_TIMEOUT`, `BEAM_SLEEP`, `BEAM_CLOCK`, `BEAM_SEED`)
+are read directly by the daemon and the shim rather than through `_config.py`,
+and are not validated; leave them unset in production. They are documented in
+[DEVELOPMENT.md](DEVELOPMENT.md#deterministic-simulation-and-replay).
 
 | var | set by | default | validated |
 |-----|--------|---------|-----------|
@@ -67,9 +72,9 @@ documented default rather than being used as `""`.
 | `BEAM_NODE_IP` | operator | `VLLM_HOST_IP`, else default-route IP | IP literal |
 | `VLLM_HOST_IP` | vLLM | unset | IP literal |
 | `BEAM_BIND_ADDRESS` | operator | `0.0.0.0` | unicast IP literal |
-| `BEAM_RUNTIME_DIR` | operator | `~/.beam` | any path |
+| `BEAM_RUNTIME_DIR` | operator | `~/.beam` | any path whose socket stays under ~100 bytes |
 | `BEAM_SOCK` | daemon (worker env), or operator | `BEAM_RUNTIME_DIR/daemon.sock` | any path |
-| `BEAM_WORKER_CMD` | operator | `python3 -m ray._worker` | command line, split with `shlex` |
+| `BEAM_WORKER_CMD` | operator | `python3 -m ray._worker` | none; split with `shlex` at spawn time |
 | `BEAM_BOOTSTRAP` | operator | unset (bootstrap is automatic in a container) | truthy |
 | `BEAM_NODE_ID`, `BEAM_GPU_IDS`, `BEAM_ACTOR_ID` | daemon, per actor subprocess | unset | internal handoff, not operator input |
 

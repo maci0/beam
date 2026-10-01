@@ -39,7 +39,9 @@ tests/                   pytest + hypothesis, 100% coverage of python/ray
   test_daemon_handlers.py  the async on_* handlers, driven via a fake Peer
   test_shim.py           the ray shim's request translation
   test_cli.py            start/status/stop arg parsing + runtime files
+  test_config.py         env-var loaders and their validation
   test_client.py / test_util.py / test_runtime.py / test_misc.py / test_scanner.py
+  test_replay.py         the BEAM_SEED replay profile in conftest.py
 
 test/                    end-to-end harnesses (shell)
   run_e2e.sh             single head, 4 fake GPUs
@@ -174,6 +176,13 @@ so default behaviour and timings are unchanged:
 | `BEAM_CLOCK` | `time.monotonic` in the shim's deadlines | `module:callable` returning seconds |
 | `BEAM_SEED` | `secrets.token_hex` in `new_node_id` | SHA-256 of the seed plus a per-process counter |
 
+Only two of the four are captured at import time: `ray._CLOCK_HOOK` (read once
+when `ray` is imported) and `_daemon._SLEEP_HOOK`. `BEAM_TIMEOUT`, the shim's
+`BEAM_SLEEP`, and `BEAM_SEED` are read from the environment on every call, so a
+test can change them mid-run. That is why the suite patches
+`monkeypatch.setattr(ray, "_CLOCK_HOOK", "simclock:now_seconds")` for the clock
+and `monkeypatch.setenv("BEAM_SLEEP", ...)` for the rest.
+
 ```bash
 # same seed, twice, same node ids and same example sequence
 BEAM_SEED=repro1 bash test/run_e2e.sh
@@ -206,6 +215,6 @@ which is the seam a crash/restart simulator would drive.
 - The daemon never unpickles payloads; only the shim and the actor worker do.
   Keeping it that way is what lets the daemon stay agnostic to vLLM's classes.
   It still *stores and forwards* payloads verbatim (`on_put` keeps them in
-  `self.objects`, `_daemon.py:1258-1264`, and every handler hands the raw payload
-  to the next hop), so the daemon is an unauthenticated relay for attacker-chosen
-  bytes, not a parser of them. See docs/THREAT_MODEL.md.
+  `self.objects`, and every handler hands the raw payload to the next hop), so
+  the daemon is an unauthenticated relay for attacker-chosen bytes, not a
+  parser of them. See docs/THREAT_MODEL.md.

@@ -10,20 +10,20 @@ Not a general Ray clone. It implements the slice of Ray that vLLM's
 ## Size vs Ray
 
 beam implements one slice of Ray's API, so it is several orders of magnitude
-smaller. beam re-measured 2026-08 (the `python/` package you bind-mount); Ray
+smaller. beam re-measured 2026-10 (the `python/` package you bind-mount); Ray
 figures from ray 2.55.1 installed with `--no-deps`, measured 2026-06:
 
 | | beam | Ray | ratio |
 |---|------|-----|-------|
-| install size | 128 KB | 183 MB | ~1,464× |
-| Python LoC | 3,388 (2,734 non-blank, non-comment) | 643,901 | ~190× |
-| Python files | 21 | 2,417 | ~115× |
+| install size | 162 KB | 183 MB | ~1,180× |
+| Python LoC | 4,093 (3,139 non-blank, non-comment) | 643,901 | ~157× |
+| Python files | 22 | 2,417 | ~110× |
 | native libraries | 0 | 11 `.so` (50 MB) | n/a |
 | runtime dependencies | 1 (cloudpickle) | ~12 required (grpcio, protobuf, msgpack, …) + many extras | n/a |
 | build | none, pure Python | Bazel + C++ core | n/a |
 
 LoC is the shipped `python/` package only (the `tests/` suite is not counted).
-beam is ~0.07% of Ray's on-disk footprint and ~0.5% of its Python. That is the
+beam is ~0.08% of Ray's on-disk footprint and ~0.6% of its Python. That is the
 point: it is the control plane vLLM needs, with nothing to compile and one
 dependency, small enough to read end to end and bind-mount into a stock image.
 

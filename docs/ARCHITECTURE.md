@@ -67,8 +67,11 @@ Three kinds of process, all Python:
 
 - Worker daemons connect only to the head. They never talk to each other through
   beam (NCCL does that directly, node to node).
-- The vLLM driver connects to its **local** daemon (the head daemon, since the
-  driver runs on the head node).
+- The vLLM driver connects to its **local** daemon, whatever node that is: the
+  head daemon on a normal deploy, or a worker daemon when the driver is started
+  on a worker (`test/run_driver_on_worker.sh`). A request from a worker-local
+  driver carries no head-assigned id, so the worker forwards it to the head for
+  placement, and releases created PGs/actors back through the head on disconnect.
 - Every cross-node control message is routed through the head. The volume is
   tiny (a handful of small RPCs per inference step), so a star hub is fine.
 

@@ -52,6 +52,7 @@ Payload column: ✓ means the frame carries a cloudpickled payload.
 |-----------------|------------------------|-----------------------|------------------------|---------|
 | `hello`         | worker daemon → head   | `node` `ip` `ngpu`    | n/a                      |         |
 | `worker_hello`  | actor worker → daemon  | `actor`               | n/a                      |         |
+| `actor_gone`    | worker daemon → head   | `actor`               | n/a                      |         |
 | `status`        | client/worker → head   | n/a                     | `nodes[]`              |         |
 | `create_pg`     | client → head          | `specs[]`             | `pg`                   |         |
 | `remove_pg`     | client → head          | `pg`                  | n/a                      |         |
@@ -89,6 +90,10 @@ Notes:
   reports readiness. A daemon forwards the field on the hop (`_forward_head`
   passes the message through) and bounds that hop by the same budget,
   answering `stat` not-ready when it expires.
+- **`actor_gone`** is a worker daemon reporting that an actor's process died or
+  was reaped locally. The head drops routing for that actor and frees its
+  placement-group bundle, but keeps the PG itself until `remove_pg` or a driver
+  disconnect releases it.
 
 ## Routing
 
