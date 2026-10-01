@@ -20,7 +20,7 @@ RT="$(beam_runtime_dir cpuhead)"   # short: AF_UNIX caps the socket path
 # but ray.init in the shim must import cleanly)
 uv venv --python 3.12 "$RUN/venv" >/dev/null
 VENVPY="$RUN/venv/bin/python"
-uv pip install --python "$VENVPY" cloudpickle >/dev/null
+beam_install_dep "$VENVPY" "$ROOT/requirements.lock"
 
 cleanup() {
   kill "${HEAD_PID:-}" 2>/dev/null || true

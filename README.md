@@ -101,9 +101,10 @@ means a runtime error (no daemon, node down), exit 2 a usage error.
 
 ## Verify without GPUs
 
-Everything below needs only [`uv`](https://docs.astral.sh/uv/) and cloudpickle;
-no GPU, no torch, no venv setup. `make` lists the targets, `make check` runs
-everything CI runs:
+Everything below needs only [`uv`](https://docs.astral.sh/uv/); no GPU, no
+torch, no venv setup. `make` lists the targets, `make check` runs everything
+CI runs (the tool versions are pinned in the `Makefile`; the harnesses install
+cloudpickle from `requirements.lock`, the hash-pinned export of `uv.lock`):
 
     make check                     # lint + types + shellcheck + unit/fuzz + import + e2e
     make test                      # unit + fuzz suite only, ~10s
@@ -181,7 +182,7 @@ ray.data / ray.serve / compiled-DAG are reported, not failed). Run it on a vLLM
 bump as a CI gate:
 
     git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
-    uv run --with cloudpickle python scripts/scan_vllm_ray.py --src /tmp/vllm
+    uv run --with 'cloudpickle>=3.1.2,<4' python scripts/scan_vllm_ray.py --src /tmp/vllm
 
 ## Environment
 
@@ -248,3 +249,8 @@ offering a modified beam over a network must make their source available. beam
 imports cleanly into other-licensed code (vLLM is Apache-2.0); the copyleft
 covers beam and its derivatives, not the model you serve or the rest of your
 stack.
+
+The full AGPL text ships inside the wheel and sdist, and every GitHub release
+carries a CycloneDX SBOM (`beam-sbom.cdx.json`) listing each artifact with its
+hash, so a consumer can trace the grant and the dependency set without the
+source repo.

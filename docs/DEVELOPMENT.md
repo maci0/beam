@@ -77,12 +77,20 @@ Under the hood `make test` is (pytest + hypothesis, no GPUs/torch; 100%
 coverage of `python/ray`, gated in CI):
 
 ```
-uv run --with pytest --with hypothesis --with pytest-cov --with cloudpickle \
+uv run --with pytest==$(PYTEST_VERSION) --with hypothesis==$(HYPOTHESIS_VERSION) \
+  --with pytest-cov==$(PYTEST_COV_VERSION) --with 'cloudpickle>=3.1.2,<4' \
   pytest tests/ -q --cov=ray --cov-report=term-missing --cov-fail-under=100
 ```
 
+(the versions are the `*_VERSION` variables at the top of the `Makefile`;
+they are pinned there so a tool release cannot change a lint, typecheck, or test
+run under your feet)
+
 End-to-end control-plane harnesses (fake GPUs via `BEAM_NUM_GPUS`, need only
-`uv` + cloudpickle), also runnable one at a time:
+`uv`), also runnable one at a time. They install cloudpickle from
+`requirements.lock` — the hash-pinned export of `uv.lock` (`make
+lockfile-export` refreshes it) — so every harness, node and worker unpickles
+with the same cloudpickle the wheel was resolved against:
 
 ```
 bash test/run_e2e.sh          # single-node control plane
@@ -109,13 +117,18 @@ Configured in the repo-root `pyproject.toml`; CI's `lint` job runs all of these
 run the same commands:
 
 ```
-make lint    # uvx ruff@0.16.9 check python examples scripts tests
-             # uvx black@26.5.1 --check python examples scripts tests
-make types   # uvx --with cloudpickle mypy@2.3.1 --config-file pyproject.toml python/ray
+make lint    # uvx ruff==$(RUFF_VERSION) check python examples scripts tests
+             # uvx black==$(BLACK_VERSION) --check python examples scripts tests
+make types   # uvx --with cloudpickle mypy==$(MYPY_VERSION) \
+             #        --config-file pyproject.toml python/ray
 make shell   # shellcheck -x test/*.sh test/dgx/*.sh
-make yaml    # yamllint -c .yamllint.yml .github/workflows/*.yml
+make yaml    # uvx yamllint==$(YAMLLINT_VERSION) -c .yamllint.yml .github/workflows/*.yml
 make format  # black, in place
 ```
+
+Tool versions live at the top of the `Makefile` in one block, pinned exactly:
+`uvx <tool>` otherwise resolves to whatever is newest at run time, so a lint or
+typecheck run could go red (or pass differently) after an upstream release.
 
 ruff/black use line-length 100, and ruff's E501 is on, so a line that black
 cannot split (a long string, say) still fails the lint job. ruff, black, mypy
@@ -147,7 +160,7 @@ guard. On a vLLM bump:
 
 ```
 git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
-uv run --with cloudpickle python scripts/scan_vllm_ray.py --src /tmp/vllm
+uv run --with 'cloudpickle>=3.1.2,<4' python scripts/scan_vllm_ray.py --src /tmp/vllm
 ```
 
 It prints every `ray.*` symbol vLLM uses, marks each covered / out-of-scope /

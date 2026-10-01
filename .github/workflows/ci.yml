@@ -85,5 +85,5 @@ jobs:
         run: git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
       - name: Scan ray API usage vs the shim
         run: >-
-          uv run --with cloudpickle python scripts/scan_vllm_ray.py
+          uv run --with 'cloudpickle>=3.1.2,<4' python scripts/scan_vllm_ray.py
           --src /tmp/vllm

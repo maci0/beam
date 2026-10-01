@@ -7,7 +7,10 @@ version = "2.43.0"
 description = "beam: a drop-in subset of the ray API for vLLM distributed inference"
 requires-python = ">=3.9"
 license = "AGPL-3.0-or-later"
-dependencies = ["cloudpickle"]
+# Held to the 3.x line: uv.lock resolves it with hashes, and cloudpickle 2.x
+# changes how closures and classes are serialized, which would move the wire
+# payload on a cluster without review.
+dependencies = ["cloudpickle>=3.1.2,<4"]
 
 [project.scripts]
 ray = "ray._cli:main"
@@ -18,3 +21,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ray"]
+
+# The AGPL text lives once, at the repo root. Hatchling will not walk above the
+# project directory, so the sdist force-includes the root copy as LICENSE;
+# hatchling's default license-files glob then picks it up when the wheel is
+# built from that sdist, which is how `uv build` makes both artifacts. Building
+# the wheel straight from a checkout (`uv build --wheel`) skips the sdist and so
+# ships no LICENSE; the release workflow runs the default `uv build`.
+[tool.hatch.build.targets.sdist.force-include]
+"../LICENSE" = "LICENSE"
+

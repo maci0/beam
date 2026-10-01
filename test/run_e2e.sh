@@ -12,7 +12,7 @@ rm -rf "$RUN"; mkdir -p "$RUN"
 
 uv venv "$RUN/venv" >/dev/null
 VENVPY="$RUN/venv/bin/python"
-uv pip install --python "$VENVPY" cloudpickle >/dev/null
+beam_install_dep "$VENVPY" "$ROOT/requirements.lock"
 
 export BEAM_RUNTIME_DIR="$RT"
 export PYTHONPATH="$ROOT/python"

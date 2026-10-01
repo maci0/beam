@@ -23,7 +23,7 @@ rm -rf "$RUN"; mkdir -p "$RUN"
 # Ray has.
 uv venv --python 3.12 "$RUN/venv" >/dev/null
 VENVPY="$RUN/venv/bin/python"
-uv pip install --python "$VENVPY" cloudpickle >/dev/null
+beam_install_dep "$VENVPY" "$ROOT/requirements.lock"
 
 export BEAM_RUNTIME_DIR="$RT"
 export PYTHONPATH="$ROOT/python"

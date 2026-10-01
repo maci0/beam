@@ -52,17 +52,22 @@ for i in $(seq 0 $((N-1))); do
   o="$(opts_of "$i")"; ip="$(ip_of "$i")"
   if [ "$o" = "LOCAL" ]; then
     mkdir -p "$REMOTE_DIR"; cp -r "$ROOT/python" "$ROOT/examples" "$REMOTE_DIR/"
+    cp "$ROOT/requirements.lock" "$REMOTE_DIR/"
   else
     ssh $o "$SSH_USER@$ip" "mkdir -p $REMOTE_DIR"
     rsync -a --delete -e "ssh $o" "$ROOT/python/" "$SSH_USER@$ip:$REMOTE_DIR/python/"
     rsync -a --delete -e "ssh $o" "$ROOT/examples/" "$SSH_USER@$ip:$REMOTE_DIR/examples/"
+    rsync -a -e "ssh $o" "$ROOT/requirements.lock" "$SSH_USER@$ip:$REMOTE_DIR/requirements.lock"
   fi
 done
 
 RUN="docker run -d --name beam-cpu --network host -e BEAM_NUM_GPUS=1 \
   -e PYTHONPATH=/opt/beam/python -e PYTHONUNBUFFERED=1 -v $REMOTE_DIR:/opt/beam:ro \
   --entrypoint bash $IMAGE -c"
-PREP="pip install -q cloudpickle >/dev/null 2>&1"
+# Hash-pinned, from the lock export that ships alongside the shim: every node in
+# the cluster must unpickle what the head pickled, so a floating cloudpickle
+# would break cross-node actor calls silently.
+PREP="pip install -q --no-deps --require-hashes -r /opt/beam/requirements.lock >/dev/null 2>&1"
 
 echo "=== head on ${HEAD_IP} ==="
 on 0 "$RUN \"$PREP && python3 -m ray start --head --port $PORT --block\"" >/dev/null

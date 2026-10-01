@@ -17,7 +17,7 @@ RT_W2="$(beam_runtime_dir dow-w2)"
 
 uv venv "$RUN/venv" >/dev/null
 VENVPY="$RUN/venv/bin/python"
-uv pip install --python "$VENVPY" cloudpickle >/dev/null
+beam_install_dep "$VENVPY" "$ROOT/requirements.lock"
 
 export PYTHONPATH="$ROOT/python"
 export BEAM_WORKER_CMD="$VENVPY -m ray._worker"

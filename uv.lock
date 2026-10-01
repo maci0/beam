@@ -25,4 +25,4 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "cloudpickle" }]
+requires-dist = [{ name = "cloudpickle", specifier = ">=3.1.2,<4" }]

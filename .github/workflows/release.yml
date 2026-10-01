@@ -50,6 +50,11 @@ jobs:
       - name: Verify the built artifacts
         run: python3 scripts/check_release.py --tag "$GITHUB_REF_NAME" --dist python/dist
 
+      - name: SBOM (CycloneDX)
+        # Inventory of what actually ships, straight from uv.lock. No extra
+        # tooling: uv can emit CycloneDX natively.
+        run: uv export --format cyclonedx1.5 --no-header -o python/dist/beam-sbom.cdx.json
+
       - name: Bundle the bind-mount payload
         # the shim + examples are all a container needs; exclude build output
         # and caches. --sort=name fixes entry order, --owner/--group=0 and
@@ -84,6 +89,7 @@ jobs:
           files: |
             python/dist/*.whl
             python/dist/*.tar.gz
+            python/dist/*.cdx.json
             beam-bindmount-*.tar.gz
             build-env.txt
 
