@@ -563,9 +563,20 @@ class Daemon:
     # ---- dispatch ----
     async def handle(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
         t = m.get("t")
-        fn = getattr(self, "on_" + t, None) if t else None
-        if fn is None:
-            return {"err": "unknown message type: %s" % t}, b""
+        # `t` is a peer-supplied string dispatched by name, so it has to be a
+        # name before getattr: a dict `t` raises TypeError, a list raises
+        # AttributeError, and a dotted "on_shutdown" reaches a coroutine that
+        # wants no arguments. Peer._handle would turn any of those into the
+        # generic "() takes 0 positional arguments" error, naming nothing the
+        # caller can act on. One bound-method check answers all three, and
+        # reports the type as well as the value, because "[{'t': 1}]" is the
+        # only clue a mismatched sender ever gets.
+        if isinstance(t, str):
+            fn = getattr(self, "on_" + t, None)
+        else:
+            fn = None
+        if not callable(fn):
+            return {"err": "unknown message type: %r" % (t,)}, b""
         return await fn(peer, m, payload)
 
     async def _forward_head(self, m: dict, payload: bytes = b"") -> tuple[dict, bytes]:
