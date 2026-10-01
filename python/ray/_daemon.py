@@ -13,6 +13,7 @@ from __future__ import annotations  # keep `X | None` valid on py3.9
 
 import asyncio
 import glob
+import hashlib
 import json
 import math
 import os
@@ -25,7 +26,22 @@ from typing import Any
 
 from . import _config
 
-# ---- tuning ----
+# ---- tuning / determinism seams ----
+#
+# Every blocking wait below reads its deadline through _timeout() instead of
+# straight from os.environ, so a deterministic simulator (or a test) can shrink
+# every budget in the process with BEAM_TIMEOUT at startup and never wait out
+# real time. BEAM_SLEEP likewise swaps the delay itself for a virtual-clock
+# awaitable, and BEAM_WORKER_CMD already replaces the actor subprocess.
+#
+#   BEAM_TIMEOUT    float, seconds; caps every timeout below (default: unset)
+#   BEAM_SLEEP      "module:callable"; called as hook(seconds) -> awaitable
+#
+# Together those three are what let the same control-plane code run under a
+# simulated clock and simulated processes. None set in production -> the
+# behaviour, and the timings, are exactly what they were. BEAM_SEED (see
+# new_node_id) is the id half of the same idea: with it set, node ids come from
+# the seed instead of OS entropy, so a replay reproduces every id byte for byte.
 
 # Peer RPC deadline: every daemon-to-daemon call (kill, remove_pg, forward) is
 # bounded so one wedged node cannot stall a release or a cleanup path.
@@ -85,6 +101,32 @@ def _gpu_request(raw: Any) -> float | None:
         return None
     value = float(raw)
     return value if math.isfinite(value) and 0.0 <= value <= _MAX_GPU_COUNT else None
+
+
+def _timeout(default: float) -> float:
+    """`default` seconds, capped by BEAM_TIMEOUT when that env var is set."""
+    cap = os.environ.get("BEAM_TIMEOUT")
+    return default if not cap else min(default, float(cap))
+
+
+_SLEEP_HOOK = os.environ.get("BEAM_SLEEP")  # None means "use asyncio.sleep"
+
+
+def _sleep(seconds: float) -> Any:
+    """Await `seconds` of delay through the injectable sleep hook.
+
+    Falls back to the real event loop when no hook is installed, so production
+    timing is untouched. The hook returns an *awaitable*, not a float, because
+    every call site is inside a coroutine: only awaiting can advance a virtual
+    clock and hand control back to the loop, so a substituted hook keeps the
+    production ordering (retry backoff still interleaves with other work)
+    instead of short-circuiting it.
+    """
+    if _SLEEP_HOOK is None:
+        return asyncio.sleep(seconds)
+    mod_name, _, attr = _SLEEP_HOOK.partition(":")
+    hook = getattr(__import__(mod_name, fromlist=["_"]), attr)
+    return hook(seconds)
 
 
 def _terminate(proc: subprocess.Popen | None) -> bool:
@@ -286,7 +328,7 @@ class Peer:
             # forever; cancel stragglers after the budget.
             tasks = list(self._tasks)
             if tasks:
-                _done, pending = await asyncio.wait(tasks, timeout=_RPC_TIMEOUT)
+                _done, pending = await asyncio.wait(tasks, timeout=_timeout(_RPC_TIMEOUT))
                 for t in pending:
                     t.cancel()
                 if pending:
@@ -327,7 +369,24 @@ def detect_gpus(override: int | None = None) -> int:
 
 
 def new_node_id() -> str:
-    return "n" + secrets.token_hex(4)
+    """Fresh node id, unique per start (it keys routing and ownership).
+
+    Uniqueness across restarts is the reason for the random suffix: a
+    re-hello is told apart from a genuinely restarted node by its id. When
+    BEAM_SEED is set, the id is derived from the seed and a per-process counter
+    instead, so a simulated or replayed run produces the same ids every time.
+    Both forms are 9 chars wide and hex after the "n", as the wire expects.
+    """
+    seed = os.environ.get("BEAM_SEED")
+    if not seed:
+        return "n" + secrets.token_hex(4)
+    global _seed_seq
+    _seed_seq += 1
+    digest = hashlib.sha256(("%s:%d" % (seed, _seed_seq)).encode()).hexdigest()
+    return "n" + digest[:8]
+
+
+_seed_seq = 0
 
 
 def owner_of(obj_id: str) -> str:
@@ -487,7 +546,7 @@ class Daemon:
             except OSError:
                 if attempt == retries - 1:
                     raise
-                await asyncio.sleep(_HEAD_DIAL_RETRY_INTERVAL)
+                await _sleep(_HEAD_DIAL_RETRY_INTERVAL)
         self.head_peer = Peer(reader, writer, self.handle)
 
         # If the head link dies, reap local actors: the head cannot RPC-kill us
@@ -853,7 +912,7 @@ class Daemon:
         own GPUs on the head). Pin in_flight and finish cleanup in the background.
         """
         try:
-            return await asyncio.wait_for(asyncio.shield(fwd_task), timeout=_RPC_TIMEOUT)
+            return await asyncio.wait_for(asyncio.shield(fwd_task), timeout=_timeout(_RPC_TIMEOUT))
         except Exception:
             if peer is not None and not fwd_task.done():
                 peer.in_flight += 1
@@ -888,7 +947,7 @@ class Daemon:
         try:
             await asyncio.wait_for(
                 self._forward_head({"t": "kill", "actor": aid}),
-                timeout=_RPC_TIMEOUT,
+                timeout=_timeout(_RPC_TIMEOUT),
             )
             if aid in self.actors:
                 try:
@@ -913,7 +972,7 @@ class Daemon:
         try:
             await asyncio.wait_for(
                 self._forward_head({"t": "remove_pg", "pg": pg_id}),
-                timeout=_RPC_TIMEOUT,
+                timeout=_timeout(_RPC_TIMEOUT),
             )
             peer.in_flight = max(0, peer.in_flight - 1)
         except asyncio.CancelledError:
@@ -942,7 +1001,7 @@ class Daemon:
                 return
             try:
                 await asyncio.wait_for(
-                    p.call({"t": "kill", "actor": actor_id}), timeout=_RPC_TIMEOUT
+                    p.call({"t": "kill", "actor": actor_id}), timeout=_timeout(_RPC_TIMEOUT)
                 )
             except Exception:
                 return  # keep actor_loc for retry
@@ -1030,7 +1089,7 @@ class Daemon:
                 await self._force_kill_actor(actor_id, node)
                 if not self._actor_still_tracked(actor_id):
                     break
-                await asyncio.sleep(delay)
+                await _sleep(delay)
                 delay = min(delay * 2, 5.0)
         finally:
             self._orphan_tasks.pop(actor_id, None)
@@ -1128,7 +1187,7 @@ class Daemon:
                 # still alive: keep hosting (finally will not drop)
                 return {"err": "actor %s process still alive after kill" % actor_id}, b""
             try:
-                peer = await asyncio.wait_for(fut, timeout=_WORKER_DIAL_BACK_TIMEOUT)
+                peer = await asyncio.wait_for(fut, timeout=_timeout(_WORKER_DIAL_BACK_TIMEOUT))
             except asyncio.TimeoutError:
                 self.pending_workers.pop(actor_id, None)
                 if _terminate(proc):
@@ -1331,7 +1390,7 @@ class Daemon:
                 # release_client) that lacks a well-formed type field.
                 try:
                     await asyncio.wait_for(
-                        p.call({"t": "kill", "actor": actor_id}), timeout=_RPC_TIMEOUT
+                        p.call({"t": "kill", "actor": actor_id}), timeout=_timeout(_RPC_TIMEOUT)
                     )
                 except Exception as e:
                     # keep actor_loc so a later kill/retry can still route.
@@ -1555,7 +1614,7 @@ class Daemon:
                 try:
                     await asyncio.wait_for(
                         self._forward_head({"t": "kill", "actor": actor_id}),
-                        timeout=_RPC_TIMEOUT,
+                        timeout=_timeout(_RPC_TIMEOUT),
                     )
                     forward_ok = True
                 except Exception:
@@ -1583,7 +1642,7 @@ class Daemon:
                     try:
                         await asyncio.wait_for(
                             self._forward_head({"t": "remove_pg", "pg": pg_id}),
-                            timeout=_RPC_TIMEOUT,
+                            timeout=_timeout(_RPC_TIMEOUT),
                         )
                     except Exception:
                         self._track(asyncio.create_task(self._retry_forward_remove_pg(pg_id)))
@@ -1659,7 +1718,7 @@ class Daemon:
         delay = 0.25
         # in_flight covers open forwards AND pinned closed-path kill/remove retries
         while peer is not None and peer.in_flight > 0:
-            await asyncio.sleep(delay)
+            await _sleep(delay)
             delay = min(delay * 2, 5.0)
         # Creates that finished after claim may have appended new actors; claim them.
         if peer is not None:
@@ -1709,13 +1768,13 @@ class Daemon:
             try:
                 await asyncio.wait_for(
                     self._forward_head({"t": "kill", "actor": actor_id}),
-                    timeout=_RPC_TIMEOUT,
+                    timeout=_timeout(_RPC_TIMEOUT),
                 )
                 return
             except Exception:
                 if self.head_peer is None or self.head_peer.closed:
                     return
-                await asyncio.sleep(delay)
+                await _sleep(delay)
                 delay = min(delay * 2, 5.0)
 
     async def _retry_forward_remove_pg(self, pg_id: str) -> None:
@@ -1727,13 +1786,13 @@ class Daemon:
             try:
                 await asyncio.wait_for(
                     self._forward_head({"t": "remove_pg", "pg": pg_id}),
-                    timeout=_RPC_TIMEOUT,
+                    timeout=_timeout(_RPC_TIMEOUT),
                 )
                 return
             except Exception:
                 if self.head_peer is None or self.head_peer.closed:
                     return
-                await asyncio.sleep(delay)
+                await _sleep(delay)
                 delay = min(delay * 2, 5.0)
 
     def shutdown(self) -> None:

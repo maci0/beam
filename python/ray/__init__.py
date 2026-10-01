@@ -73,16 +73,43 @@ _WAIT_POLL_INTERVAL = 0.005
 # leap-second smear, or a host suspend, which would make a deadline jump
 # (an hour of the caller's wait skipped) or never arrive (a hang past the
 # timeout). time.monotonic() is unaffected by those and never goes backwards.
+#
+# Both reads go through _clock/_sleep so a deterministic simulation can drive
+# them from a virtual clock: BEAM_CLOCK names "module:callable" returning the
+# current time in seconds and BEAM_SLEEP the matching delay hook (the same seam
+# the daemon uses). Unset in production -> the real monotonic clock, as before.
+_CLOCK_HOOK = os.environ.get("BEAM_CLOCK")
+
+
+def _clock() -> float:
+    """Current time in seconds for deadline arithmetic (monotonic in prod)."""
+    if _CLOCK_HOOK is None:
+        return time.monotonic()
+    mod_name, _, attr = _CLOCK_HOOK.partition(":")
+    return float(getattr(__import__(mod_name, fromlist=["_"]), attr)())
+
+
+def _sleep(seconds: float) -> None:
+    """Delay `seconds`, or yield to a simulator's virtual clock when installed."""
+    hook = os.environ.get("BEAM_SLEEP")
+    if hook is None:
+        time.sleep(seconds)
+        return
+    mod_name, _, attr = hook.partition(":")
+    fn = getattr(__import__(mod_name, fromlist=["_"]), attr)
+    val = fn(seconds)
+    if val is not None and hasattr(val, "send"):  # a coroutine from an async hook
+        raise RuntimeError("BEAM_SLEEP hook for the ray shim must be synchronous")
 
 
 def _deadline(timeout: float | None) -> float | None:
     """Deadline on the monotonic clock, or None for "wait forever"."""
-    return None if timeout is None else time.monotonic() + timeout
+    return None if timeout is None else _clock() + timeout
 
 
 def _remaining(deadline: float | None) -> float | None:
     """Seconds left before `deadline`, clamped at 0. None means no deadline."""
-    return None if deadline is None else max(0.0, deadline - time.monotonic())
+    return None if deadline is None else max(0.0, deadline - _clock())
 
 
 # ---- object refs ----
@@ -164,14 +191,15 @@ def wait(
                 continue
             resp, _ = _stat(client, ref, _remaining(deadline))
             (ready if resp.get("ready") else not_ready).append(ref)
-        if len(ready) >= num_returns or (deadline and time.monotonic() >= deadline):
+        if len(ready) >= num_returns or (deadline and _clock() >= deadline):
             return ready, not_ready
         # Never sleep past the deadline: ray.wait is polled on a fixed cadence
         # (vLLM's liveness thread), so oversleeping here compounds every cycle.
         left = _remaining(deadline)
         if left is not None and left <= 0:
             return ready, not_ready
-        time.sleep(_WAIT_POLL_INTERVAL if left is None else min(_WAIT_POLL_INTERVAL, left))
+        # Through _sleep, so a run on a virtual clock polls without real time.
+        _sleep(_WAIT_POLL_INTERVAL if left is None else min(_WAIT_POLL_INTERVAL, left))
 
 
 def _budgeted(client: Any, header: dict[str, Any], left: float | None) -> tuple[dict, bytes]:

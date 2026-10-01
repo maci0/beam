@@ -5,12 +5,14 @@ covered by the shell harnesses in test/."""
 import asyncio
 import os
 import sys
+import time
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+from ray import _daemon
 from ray._daemon import ActorProc, Daemon, Peer, detect_gpus, new_node_id, owner_of
 
 
@@ -170,6 +172,35 @@ def test_node_id_format():
     int(nid[1:], 16)  # raises if the suffix is not hex
 
 
+def test_node_id_from_seed_is_reproducible(monkeypatch):
+    """With BEAM_SEED, two runs of the same seed yield the same id sequence:
+    that is what lets a failing run be replayed byte for byte."""
+    monkeypatch.setenv("BEAM_SEED", "s1")
+    monkeypatch.setattr(_daemon, "_seed_seq", 0)
+    first = [new_node_id() for _ in range(4)]
+
+    monkeypatch.setattr(_daemon, "_seed_seq", 0)
+    assert [new_node_id() for _ in range(4)] == first
+
+    monkeypatch.setenv("BEAM_SEED", "s2")
+    monkeypatch.setattr(_daemon, "_seed_seq", 0)
+    assert [new_node_id() for _ in range(4)] != first  # a different seed differs
+
+
+def test_node_id_from_seed_keeps_the_wire_shape(monkeypatch):
+    monkeypatch.setenv("BEAM_SEED", "shape")
+    monkeypatch.setattr(_daemon, "_seed_seq", 0)
+    ids = [new_node_id() for _ in range(8)]
+    assert all(len(i) == 9 and i[0] == "n" for i in ids)
+    assert len(set(ids)) == 8  # distinct within a run, like the random form
+    assert all(int(i[1:], 16) >= 0 for i in ids)
+
+
+def test_node_id_seed_empty_falls_back_to_entropy(monkeypatch):
+    monkeypatch.setenv("BEAM_SEED", "")
+    assert len(new_node_id()) == 9  # unset seed keeps OS entropy
+
+
 def test_detect_gpus(monkeypatch):
     monkeypatch.setenv("BEAM_NUM_GPUS", "7")
     assert detect_gpus() == 7
@@ -274,6 +305,74 @@ def test_peer_send_on_closed_raises():
             await p.send({"t": "x"})
             raise AssertionError("expected ConnectionError")
         except ConnectionError:
+            # the closed peer must refuse to write, not silently drop the frame
             pass
 
     asyncio.run(run())
+
+
+# ---- determinism seams (BEAM_TIMEOUT / BEAM_SLEEP) ----
+def _sim_sleep_hook(seen):
+    """A BEAM_SLEEP hook: records the requested delay, returns an awaitable."""
+    import types
+
+    mod = types.ModuleType("simclock")
+
+    def hook(seconds):
+        seen.append(seconds)
+
+        async def _virtual_delay():
+            return None
+
+        return _virtual_delay()
+
+    mod.hook = hook
+    return mod
+
+
+def test_timeout_default_without_env(monkeypatch):
+    monkeypatch.delenv("BEAM_TIMEOUT", raising=False)
+    assert _daemon._timeout(30.0) == 30.0  # production budget, untouched
+
+
+def test_timeout_capped_by_env(monkeypatch):
+    monkeypatch.setenv("BEAM_TIMEOUT", "0.5")
+    assert _daemon._timeout(30.0) == 0.5  # a simulated run never waits 30s
+    assert _daemon._timeout(0.05) == 0.05  # budgets shrink, never stretch
+
+
+def test_sleep_without_hook_uses_event_loop(monkeypatch):
+    monkeypatch.setattr(_daemon, "_SLEEP_HOOK", None)
+    started = time.monotonic()
+    asyncio.run(_daemon._sleep(0.01))
+    assert time.monotonic() - started >= 0.005
+
+
+def test_sleep_hook_replaces_the_delay(monkeypatch):
+    seen = []
+    monkeypatch.setitem(sys.modules, "simclock", _sim_sleep_hook(seen))
+    monkeypatch.setattr(_daemon, "_SLEEP_HOOK", "simclock:hook")
+    asyncio.run(_daemon._sleep(2.5))
+    assert seen == [2.5]  # the delay reached the hook instead of the real clock
+
+
+def test_retry_backoff_goes_through_the_hook(monkeypatch):
+    """_reap_orphan's backoff must reach the hook, not asyncio.sleep, or a
+    simulated run waits out real seconds between retries."""
+    d = head(2)
+    d.actor_loc["a1"] = "n2"
+    d._orphans["a1"] = "n2"
+    tries = {"n": 0}
+    seen = []
+
+    async def force(actor_id, node):
+        tries["n"] += 1
+        if tries["n"] >= 3:
+            d.actor_loc.pop(actor_id, None)
+
+    monkeypatch.setattr(d, "_force_kill_actor", force)
+    monkeypatch.setitem(sys.modules, "simclock", _sim_sleep_hook(seen))
+    monkeypatch.setattr(_daemon, "_SLEEP_HOOK", "simclock:hook")
+
+    asyncio.run(d._reap_orphan("a1", "n2"))
+    assert tries["n"] >= 3 and seen == [0.25, 0.5]  # exponential backoff, instantly

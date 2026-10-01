@@ -156,6 +156,41 @@ To cover a newly-required symbol:
   and a thin call in the shim (see how `placement_group_table` → `pg_table` and
   `available_resources_per_node` → `resources` are wired).
 
+## Deterministic simulation and replay
+
+The control plane is written so a whole run can be driven by one seed instead of
+by real time and OS entropy. Four env vars are the seams; unset in production,
+so default behaviour and timings are unchanged:
+
+| var | replaces | with |
+|-----|----------|------|
+| `BEAM_TIMEOUT` | the daemon's 30s/120s `wait_for` budgets | a capped budget (capped, never stretched) |
+| `BEAM_SLEEP` | `asyncio.sleep` (daemon) / `time.sleep` (shim) | `module:callable`, `hook(seconds) -> awaitable` (daemon) or `-> None` (shim) |
+| `BEAM_CLOCK` | `time.monotonic` in the shim's deadlines | `module:callable` returning seconds |
+| `BEAM_SEED` | `secrets.token_hex` in `new_node_id` | SHA-256 of the seed plus a per-process counter |
+
+```bash
+# same seed, twice, same node ids and same example sequence
+BEAM_SEED=repro1 bash test/run_e2e.sh
+BEAM_SEED=repro1 bash test/run_e2e.sh
+
+# derandomized property tests: a flaky failure reproduces instead of moving
+BEAM_SEED=repro1 uv run --with pytest --with hypothesis --with cloudpickle pytest tests/
+# one-off: pin a single example
+pytest tests/test_proto.py --hypothesis-seed=1234
+```
+
+`tests/conftest.py` turns `BEAM_SEED` into hypothesis's `replay` profile
+(derandomized, no example database), so the property suite replays exactly like
+the daemon ids do. CI leaves `BEAM_SEED` unset so the database-backed search
+keeps finding new failures.
+
+Not yet modelled (deliberate gaps, in rough priority order): no fault-injection
+hook for torn writes or `fsync` failure, no virtual network (latency, reorder,
+drop, partition) between nodes, and no action/event log to diff a divergent
+replay against. The actor subprocess is already swappable via `BEAM_WORKER_CMD`,
+which is the seam a crash/restart simulator would drive.
+
 ## Conventions
 
 - The wire format is the single source of truth; the sync side (`_proto.py`,

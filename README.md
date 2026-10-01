@@ -192,6 +192,16 @@ bump as a CI gate:
 | `BEAM_SOCK`        | actor/worker daemon socket (the CLI reads it from the runtime dir) |
 | `BEAM_WORKER_CMD`  | how to launch a python actor (default `python3 -m ray._worker`) |
 | `BEAM_BOOTSTRAP`   | force the bootstrap that normally runs only inside a container |
+| `BEAM_TIMEOUT`     | cap every control-plane timeout (seconds); unset = production budgets |
+| `BEAM_SLEEP`       | `module:callable` delay hook, `hook(seconds) -> awaitable`; daemon + shim |
+| `BEAM_CLOCK`       | `module:callable` returning the current time in seconds (shim deadlines) |
+| `BEAM_SEED`        | derive node ids from this seed instead of OS entropy (reproducible runs) |
+
+`BEAM_TIMEOUT`, `BEAM_SLEEP`, `BEAM_CLOCK` and `BEAM_SEED` are the determinism
+seams: set them and the same daemon code runs on a virtual clock (backoffs and
+retries collapse instantly, budgets shrink) with ids that follow from one seed,
+which is what makes a control-plane run drivable from a single seed instead of
+from real time and OS entropy. Unset in production, so timings are unchanged.
 
 Values are read once, through `python/ray/_config.py`, and validated where they
 are read: a non-numeric or negative `BEAM_NUM_GPUS`, or a `BEAM_NODE_IP` that is

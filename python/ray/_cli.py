@@ -156,6 +156,11 @@ def _usage(code: int) -> int:
         "  BEAM_BOOTSTRAP    force bootstrap outside a container (auto inside one)\n"
         "  BEAM_BIND_ADDRESS address the head's control port binds (default 0.0.0.0, i.e. every\n"
         "                    interface; set the cluster LAN address to narrow it)\n"
+        "  BEAM_TIMEOUT      cap every control-plane timeout, in seconds (test/sim seam)\n"
+        "  BEAM_SLEEP        'module:callable' delay hook: hook(seconds) -> awaitable (daemon)\n"
+        "                    or -> None (shim); sync in the shim, the event loop in the daemon\n"
+        "  BEAM_CLOCK        'module:callable' returning the current time in seconds\n"
+        "  BEAM_SEED         derive node ids from this seed instead of OS entropy\n"
     )
     if code:
         sys.stderr.write(text)

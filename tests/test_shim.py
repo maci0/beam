@@ -16,6 +16,8 @@ from ray import _proto
 from ray.exceptions import GetTimeoutError
 from ray.runtime_env import RuntimeEnv
 
+ObjectRef = ray.ObjectRef  # noqa: E405  (bound at import time for the seam tests)
+
 
 class FakeClient:
     """Mirrors DaemonClient.request: an "err" key in the canned response raises
@@ -376,6 +378,100 @@ def test_wait_returns_when_the_clock_steps_past_the_deadline(monkeypatch):
     assert _time.monotonic() - started < 1.0
     assert ready == [] and len(not_ready) == 1
     assert clock  # keep the name used
+
+
+# ---- virtual-clock seams (BEAM_CLOCK / BEAM_SLEEP) ----
+class VirtualClock:
+    """The simulator's clock: a float the test advances, plus a sleep hook that
+    jumps it forward instead of blocking. A shim run driven through this never
+    waits real seconds, and its deadline arithmetic is fully reproducible."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def now_seconds(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds  # time passes instantly
+
+    def install(self, monkeypatch):
+        import types
+
+        mod = types.ModuleType("simclock")
+        mod.now_seconds = self.now_seconds
+        mod.sleep = self.sleep
+        monkeypatch.setitem(sys.modules, "simclock", mod)
+        monkeypatch.setattr(ray, "_CLOCK_HOOK", "simclock:now_seconds")
+        monkeypatch.setenv("BEAM_SLEEP", "simclock:sleep")
+        return self
+
+
+def test_deadlines_run_on_the_virtual_clock(monkeypatch):
+    clock = VirtualClock().install(monkeypatch)
+    deadline = ray._deadline(2.0)
+    assert deadline == 1002.0
+    assert ray._remaining(deadline) == 2.0
+    clock.now += 0.5
+    assert ray._remaining(deadline) == 1.5
+    clock.now += 10.0
+    assert ray._remaining(deadline) == 0.0  # clamped, never negative
+
+
+def test_wait_polls_on_the_virtual_clock(monkeypatch):
+    clock = VirtualClock().install(monkeypatch)
+    polls = {"n": 0}
+
+    class ReadyAtPoll3:
+        def request(self, header, payload=b""):
+            polls["n"] += 1
+            return {"t": "stat_ok", "ready": polls["n"] >= 3}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: ReadyAtPoll3())
+    started = _time.monotonic()
+    ref = ObjectRef("a")
+    ready, not_ready = ray.wait([ref], num_returns=1, timeout=5.0)
+    assert ready == [ref] and not_ready == []
+    assert clock.slept == [ray._WAIT_POLL_INTERVAL] * 2  # two polls, no real time
+    assert _time.monotonic() - started < 1.0
+
+
+def test_wait_timeout_comes_from_the_virtual_clock(monkeypatch):
+    clock = VirtualClock().install(monkeypatch)
+
+    class NeverReady:
+        def request(self, header, payload=b""):
+            return {"t": "stat_ok", "ready": False}, b""
+
+    monkeypatch.setattr(ray, "_need", lambda: NeverReady())
+    ref = ObjectRef("a")
+    ready, not_ready = ray.wait([ref], num_returns=1, timeout=0.01)
+    assert ready == [] and not_ready == [ref]
+    assert clock.now >= 1000.0 + 0.01  # the virtual clock, not the wall clock
+
+
+def test_shim_sleep_without_hook_sleeps(monkeypatch):
+    monkeypatch.delenv("BEAM_SLEEP", raising=False)
+    started = _time.monotonic()
+    ray._sleep(0.01)
+    assert _time.monotonic() - started >= 0.005
+
+
+def test_shim_sleep_rejects_an_async_hook(monkeypatch):
+    import types
+
+    mod = types.ModuleType("simclock")
+
+    async def bad_sleep(seconds):
+        return None
+
+    mod.sleep = bad_sleep
+    monkeypatch.setitem(sys.modules, "simclock", mod)
+    monkeypatch.setenv("BEAM_SLEEP", "simclock:sleep")
+    with pytest.raises(RuntimeError, match="synchronous"):
+        ray._sleep(1.0)
 
 
 # ---- remote / options ----
