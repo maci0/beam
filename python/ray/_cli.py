@@ -306,8 +306,6 @@ async def _run_daemon(
         sys.stderr.write(claim)
         return 1
 
-    await d.serve_unix(sock)
-
     def _fail(msg: str) -> int:
         sys.stderr.write(msg)
         for path in (sock, _config.runtime_json_path()):
@@ -316,6 +314,11 @@ async def _run_daemon(
             except OSError:
                 pass
         return 1
+
+    try:
+        await d.serve_unix(sock)
+    except OSError as e:
+        return _fail("beam: cannot bind the daemon socket at %s (%s)\n" % (sock, e))
 
     if head:
         bind = _config.bind_address()

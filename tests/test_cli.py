@@ -534,11 +534,13 @@ def test_live_daemon_pid_zero_pid(tmp_path, monkeypatch):
 # ---- _run_daemon (head + worker, no real listeners) -------------------------
 
 
-def _patch_daemon(monkeypatch, *, head_serve_exc=None, join_exc=None):
+def _patch_daemon(monkeypatch, *, unix_serve_exc=None, head_serve_exc=None, join_exc=None):
     """Replace Daemon's networking with no-ops so _run_daemon can run end to end
     in-process: no unix/tcp listeners, no signal-driven block."""
 
     async def fake_serve_unix(self, path):
+        if unix_serve_exc:
+            raise unix_serve_exc
         self.sock_path = path
 
     async def fake_serve_tcp(self, host, port):
@@ -653,6 +655,19 @@ def test_run_daemon_head_bind_failure(tmp_path, monkeypatch, capsys):
     rc = aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 4, 6379, None))
     assert rc == 1
     assert "cannot bind" in capsys.readouterr().err
+
+
+def test_run_daemon_sock_bind_failure_releases_the_claim(tmp_path, monkeypatch, capsys):
+    """A daemon socket that cannot bind exits 1 and leaves no daemon.json, so the
+    next `ray start` is not refused with "daemon already running"."""
+    monkeypatch.setenv("BEAM_RUNTIME_DIR", str(tmp_path))
+    _patch_daemon(monkeypatch, unix_serve_exc=PermissionError("denied"))
+    import asyncio as aio
+
+    rc = aio.run(_cli._run_daemon(True, "n1", "1.2.3.4", 4, 6379, None))
+    assert rc == 1
+    assert "cannot bind the daemon socket" in capsys.readouterr().err
+    assert not os.path.exists(_cli._config.runtime_json_path())
 
 
 def test_run_daemon_worker(tmp_path, monkeypatch, capsys):

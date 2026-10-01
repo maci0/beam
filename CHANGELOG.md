@@ -23,8 +23,8 @@ Both numbers are checked against each other and against the tag by
 
 ## [Unreleased]
 
-Ten commits since v0.2.0, none of them released yet. The behavioral changes a
-consumer can notice:
+Changes since v0.2.0, not yet released. The behavioral changes a consumer can
+notice:
 
 ### Added
 
@@ -64,6 +64,10 @@ consumer can notice:
 - `ray start` refuses a `BEAM_RUNTIME_DIR` whose unix-socket path exceeds the
   AF_UNIX limit with a named error, instead of a bare `OSError` out of
   `socket.connect()`.
+- A daemon socket that fails to bind (permissions, a read-only runtime dir)
+  makes `ray start` exit 1 with the path and the error, and releases the
+  `daemon.json` claim. Before, the `OSError` escaped and the leftover claim
+  made the next `ray start` refuse with "daemon already running".
 - `DaemonNotRunning` replaces the `FileNotFoundError` / `KeyError` /
   `JSONDecodeError` a driver saw when no daemon was running.
 - A `return` inside `finally` in the daemon's actor-kill path (a `SyntaxError`
