@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -52,6 +53,51 @@ def test_place_exhaustion():
     d.gpu_used[0] = True
     node, _, err = d._place_actor({"ngpu": 1})
     assert node is None and "no free GPU" in err
+
+
+# ---- malformed quantities on the wire --------------------------------------
+# ngpu/bundle/GPU arrive from a peer over the control socket. Used raw they are
+# not quantities: a str or float raises TypeError out of the placement handler
+# mid-create, and NaN slips past every comparison it is checked against.
+BAD_COUNTS = ["1", float("nan"), float("inf"), -0.5, -5, None, [1], True]
+
+
+@pytest.mark.parametrize("bad", BAD_COUNTS)
+def test_place_rejects_malformed_ngpu(bad):
+    node, gpus, err = head()._place_actor({"ngpu": bad})
+    assert node is None and gpus is None
+    assert "invalid num_gpus" in err
+
+
+@pytest.mark.parametrize("bad", BAD_COUNTS)
+def test_place_rejects_malformed_bundle(bad):
+    d = head()
+    d.pgs["p"] = [{"node": "n1", "gpu": 0}]
+    node, gpus, err = d._place_actor({"pg": "p", "bundle": bad})
+    assert node is None and gpus is None
+    assert "bundle index" in err
+
+
+def test_place_rejects_ngpu_above_node_capacity():
+    # 3 GPUs on a 2-GPU node can never be satisfied; placing it anyway would
+    # hand the actor one device for a three-device request.
+    node, gpus, err = head(2)._place_actor({"ngpu": 3})
+    assert node is None and gpus is None and "exceeds" in err
+
+
+def test_place_fractional_ngpu_still_takes_one_device():
+    # num_gpus=0.5 is preserved on the wire (vLLM splits workers that way) and
+    # the actor still gets exactly one CUDA_VISIBLE_DEVICES entry.
+    assert head(4)._place_actor({"ngpu": 0.5}) == ("n1", [0], None)
+
+
+@given(st.one_of(st.integers(), st.floats(), st.text()))
+def test_place_never_raises_on_any_ngpu(value):
+    d = head()
+    try:
+        d._place_actor({"ngpu": value})
+    except Exception as e:  # noqa: BLE001 - the point is that nothing escapes
+        raise AssertionError("ngpu=%r raised %r" % (value, e)) from None
 
 
 # ---- id parsing ----

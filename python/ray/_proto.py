@@ -55,7 +55,10 @@ def read_frame(sock: socket.socket) -> tuple[dict, bytes]:
     if not isinstance(header, dict):  # valid JSON but not an object (e.g. a bare int)
         raise ConnectionError("frame header is not a JSON object")
     plen = header.get("plen", 0)
-    if plen < 0 or plen > _MAX_FRAME:
-        raise ConnectionError("bad frame payload length %d" % plen)
+    # isint, not a range check: a float/str plen is not a length, and letting one
+    # through reaches recv(n - len(buf)) with a non-int and raises TypeError out
+    # of the frame reader instead of closing the connection cleanly.
+    if not isinstance(plen, int) or isinstance(plen, bool) or not 0 <= plen <= _MAX_FRAME:
+        raise ConnectionError("bad frame payload length %r" % (plen,))
     payload = _recv_exact(sock, plen) if plen else b""
     return header, payload

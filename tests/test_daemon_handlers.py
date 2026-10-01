@@ -1982,6 +1982,38 @@ def test_on_hello_registers_node():
     assert peer.on_close is not None  # wired to release + _drop_node
 
 
+@pytest.mark.parametrize("bad", ["2", 2.5, -5, None, [1], True, 10**9, 2**40])
+def test_on_hello_normalizes_malformed_ngpu(bad):
+    """A peer's GPU count bounds range(), ngpu-used and `ray status`'s %d, so a
+    non-count must not be stored: it crashed the head's create_pg handler and
+    poisoned the status view. The node joins as a 0-GPU node instead."""
+    d = head()
+    peer = FakePeer()
+    r, _ = run(d.on_hello(peer, {"t": "hello", "node": "n2", "ip": "9.9.9.9", "ngpu": bad}, b""))
+    assert r["t"] == "hello_ok"
+    assert d.nodes["n2"]["info"]["ngpu"] == 0
+    # the stored value must survive every consumer of it
+    status, _ = run(d.on_status(peer, {"t": "status"}, b""))
+    assert status["nodes"][-1]["ngpu"] == 0
+    resources, _ = run(d.on_resources(peer, {"t": "resources"}, b""))
+    assert resources["data"]["n2"] == {"GPU": 0.0, "CPU": 1.0}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1, "1", [1], {"GPU": 1}])
+def test_on_create_pg_rejects_malformed_bundle_spec(bad):
+    d = head()
+    r, _ = run(d.on_create_pg(FakePeer(), {"t": "create_pg", "specs": [{"GPU": bad}]}, b""))
+    assert "invalid bundle spec" in r["err"]
+    assert d.pgs == {}  # nothing half-placed
+
+
+def test_on_create_pg_zero_gpu_bundle_is_cpu_bundle():
+    d = head(2)
+    r, _ = run(d.on_create_pg(FakePeer(), {"t": "create_pg", "specs": [{"CPU": 1}]}, b""))
+    assert r["t"] == "create_pg_ok"
+    assert d.pgs[r["pg"]] == [{"node": "n1", "gpu": -1}]
+
+
 def test_on_hello_close_releases_owned_pgs_and_drops_node():
     """Worker disconnect must free PGs/actors tracked on that connection
     (driver-on-worker ownership), not only drop membership. Otherwise a PG

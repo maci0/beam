@@ -14,6 +14,7 @@ from __future__ import annotations  # keep `X | None` valid on py3.9
 import asyncio
 import glob
 import json
+import math
 import os
 import secrets
 import shlex
@@ -48,6 +49,42 @@ def _hop_budget(requested: float | None) -> float:
     if requested is None:
         return _RPC_TIMEOUT
     return max(_STAT_HOP_FLOOR, min(_RPC_TIMEOUT, requested))
+
+
+# A node's GPU count bounds every allocation the head makes for it (range()
+# over the count, ngpu - used in the resource view, %d in `ray status`), so a
+# count that is not a plain non-negative int is not a count at all. Anything
+# else reaches those sites as a TypeError mid-handler, or as a negative/odd
+# value that silently corrupts the cluster's view of what is allocated.
+_MAX_GPU_COUNT = 1 << 20
+
+
+def _gpu_count(raw: Any, default: int = 0) -> int:
+    """GPUs a peer claims, or `default` when the value is not a sane count.
+
+    bool is rejected on purpose: True is an int in Python and would read as a
+    1-GPU node. Floats are rejected because the count indexes a per-node list
+    (`range(ngpu)`), so 2.5 has no meaning there. Anything out of the accepted
+    range falls back to `default` rather than failing the hello, so one bad
+    peer cannot keep a node out of the cluster.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return default
+    return raw if 0 <= raw <= _MAX_GPU_COUNT else default
+
+
+def _gpu_request(raw: Any) -> float | None:
+    """GPUs an actor asks for, or None when the request is not a sane quantity.
+
+    A non-finite or negative request is not a quantity at all (NaN compares
+    false against every bound, so it slips past a bare `<= 0` check), and a
+    request above what one node has can never be satisfied: both are client
+    errors, so both are rejected here rather than silently placed.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) and 0.0 <= value <= _MAX_GPU_COUNT else None
 
 
 def _terminate(proc: subprocess.Popen | None) -> bool:
@@ -109,8 +146,8 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes]:
     if not isinstance(header, dict):  # valid JSON but not an object (e.g. a bare int)
         raise ConnectionError("frame header is not a JSON object")
     plen = header.get("plen", 0)
-    if plen < 0 or plen > _MAX_FRAME:
-        raise ConnectionError("bad frame payload length %d" % plen)
+    if not isinstance(plen, int) or isinstance(plen, bool) or not 0 <= plen <= _MAX_FRAME:
+        raise ConnectionError("bad frame payload length %r" % (plen,))
     payload = await reader.readexactly(plen) if plen else b""
     return header, payload
 
@@ -491,7 +528,7 @@ class Daemon:
             "info": {
                 "node": node,
                 "ip": m.get("ip", ""),
-                "ngpu": m.get("ngpu", 0),
+                "ngpu": _gpu_count(m.get("ngpu", 0)),
                 "alive": True,
                 "head": False,
             },
@@ -592,7 +629,10 @@ class Daemon:
 
         bundles = []
         for spec in m.get("specs", []):
-            if not spec.get("GPU", 0):
+            want = _gpu_request(spec.get("GPU", 0)) if isinstance(spec, dict) else None
+            if want is None:
+                return {"err": "invalid bundle spec %r" % (spec,)}, b""
+            if want == 0:
                 bundles.append({"node": self.node_id, "gpu": -1})
                 continue
             placed = False
@@ -945,13 +985,26 @@ class Daemon:
             pg = self.pgs.get(pg_id)
             if pg is None:
                 return None, None, "unknown placement group %s" % pg_id
-            bundle = m.get("bundle", 0)
+            bundle = _gpu_count(m.get("bundle", 0), default=-1)
             if bundle < 0 or bundle >= len(pg):
-                return None, None, "bundle index %d out of range" % bundle
+                return None, None, "bundle index %s out of range" % (m.get("bundle", 0),)
             b = pg[bundle]
             return b["node"], ([b["gpu"]] if b["gpu"] >= 0 else []), None
-        if m.get("ngpu", 0) <= 0:
+        # ngpu is the quantity the client asks for. Anything that is not a
+        # finite non-negative number is a malformed request, not a CPU actor,
+        # and a request of more than one node's worth of GPUs can never be
+        # satisfied by the single-index placement below.
+        ngpu = _gpu_request(m.get("ngpu", 0))
+        if ngpu is None:
+            return None, None, "invalid num_gpus %r" % (m.get("ngpu"),)
+        if ngpu == 0:
             return self.node_id, [], None
+        if ngpu > self.num_gpus:
+            return (
+                None,
+                None,
+                "num_gpus %g exceeds the %d GPUs on this node" % (ngpu, self.num_gpus),
+            )
         # exclude GPUs already owned by pg bundles on this node, so a non-pg GPU
         # actor can't grab an index a placement-group bundle is using.
         pg_used = {
