@@ -73,7 +73,7 @@ and are not validated; leave them unset in production. They are documented in
 | `VLLM_HOST_IP` | vLLM | unset | IP literal |
 | `BEAM_BIND_ADDRESS` | operator | `0.0.0.0` | unicast IP literal |
 | `BEAM_RUNTIME_DIR` | operator | `~/.beam` | any path whose socket stays under ~100 bytes |
-| `BEAM_SOCK` | daemon (worker env), or operator | `BEAM_RUNTIME_DIR/daemon.sock` | any path |
+| `BEAM_SOCK` | daemon (actor env), or operator | the `sock` path in `BEAM_RUNTIME_DIR/daemon.json` | any path |
 | `BEAM_WORKER_CMD` | operator | `python3 -m ray._worker` | none; split with `shlex` at spawn time |
 | `BEAM_BOOTSTRAP` | operator | unset (bootstrap is automatic in a container) | truthy |
 | `BEAM_NODE_ID`, `BEAM_GPU_IDS`, `BEAM_ACTOR_ID` | daemon, per actor subprocess | unset | internal handoff, not operator input |

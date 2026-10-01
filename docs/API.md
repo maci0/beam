@@ -65,10 +65,15 @@ through ray).
 | `ray._private.state.available_resources_per_node()` | `resources`                 |
 | `ray._private.state.total_resources_per_node()` | `status`                        |
 | `ray.util.state.list_nodes()`                  | `status` → node objects          |
+| `ray.util.get_node_ip_address()`               | local: `BEAM_NODE_IP` / `VLLM_HOST_IP`, else the default-route IP |
 
 `available_resources_per_node` and `placement_group_table` are imported at
 module top in vLLM's `ray_utils.py`; if they were missing, vLLM would conclude
-ray is unavailable and refuse the backend. They are not optional.
+that ray is unavailable and refuse the backend. They are not optional.
+
+`get_node_ip_address` is computed in-process rather than asked of the daemon,
+because vLLM calls it in the driver to publish its own zmq queues, and on a
+multi-homed host the configured address is the one peers can reach.
 
 ## Placement groups
 

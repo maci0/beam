@@ -10,6 +10,7 @@ python/ray/
   _daemon.py             the asyncio daemon: membership, placement, actor hub, routing
   _cli.py                `ray start/status/stop/bootstrap` (start runs the daemon)
   _runtime.py            the daemon.json claim: read/write/claim, pid liveness, seize+restore
+  _config.py             every operator-set env var, read and validated in one place
   __main__.py            `python -m ray` → _cli.main
   _worker.py             actor subprocess: instantiate class, serve method calls
   util/
@@ -33,6 +34,7 @@ examples/
 
 scripts/
   scan_vllm_ray.py       scan a vLLM checkout for ray usage vs the shim
+  check_release.py       version / CHANGELOG / built-artifact agreement (`make release-check`)
 
 tests/                   pytest + hypothesis, 100% coverage of python/ray
   test_proto.py          wire framing (roundtrip + garbage/oversize fuzz)
@@ -43,6 +45,7 @@ tests/                   pytest + hypothesis, 100% coverage of python/ray
   test_config.py         env-var loaders, and the daemon.json readers built on them
   test_client.py / test_util.py / test_runtime.py / test_misc.py / test_scanner.py
   test_replay.py         the BEAM_SEED replay profile in conftest.py
+  test_release.py        check_release.py's version/CHANGELOG/dist gates
 
 test/                    end-to-end harnesses (shell)
   run_e2e.sh             single head, 4 fake GPUs
@@ -55,7 +58,7 @@ test/                    end-to-end harnesses (shell)
   run_rocm*.sh           AMD ROCm: single-node + cross-node harnesses
   dgx/                   two-node DGX Spark harness over SSH (see test/dgx/README.md)
 
-docs/                    DESIGN + ARCHITECTURE/PROTOCOL/API/OPERATIONS/DEVELOPMENT
+docs/                    DESIGN + ARCHITECTURE/PROTOCOL/API/OPERATIONS/DEVELOPMENT/RELEASING
                           + THREAT_MODEL (attack surface, boundaries, controls) + logo.svg
 SECURITY.md              deployment checklist, supported versions, disclosure policy
 CHANGELOG.md             what changed per release; docs/RELEASING.md how a tag is cut
@@ -165,9 +168,11 @@ uv run --with 'cloudpickle>=3.1.2,<4' python scripts/scan_vllm_ray.py --src /tmp
 ```
 
 It prints every `ray.*` symbol vLLM uses, marks each covered / out-of-scope /
-MISSING, and exits non-zero if anything in-scope is MISSING (CI gate). Symbols
-under `OUT_OF_SCOPE` in the script (ray.data / ray.serve / ray.experimental /
-TPU) are reported, not failed.
+MISSING, and exits non-zero if anything in-scope is MISSING. CI's `vllm-surface`
+job runs exactly that command, but with `continue-on-error: true`: a vLLM bump
+that adds a symbol is reported rather than failed, until the scan is pinned to a
+tag. Symbols under `OUT_OF_SCOPE` in the script (ray.data / ray.serve /
+ray.experimental / TPU) are reported, not failed.
 
 To cover a newly-required symbol:
 

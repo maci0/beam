@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/maci0/beam/actions/workflows/ci.yml"><img src="https://github.com/maci0/beam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="coverage">
-  <img src="https://img.shields.io/badge/tests-696-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-716-brightgreen" alt="tests">
   <img src="https://img.shields.io/badge/mypy-typed%20%2B%20strict-blue" alt="mypy typed and strict">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="python 3.9+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license AGPL-3.0"></a>
@@ -21,7 +21,7 @@ The heavy tensor-parallel traffic still goes over NCCL/torch.distributed, exactl
 as with real Ray, so beam stays small. Pure Python, no build step, one dependency.
 ([vLLM parallelism & scaling](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/).)
 
-**4,093 lines, 162 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
+**4,040 lines, 162 KB, 1 dependency** vs Ray's 644k Python LoC / 183 MB install
 (see [docs/DESIGN.md](docs/DESIGN.md#size-vs-ray)).
 
 ## Documentation
@@ -179,7 +179,8 @@ deploy (see [docs/OPERATIONS.md](docs/OPERATIONS.md)):
 `scripts/scan_vllm_ray.py` statically scans a vLLM checkout for every `ray.*`
 symbol it uses and checks the shim covers it (out-of-scope features like
 ray.data / ray.serve / compiled-DAG are reported, not failed). Run it on a vLLM
-bump as a CI gate:
+bump: CI's `vllm-surface` job runs the same scan, but it is allowed to fail, so
+this local run is what actually catches a new symbol.
 
     git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
     uv run --with 'cloudpickle>=3.1.2,<4' python scripts/scan_vllm_ray.py --src /tmp/vllm
@@ -192,7 +193,7 @@ bump as a CI gate:
 | `BEAM_NODE_IP`     | advertise this address (else `VLLM_HOST_IP`, else default-route IP) |
 | `BEAM_BIND_ADDRESS` | address the head's control port binds (default `0.0.0.0`, every interface) |
 | `BEAM_RUNTIME_DIR` | daemon state dir (default `~/.beam`; keep the path under ~100 bytes, the AF_UNIX socket limit) |
-| `BEAM_SOCK`        | actor/worker daemon socket (the CLI reads it from the runtime dir) |
+| `BEAM_SOCK`        | actor/worker daemon socket; set per actor by the daemon, and an operator override on the path recorded in `daemon.json` for the shim client |
 | `BEAM_WORKER_CMD`  | how to launch a python actor (default `python3 -m ray._worker`) |
 | `BEAM_BOOTSTRAP`   | force the bootstrap that normally runs only inside a container |
 | `BEAM_TIMEOUT`     | cap every control-plane timeout (seconds); unset = production budgets |
@@ -206,18 +207,21 @@ retries collapse instantly, budgets shrink) with ids that follow from one seed,
 which is what makes a control-plane run drivable from a single seed instead of
 from real time and OS entropy. Unset in production, so timings are unchanged.
 
-Values are read once, through `python/ray/_config.py`, and validated where they
-are read: a non-numeric or negative `BEAM_NUM_GPUS`, or a `BEAM_NODE_IP` that is
-not an IP literal, fails at `ray start` with a one-line `beam:` message instead
-of being used (a wrong advertised IP otherwise surfaces much later as a cluster
-that forms and then hangs). An empty value counts as unset, so `-e BEAM_NODE_IP`
-with no `=value` falls back to the documented chain rather than advertising "".
+Every operator-set value is read through `python/ray/_config.py` and validated
+where it is read: a non-numeric or negative `BEAM_NUM_GPUS`, or a `BEAM_NODE_IP`
+that is not an IP literal, fails at `ray start` with a one-line `beam:` message
+instead of being used (a wrong advertised IP otherwise surfaces much later as a
+cluster that forms and then hangs). An empty value counts as unset, so
+`-e BEAM_NODE_IP` with no `=value` falls back to the documented chain rather than
+advertising "".
 
-The determinism seams (`BEAM_TIMEOUT`, `BEAM_WORKER_CMD`, `BEAM_SEED`, the shim's
-`BEAM_SLEEP`) are read by the daemon and the shim directly rather than through
-`_config.py`. Two of them are resolved once at import, so they must be in the
-environment before the process starts: `BEAM_CLOCK` (shim deadlines) and the
-daemon's `BEAM_SLEEP`. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#deterministic-simulation-and-replay).
+The determinism seams (`BEAM_TIMEOUT`, `BEAM_SEED`, the shim's `BEAM_SLEEP`) are
+read by the daemon and the shim directly rather than through `_config.py`, so a
+test can change them mid-run. Two more are resolved once at import, so they must
+be in the environment before the process starts: `BEAM_CLOCK` (shim deadlines)
+and the daemon's `BEAM_SLEEP`. `BEAM_WORKER_CMD`, the seam a crash/restart
+simulator drives, is read per spawn through `_config.worker_cmd()`. See
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#deterministic-simulation-and-replay).
 
 ## Not implemented (by design)
 

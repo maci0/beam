@@ -62,7 +62,7 @@ what that means. Fixes are not backported to older tags.
 - The tag must be `vMAJOR.MINOR.PATCH` and must have a dated changelog section,
   checked before anything is built.
 - `python/pyproject.toml`, `ray.__version__`, and the versions quoted in
-  `docs/API.md` and `docs/THREAT_MODEL.md` must be one number.
+  `docs/API.md` and `docs/RELEASING.md` must be one number.
 - Exactly one wheel and one sdist must exist at the declared version, so a stale
   artifact from an earlier build cannot ride along in the release glob.
 - The release body is this tag's own changelog section, not a generated commit

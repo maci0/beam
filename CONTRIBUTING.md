@@ -39,8 +39,9 @@ when vLLM changes which `ray.*` symbols it imports.
   `runtime_env.py`, `types.py`, `exceptions.py`;
 - something needing cluster state: add an `on_<t>` handler in `_daemon.py` and
   a thin call in the shim, following `placement_group_table` or `resources`;
-- anything vLLM starts importing: run the scanner (below) so CI's vLLM-surface
-  job stays green.
+- anything vLLM starts importing: run the scanner (below) and cover what it
+  reports as MISSING. CI's `vllm-surface` job runs the same scan but is allowed
+  to fail, so the check that keeps it honest is a local one.
 
     git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm
     uv run --with 'cloudpickle>=3.1.2,<4' python scripts/scan_vllm_ray.py --src /tmp/vllm

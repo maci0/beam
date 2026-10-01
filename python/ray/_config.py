@@ -13,13 +13,16 @@ variable. `ConfigError` messages start with "beam:" so every config failure
 reaches the operator the same way.
 
 The determinism seams (BEAM_TIMEOUT / BEAM_SLEEP / BEAM_CLOCK / BEAM_SEED) are
-not here: they are test/simulation hooks read directly by the daemon and the shim,
-and they must stay settable mid-process. See docs/DEVELOPMENT.md.
+not here: they are test/simulation hooks read directly by the daemon and the shim
+rather than through a loader, so BEAM_TIMEOUT, BEAM_SEED and the shim's
+BEAM_SLEEP can be changed mid-process while BEAM_CLOCK and the daemon's BEAM_SLEEP
+are captured once at import. See docs/DEVELOPMENT.md.
 
-Documented in README.md ("Environment") and docs/OPERATIONS.md. The internal
-worker handoff vars (BEAM_SOCK / BEAM_NODE_ID / BEAM_GPU_IDS / BEAM_ACTOR_ID)
-are produced by the daemon on the actor subprocess, not typed by an operator, so
-they are deliberately not config: only the ones that parse them live here.
+Documented in README.md ("Environment") and docs/OPERATIONS.md. The pure handoff
+vars (BEAM_NODE_ID / BEAM_GPU_IDS / BEAM_ACTOR_ID) are produced by the daemon on
+the actor subprocess and have no parser here. BEAM_SOCK is the one exception: the
+daemon sets it per actor, and runtime_sock() also honors it as an operator
+override on the `sock` path recorded in daemon.json.
 """
 
 from __future__ import annotations  # keep PEP604 annotations valid on py3.9
