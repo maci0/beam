@@ -96,6 +96,10 @@ control-plane test, vllm-test) and is verified end-to-end on real GB10 nodes. Se
     ray status                            # nodes/GPUs; exit 1 if any node is DOWN
     ray stop                              # stop the local daemon, clean its runtime files
 
+Uninstall a real ray from the environment first (`uv pip uninstall ray`): both
+distributions are named `ray` and write the same `ray/` package, so installing
+one over the other leaves a mix of both.
+
 `ray --help` (and `--help` on any command) exits 0 and prints to stdout; exit 1
 means a runtime error (no daemon, node down), exit 2 a usage error.
 

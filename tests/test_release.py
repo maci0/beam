@@ -25,6 +25,7 @@ def _load_tree(tmp_path, manifest_version="2.43.0", shim_version="2.43.0", chang
     (tmp_path / "python" / "ray" / "__init__.py").write_text(
         'from __future__ import annotations\n\n__version__ = "%s"\n' % shim_version
     )
+    (tmp_path / "python" / "ray" / "py.typed").write_text("")
     (tmp_path / "docs").mkdir(exist_ok=True)
     (tmp_path / "docs" / "API.md").write_text("")
     if changelog is not None:
@@ -38,6 +39,7 @@ def _patched_root(tree, monkeypatch):
     monkeypatch.setattr(cr, "SHIM_INIT", str(tree / "python" / "ray" / "__init__.py"))
     monkeypatch.setattr(cr, "CHANGELOG", str(tree / "CHANGELOG.md"))
     monkeypatch.setattr(cr, "DOCS", [str(tree / "docs" / "API.md")])
+    monkeypatch.setattr(cr, "PY_TYPED", str(tree / "python" / "ray" / "py.typed"))
 
 
 def test_real_tree_is_consistent():
@@ -45,6 +47,17 @@ def test_real_tree_is_consistent():
     errors = []
     cr.check_tree(errors)
     assert errors == []
+
+
+def test_missing_py_typed_is_reported(tmp_path, monkeypatch):
+    """The manifest claims "Typing :: Typed"; without the PEP 561 marker in the
+    wheel a downstream mypy (vLLM's) sees an untyped ray."""
+    tree = _load_tree(tmp_path, changelog="## [0.1.0] - 2026-06-25\n\n- first release\n")
+    _patched_root(tree, monkeypatch)
+    (tree / "python" / "ray" / "py.typed").unlink()
+    errors = []
+    cr.check_tree(errors)
+    assert errors == ["python/ray/py.typed is missing; a downstream mypy sees an untyped ray"]
 
 
 def test_version_mismatch_is_reported(tmp_path, monkeypatch):

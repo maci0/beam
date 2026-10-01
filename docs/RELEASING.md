@@ -65,6 +65,8 @@ what that means. Fixes are not backported to older tags.
   before anything is built.
 - `python/pyproject.toml`, `ray.__version__`, and the versions quoted in
   `docs/API.md` and `docs/RELEASING.md` must be one number.
+- `python/ray/py.typed` (PEP 561) must exist, or the wheel's "Typing :: Typed"
+  classifier is false and a downstream mypy sees an untyped `ray`.
 - Exactly one wheel and one sdist must exist at the declared version, so a stale
   artifact from an earlier build cannot ride along in the release glob.
 - The release body is this tag's own changelog section, not a generated commit

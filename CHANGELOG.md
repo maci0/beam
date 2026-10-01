@@ -39,6 +39,9 @@ notice:
   `BEAM_BIND_ADDRESS` is rejected.
 - `docs/THREAT_MODEL.md`, `SECURITY.md`, and a supported-versions statement
   (one line: the current release; no backports).
+- The wheel ships `ray/py.typed` (PEP 561), so a downstream mypy reads beam's
+  annotations, plus classifiers and project URLs; `make release-check` fails
+  when the marker is missing.
 
 ### Changed
 

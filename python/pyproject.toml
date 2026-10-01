@@ -11,6 +11,18 @@ license = "AGPL-3.0-or-later"
 # changes how closures and classes are serialized, which would move the wire
 # payload on a cluster without review.
 dependencies = ["cloudpickle>=3.1.2,<4"]
+# "Typing :: Typed" is backed by ray/py.typed (PEP 561), which the wheel ships.
+classifiers = [
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Distributed Computing",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Source = "https://github.com/maci0/beam"
+Changelog = "https://github.com/maci0/beam/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/maci0/beam/blob/main/docs/OPERATIONS.md"
 
 [project.scripts]
 ray = "ray._cli:main"

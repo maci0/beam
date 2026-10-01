@@ -36,6 +36,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = os.path.join(ROOT, "python", "pyproject.toml")
 SHIM_INIT = os.path.join(ROOT, "python", "ray", "__init__.py")
 CHANGELOG = os.path.join(ROOT, "CHANGELOG.md")
+PY_TYPED = os.path.join(ROOT, "python", "ray", "py.typed")
 DOCS = [os.path.join(ROOT, "docs", name) for name in ("API.md", "RELEASING.md")]
 
 # `version = "..."` in [project]; the manifest is the single source of truth and
@@ -88,7 +89,8 @@ def release_notes(version: str) -> str:
 
 def check_tree(errors: list[str]) -> None:
     """Everything checkable without a tag: the two version declarations agree,
-    and every doc that quotes the version quotes the current one."""
+    every doc that quotes the version quotes the current one, and the PEP 561
+    marker the "Typing :: Typed" classifier promises exists."""
     manifest, shim = manifest_version(), shim_version()
     if manifest != shim:
         errors.append(
@@ -126,6 +128,10 @@ def check_tree(errors: list[str]) -> None:
         errors.append("CHANGELOG.md is missing; a release ships with nothing to read")
     elif not changelog_versions():
         errors.append("CHANGELOG.md has no released version sections")
+    if not os.path.exists(PY_TYPED):
+        errors.append(
+            "%s is missing; a downstream mypy sees an untyped ray" % os.path.relpath(PY_TYPED, ROOT)
+        )
 
 
 def check_tag(tag: str, errors: list[str]) -> None:
