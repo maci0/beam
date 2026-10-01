@@ -17,10 +17,12 @@ TCP connection, and the daemon↔actor-worker unix socket.
   The payload is opaque bytes: cloudpickled Python objects (class+args, method
   args, return values). The daemon never unpickles it; only the shim and the
   actor worker do. It does relay it verbatim: `put` payloads are held in the
-  daemon's `objects` dict with no eviction or size accounting
-  (`_daemon.py:1258-1264`), and every handler forwards the raw payload to the
-  next hop. Anyone who can open a daemon socket therefore supplies bytes that are
-  eventually unpickled elsewhere — see docs/THREAT_MODEL.md.
+  daemon's `objects` dict, which is capped and reclaims the oldest completed,
+  unpinned slots past `_OBJECT_CAP` (in-flight and in-read slots are never
+  dropped, so the store can exceed the cap while work is outstanding), and every
+  handler forwards the raw payload to the next hop. Anyone who can open a daemon
+  socket therefore supplies bytes that are eventually unpickled elsewhere — see
+  docs/THREAT_MODEL.md.
 
 ## Header fields
 

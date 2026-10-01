@@ -415,6 +415,73 @@ def test_on_put_stores_payload():
     assert d.objects[obj].data == b"hello" and d.objects[obj].ev.is_set()
 
 
+def test_object_store_is_bounded_and_keeps_the_newest():
+    """The store reclaims old completed slots once it passes its cap, so a long
+    run of put/call cannot grow it without bound. The cap sits far above vLLM's
+    working set, so under it nothing is evicted at all."""
+    d = head()
+    for _ in range(_daemon._OBJECT_CAP + 10):
+        run(d.on_put(FakePeer(), {"t": "put"}, b"x"))
+    assert len(d.objects) == _daemon._OBJECT_CAP
+    assert "n1-o%d" % (_daemon._OBJECT_CAP + 10) in d.objects
+    assert "n1-o1" not in d.objects
+
+
+def test_eviction_never_drops_an_in_flight_or_pinned_slot():
+    """A not-ready slot is an actor call still running and a pinned slot has a
+    get parked on it; neither may be reclaimed, so the store may exceed its cap
+    rather than pull a live result out from under a reader."""
+    d = head()
+    for i in range(_daemon._OBJECT_CAP):
+        d.objects["busy%d" % i] = ObjSlot()  # not ready: in-flight calls
+    pinned = ObjSlot()
+    pinned.ev.set()
+    pinned.waiters = 1  # a get is parked on it
+    d.objects["pinned"] = pinned
+    d._store_object("fresh", ObjSlot())
+    assert "pinned" in d.objects
+    assert all(not s.ev.is_set() for k, s in d.objects.items() if k.startswith("busy"))
+
+
+def test_eviction_prefers_the_oldest_completed_slot():
+    """Order matters: the oldest evictable slot goes first, not an arbitrary one."""
+    d = head()
+    first = ObjSlot()
+    first.ev.set()
+    second = ObjSlot()
+    second.ev.set()
+    d.objects["old"] = first
+    d.objects["new"] = second
+    d.objects["inflight"] = ObjSlot()  # never ready
+    for i in range(_daemon._OBJECT_CAP - 1):
+        s = ObjSlot()
+        s.ev.set()
+        d.objects["fill%d" % i] = s
+    d._store_object("freshest", ObjSlot())
+    assert "old" not in d.objects
+    assert "inflight" in d.objects
+    assert len(d.objects) == _daemon._OBJECT_CAP
+
+
+def test_get_pins_its_slot_while_parked():
+    """A get waiting on a not-ready slot pins it, and releases the pin when the
+    slot fills."""
+    d = head()
+    slot = ObjSlot()
+    d.objects["n1-o1"] = slot
+
+    async def scenario():
+        task = asyncio.ensure_future(d.on_get(FakePeer(), {"t": "get", "obj": "n1-o1"}, b""))
+        await asyncio.sleep(0.01)
+        assert slot.waiters == 1, "get did not pin its slot while parked"
+        slot.data = b"v"
+        slot.ev.set()
+        await asyncio.wait_for(task, 1.0)
+
+    run(scenario())
+    assert slot.waiters == 0, "get did not release its pin"
+
+
 def test_put_get_roundtrip():
     d = head()
     rp, _ = run(d.on_put(FakePeer(), {"t": "put"}, b"data"))

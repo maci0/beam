@@ -355,6 +355,23 @@ class ObjSlot:
         self.ev = asyncio.Event()
         self.data = b""
         self.err = ""
+        # Handlers currently parked on this slot (an in-flight get/stat). A slot
+        # with waiters > 0 is pinned: eviction never drops it out from under an
+        # active request. Not thread-safe, but every mutation happens on the
+        # event loop's single thread.
+        self.waiters = 0
+
+
+# Upper bound on retained object slots. `objects` is the daemon's object store:
+# every actor method call and every ray.put() inserts a slot that, with no
+# client-side release signal, would otherwise live for the daemon's lifetime and
+# grow without bound over a long run (see docs/PROTOCOL.md). This cap reclaims
+# the oldest *completed, unpinned* results so memory stays bounded. It sits far
+# above vLLM's working set (a handful of small control returns), so under the cap
+# eviction never fires and get/stat behave exactly as before. Over the cap an
+# ancient, unpinned result becomes "unknown object" — the same terminal outcome
+# the store already produces for a ref whose owner node went away.
+_OBJECT_CAP = 4096
 
 
 class Daemon:
@@ -413,6 +430,28 @@ class Daemon:
     def _next_id(self, kind: str) -> str:
         self.id_seq += 1
         return f"{self.node_id}-{kind}{self.id_seq}"
+
+    def _store_object(self, obj_id: str, slot: ObjSlot) -> None:
+        """Insert a slot into the object store and keep the store bounded.
+
+        `objects` is insertion-ordered, so eviction walks oldest-first and drops
+        the first slot that is both completed (a not-ready slot is an in-flight
+        actor call whose result a get may still be waiting on) and unpinned (no
+        handler parked on it). Stopping at the first in-use slot preserves order:
+        we never skip past a live slot to reach an older evictable one. If nothing
+        can be freed the store stays over cap, which is correct — the excess is
+        in-flight work, not leaked completed data.
+        """
+        self.objects[obj_id] = slot
+        while len(self.objects) > _OBJECT_CAP:
+            for old_id in list(self.objects):
+                old = self.objects.get(old_id)
+                if old is None or not old.ev.is_set() or old.waiters:
+                    continue
+                del self.objects[old_id]
+                break
+            else:
+                return  # every retained slot is in use; defer to future inserts
 
     # ---- servers ----
     async def serve_unix(self, path: str) -> None:
@@ -1209,7 +1248,7 @@ class Daemon:
             return {"err": "unknown actor %s" % m["actor"]}, b""
         obj_id = self._next_obj()
         slot = ObjSlot()
-        self.objects[obj_id] = slot
+        self._store_object(obj_id, slot)
         self._track(asyncio.create_task(self._dispatch(ap, m["method"], payload, slot)))
         return {"t": "call_ok", "obj": obj_id}, b""
 
@@ -1345,7 +1384,7 @@ class Daemon:
         slot = ObjSlot()
         slot.data = payload
         slot.ev.set()
-        self.objects[obj_id] = slot
+        self._store_object(obj_id, slot)
         return {"t": "put_ok", "obj": obj_id}, b""
 
     async def on_get(self, peer: Peer, m: dict, payload: bytes) -> tuple[dict, bytes]:
@@ -1359,9 +1398,11 @@ class Daemon:
                 r, pl = await p.call(m)
                 return r, pl
             return await self._forward_head(m)
-        # keep the slot (not pop): a ref can be get/stat'd more than once, like
-        # real ray. vLLM's hot path uses its own MessageQueue, not ray objects,
-        # so the store does not accumulate during inference (see DESIGN scope).
+        # Keep the slot after the read (not pop): a ref can be get/stat'd more
+        # than once, like real ray. Retention is bounded by _store_object, which
+        # reclaims old completed slots, so a long run does not grow the store
+        # without limit; this read pins the slot so eviction cannot drop it while
+        # a get is parked on it.
         slot = self.objects.get(obj_id)
         if slot is None:
             return {"err": "unknown object %s" % obj_id}, b""
@@ -1371,18 +1412,22 @@ class Daemon:
         # and raises GetTimeoutError on a ref that is done. A ready slot answers
         # immediately, whatever the remaining budget; only a not-ready slot with a
         # budget is worth waiting on. A missing/None budget waits forever.
-        if slot.ev.is_set():
-            pass
-        elif m.get("timeout") is None:
-            await slot.ev.wait()
-        else:
-            try:
-                await asyncio.wait_for(slot.ev.wait(), m["timeout"])
-            except asyncio.TimeoutError:
-                timeout = m["timeout"]
-                return {
-                    "err": "GetTimeoutError: object %s not ready in %ss" % (obj_id, timeout)
-                }, b""
+        slot.waiters += 1
+        try:
+            if slot.ev.is_set():
+                pass
+            elif m.get("timeout") is None:
+                await slot.ev.wait()
+            else:
+                try:
+                    await asyncio.wait_for(slot.ev.wait(), m["timeout"])
+                except asyncio.TimeoutError:
+                    timeout = m["timeout"]
+                    return {
+                        "err": "GetTimeoutError: object %s not ready in %ss" % (obj_id, timeout)
+                    }, b""
+        finally:
+            slot.waiters -= 1
         if slot.err:
             return {"err": slot.err}, b""
         return {"t": "get_ok", "obj": obj_id}, slot.data
