@@ -11,14 +11,16 @@ executed on a node. The full model, with the code paths behind each claim, is in
 
 Concretely, before deploying:
 
-- Keep the head's TCP port (default 6379) on a private network. The head always
-  binds `0.0.0.0`; there is no flag to narrow it, so the firewall or security
-  group is the control.
+- Keep the head's TCP port (default 6379) on a private network. By default the
+  head binds `0.0.0.0`, i.e. every interface; set `BEAM_BIND_ADDRESS` to the
+  cluster LAN address to narrow the listener to one interface, and keep the
+  firewall or security group as the second layer. The startup line prints what
+  was bound (`beam head started on ... control port bound to <addr>`).
 - Set `--node-ip` / `BEAM_NODE_IP` per node to the address the cluster actually
   uses.
 - Do not put secrets in the daemon environment that the actor processes must not
   see: every actor subprocess inherits the daemon's full environment
-  (`_daemon.py:1071`).
+  (`_daemon.py:1288`).
 
 ## Supported versions
 
