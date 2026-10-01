@@ -9,7 +9,7 @@ All notable changes to beam are recorded here, in the format of
 
 beam publishes two version numbers and they mean different things:
 
-- The **tag** (`v0.2.0`, this file's headings) is beam's release line. It is the
+- The **tag** (`v0.3.0`, this file's headings) is beam's release line. It is the
   only version that says anything about beam's own compatibility, and it is the
   version `SECURITY.md` calls "the current release".
 - The **distribution version** (`ray 2.43.0`, in `python/pyproject.toml` and
@@ -23,8 +23,7 @@ Both numbers are checked against each other and against the tag by
 
 ## [Unreleased]
 
-Changes since v0.2.0, not yet released. The behavioral changes a consumer can
-notice:
+## [0.3.0] - 2026-10-01
 
 ### Added
 
@@ -64,9 +63,11 @@ notice:
 - The `Dockerfile` takes uv from its digest-pinned image for the install step
   only, so uv no longer ships in the built image, and it carries OCI
   title/source/licence labels.
+- The optional Docker image defaults to the validated vLLM v0.23.0 base. `BASE` remains available to test another release.
 
 ### Fixed
 
+- Release provenance records the Python version without trying to execute it as a command.
 - `ray start` refuses a `BEAM_RUNTIME_DIR` whose unix-socket path exceeds the
   AF_UNIX limit with a named error, instead of a bare `OSError` out of
   `socket.connect()`.
@@ -93,10 +94,6 @@ notice:
 
 Upgrade: nothing in the `ray` Python surface vLLM imports changed shape. Scripts
 that invoke the CLI must drop stray arguments and may rely on `--help` exiting 0.
-
-### Changed
-
-- The optional Docker image defaults to the validated vLLM v0.23.0 base. `BASE` remains available to test another release.
 
 ## [0.2.0] - 2026-08-26
 
@@ -154,7 +151,8 @@ No change to the `ray` API surface.
   and an actor-call hub. Bind-mount into the stock vLLM image; tensor traffic
   stays on NCCL/RCCL. Fully typed, 100% test coverage, validated cross-node.
 
-[Unreleased]: https://github.com/maci0/beam/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/maci0/beam/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/maci0/beam/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/maci0/beam/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/maci0/beam/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/maci0/beam/compare/v0.1.1...v0.1.2

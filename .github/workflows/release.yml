@@ -88,7 +88,7 @@ jobs:
             echo "runner_image: ${ImageOS}-${ImageVersion}"
             echo "uv: $(uv --version)"
             # the wheel is py3-none-any; this is the interpreter uv drives
-            python: $(uv run --no-project python -V 2>/dev/null || echo 'n/a')
+            echo "python: $(uv run --no-project python -V 2>/dev/null || echo 'n/a')"
           } > build-env.txt
 
       - name: Publish GitHub release

@@ -9,7 +9,7 @@ beam publishes two, and they answer different questions:
 
 | number | where | what it means |
 |--------|-------|---------------|
-| **tag**, `v0.2.0` | the git tag, `CHANGELOG.md` | beam's release line: what changed, and whether an upgrade is safe |
+| **tag**, `v0.3.0` | the git tag, `CHANGELOG.md` | beam's release line: what changed, and whether an upgrade is safe |
 | **distribution version** | `python/pyproject.toml` (`version`), copied to `ray.__version__` | the Ray release whose distributed-executor API this shim implements |
 
 The distribution version is pinned to a real Ray release on purpose: beam's
